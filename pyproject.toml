@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-cent"
+version = "0.0.0"
+description = "A vLLM integration and compiler interface for CENT."
+requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+where = ["src"]
