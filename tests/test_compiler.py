@@ -1,87 +1,284 @@
+"""Tests for the public model-to-CENT compiler."""
+
 import unittest
+from collections import Counter
 
 from vllm_cent import (
+    CentBlockPlacementSpec,
     CentHardwareSpec,
-    CentInstruction,
-    CentMappingSpec,
     CentOpcode,
-    CentProgram,
     CompileRequest,
     DecodeStepSpec,
     LlamaModelSpec,
     compile_transformer_block,
-    render_text_trace,
 )
+from vllm_cent.cent import (
+    Accumulate,
+    CentSharedBufferAddress,
+    render_text_program,
+)
+from vllm_cent.models.base import ModelSpec
+
+class UnsupportedModelSpec(ModelSpec):
+    """Represent a model with no compiler."""
 
 
-class CompilerTests(unittest.TestCase):
-    def test_tiny_llama_block_has_expected_boundaries(self) -> None:
-        # This is a deliberately small, valid Llama block. A hidden width of 16
-        # split across four query heads gives four values per head. Two KV heads
-        # mean that each KV head is shared by two query heads. The FFN width is
-        # kept at 32 so its later mapping arithmetic remains easy to inspect.
-        request = CompileRequest(
-            model=LlamaModelSpec(
-                hidden_size=16,
+def small_request(
+    *,
+    hidden_size: int = 16,
+    num_attention_heads: int = 1,
+    num_kv_heads: int = 1,
+    intermediate_size: int = 16,
+    num_channels: int = 1,
+    channels_per_block: int = 1,
+    dram_rows: int = 1_000,
+    sequence_length: int = 1,
+    max_sequence_length: int = 16,
+    accumulator_slots_per_bank: int = 2,
+) -> CompileRequest:
+    """Build the small Llama request used by compiler tests.
+
+    Args:
+        hidden_size: Residual width in BF16 values.
+        num_attention_heads: Query-head count.
+        num_kv_heads: Unique key/value-head count.
+        intermediate_size: Feed-forward width in BF16 values.
+        num_channels: Physical CENT channel count.
+        channels_per_block: Channels assigned to one block.
+        dram_rows: Rows available in every bank.
+        sequence_length: Tokens in the current context.
+        max_sequence_length: Reserved KV-cache length.
+        accumulator_slots_per_bank: Accumulator registers in each PU.
+
+    Returns:
+        Complete request using four banks and four-value micro-operations.
+    """
+
+    return CompileRequest(
+        model=LlamaModelSpec(
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            num_kv_heads=num_kv_heads,
+            intermediate_size=intermediate_size,
+        ),
+        hardware=CentHardwareSpec(
+            num_channels=num_channels,
+            num_banks=4,
+            dram_rows=dram_rows,
+            dram_columns=16,
+            burst_length=4,
+            accumulator_slots_per_bank=accumulator_slots_per_bank,
+            # The paper does not assign numeric AFid values; zero is a fake
+            # target-ABI value chosen explicitly for these tests.
+            sigmoid_activation_function_id=0,
+        ),
+        placement=CentBlockPlacementSpec(
+            channels_per_block=channels_per_block
+        ),
+        step=DecodeStepSpec(
+            sequence_length=sequence_length,
+            max_sequence_length=max_sequence_length,
+        ),
+    )
+
+
+class CompilerInputTests(unittest.TestCase):
+    """Test compiler input validation."""
+
+    def test_rejects_unsupported_models_and_invalid_placement(self) -> None:
+        """Reject unknown models and invalid block placement."""
+
+        base = small_request()
+        unsupported = CompileRequest(
+            model=UnsupportedModelSpec(),
+            hardware=base.hardware,
+            placement=base.placement,
+            step=base.step,
+        )
+        with self.assertRaisesRegex(TypeError, "UnsupportedModelSpec"):
+            compile_transformer_block(unsupported)
+        with self.assertRaisesRegex(ValueError, "cannot exceed"):
+            compile_transformer_block(
+                small_request(channels_per_block=2)
+            )
+        with self.assertRaisesRegex(ValueError, "must divide"):
+            compile_transformer_block(
+                small_request(num_channels=3, channels_per_block=2)
+            )
+
+    def test_rejects_incompatible_llama_and_capacity_dimensions(self) -> None:
+        """Reject incompatible model and hardware dimensions."""
+
+        cases = (
+            (small_request(accumulator_slots_per_bank=1), "activation"),
+            (small_request(hidden_size=4, num_attention_heads=2), "at least"),
+            (small_request(intermediate_size=33), "two-pass"),
+            (small_request(dram_rows=10), "requires"),
+        )
+        for request, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    compile_transformer_block(request)
+
+
+class TransformerBlockCompilerTests(unittest.TestCase):
+    """Test complete Llama block compilation."""
+
+    def test_tiny_block_has_stable_paper_operand_instruction_counts(self) -> None:
+        """Keep the tiny block's instruction counts stable."""
+
+        program = compile_transformer_block(small_request())
+        counts = Counter(instruction.opcode for instruction in program.instructions)
+
+        # These are the expected counts for the smallest complete block.
+        # WR_SBK and RD_SBK count row transfers; OPsize stores the burst count.
+        #
+        # The totals below are sums of the compiler's ordered lowering stages:
+        # - Each of two RMSNorms emits 6 WR_SBK, 1 WR_BIAS, 1 MAC_ABK,
+        #   1 RD_MAC, 2 EW_MUL, 1 COPY_BKGB, 1 COPY_GBBK, and 1 RD_SBK.
+        # - Wq, Wk, Wv, Wo, W3, and W2 each emit 1 WR_GB and four groups of
+        #   WR_BIAS + MAC_ABK + RD_MAC for the four outputs assigned per bank.
+        # - W1 emits that same GEMV shape plus four AF instructions for SiLU.
+        # - Rotary emits 8 WR_SBK and 2 EW_MUL; the KV update emits 1 WR_SBK
+        #   for the key and 4 WR_ABK for the four value dimensions.
+        # - Score GEMV emits one WR_GB/WR_BIAS/MAC_ABK/RD_MAC group. Two
+        #   softmax passes total 4 WR_SBK, 2 EW_MUL, and 2 RD_SBK.
+        # - Output GEMV emits 1 WR_GB and four WR_BIAS/MAC_ABK/RD_MAC groups.
+        # - The gated SiLU product emits 3 WR_SBK, 2 EW_MUL, one of each copy,
+        #   and 1 RD_SBK. The two residual connections emit 2 ACC in total.
+        self.assertEqual(
+            counts,
+            {
+                CentOpcode.WRITE_SINGLE_BANK: 28,
+                CentOpcode.READ_SINGLE_BANK: 5,
+                CentOpcode.WRITE_ALL_BANKS: 4,
+                CentOpcode.WRITE_BIAS: 35,
+                CentOpcode.MAC_ALL_BANKS: 35,
+                CentOpcode.READ_MAC: 35,
+                CentOpcode.ELEMENTWISE_MULTIPLY: 10,
+                CentOpcode.WRITE_GLOBAL_BUFFER: 9,
+                CentOpcode.COPY_BANK_TO_GLOBAL_BUFFER: 3,
+                CentOpcode.COPY_GLOBAL_BUFFER_TO_BANK: 3,
+                CentOpcode.ACTIVATION_FUNCTION: 4,
+                CentOpcode.ACCUMULATION: 2,
+            },
+        )
+        self.assertEqual(len(program.instructions), 173)
+
+    def test_residual_add_uses_nonoverlapping_shared_buffer_vectors(self) -> None:
+        """Use separate Shared Buffer vectors for residual addition."""
+
+        program = compile_transformer_block(small_request())
+        residuals = [
+            instruction
+            for instruction in program.instructions
+            if type(instruction) is Accumulate
+        ]
+
+        # A sixteen-value vector occupies four 4-value Shared Buffer slots.
+        # Rd begins at slot 0 and Rs begins immediately after it at slot 4.
+        expected_residual = Accumulate(
+            operation_size=4,
+            destination=CentSharedBufferAddress(slot=0),
+            source=CentSharedBufferAddress(slot=4),
+        )
+        self.assertEqual(
+            residuals,
+            [expected_residual, expected_residual],
+        )
+
+    def test_output_contains_only_paper_isa_mnemonics(self) -> None:
+        """Leave reference-only commands out of paper ISA output."""
+
+        assembly = render_text_program(
+            compile_transformer_block(small_request())
+        )
+
+        self.assertIn("MAC_ABK", assembly)
+        self.assertIn("WR_SBK", assembly)
+        self.assertNotIn("SYNC", assembly)
+        self.assertNotIn("EOC", assembly)
+        self.assertNotIn("RD_AF", assembly)
+
+    def test_grouped_query_attention_and_two_pass_activation_compile(self) -> None:
+        """Compile grouped-query attention with two activation passes."""
+
+        program = compile_transformer_block(
+            small_request(
+                hidden_size=64,
                 num_attention_heads=4,
                 num_kv_heads=2,
-                intermediate_size=32,
-            ),
-            # Sixteen banks and a burst length of 16 match the current CENT
-            # trace generator. The small row/column counts keep test addresses
-            # human-readable; this test does not model storage capacity.
-            hardware=CentHardwareSpec(
-                num_channels=2,
-                num_banks=16,
-                dram_rows=128,
-                dram_columns=64,
-                burst_length=16,
-            ),
-            # Both channels execute this block, so their bit mask is binary 11,
-            # rendered as 0x3. reuse_size=1 disables multi-chunk GB reuse.
-            mapping=CentMappingSpec(channels_per_block=2, reuse_size=1),
-            # Sequence length 1 is the first autoregressive decode step: the KV
-            # cache contains only the token currently being decoded.
-            step=DecodeStepSpec(sequence_length=1),
-        )
-
-        program = compile_transformer_block(request)
-
-        self.assertEqual(
-            program.instructions[:3],
-            (
-                # RMSNorm begins by zeroing MAC latch 0, accumulating the
-                # one-burst input vector from DRAM row 0, then reading the sum.
-                CentInstruction(opcode=CentOpcode.WRITE_BIAS, operands=(0, "0x3")),
-                CentInstruction(opcode=CentOpcode.MAC_ALL_BANKS, operands=(1, "0x3", 0)),
-                CentInstruction(opcode=CentOpcode.READ_MAC, operands=(0, "0x3")),
-            ),
-        )
-        self.assertEqual(
-            program.instructions[-1],
-            CentInstruction(opcode=CentOpcode.END_OF_COMPUTATION),
-        )
-
-    def test_renders_exact_cent_trace_text(self) -> None:
-        program = CentProgram(
-            instructions=(
-                # Write one burst to channel 0, bank 2, DRAM row 17.
-                CentInstruction(opcode=CentOpcode.WRITE_MEMORY, operands=(0, 2, 17)),
-                # Run four elementwise-multiply bursts on channels 0 and 1
-                # (mask 0x3), using operands stored at DRAM row 18.
-                CentInstruction(
-                    opcode=CentOpcode.ELEMENTWISE_MULTIPLY,
-                    operands=(4, "0x3", 18),
-                ),
-                # Every complete simulator trace ends with this marker.
-                CentInstruction(opcode=CentOpcode.END_OF_COMPUTATION),
+                intermediate_size=128,
+                num_channels=4,
+                channels_per_block=4,
+                sequence_length=17,
+                max_sequence_length=17,
+                accumulator_slots_per_bank=4,
             )
         )
-
-        self.assertEqual(
-            render_text_trace(program),
-            "W MEM 0 2 17\nAiM EWMUL 4 0x3 18\nAiM EOC\n",
+        # Four query heads share two KV heads. Four channels, one PU per
+        # channel, and 16 columns give 4 * 1 * 16 = 64 activation values per
+        # pass. The 128-value FFN therefore needs both supported passes.
+        self.assertGreater(len(program.instructions), 0)
+        self.assertGreater(
+            sum(i.opcode is CentOpcode.WRITE_ALL_BANKS for i in program.instructions),
+            0,
         )
+
+    def test_llama_3_8b_and_70b_shapes_compile(self) -> None:
+        """Compile the Llama 3 8B and 70B block dimensions."""
+
+        target = CentHardwareSpec(
+            num_channels=32,
+            num_banks=16,
+            dram_rows=16_384,
+            dram_columns=1_024,
+            burst_length=16,
+            accumulator_slots_per_bank=32,
+            sigmoid_activation_function_id=0,
+        )
+        # These are the published Llama 3 8B and 70B block dimensions. Both
+        # have 128-value heads: 4096/32 for 8B and 8192/64 for 70B. Their eight
+        # KV heads therefore produce a 1024-value KV width. The channel counts
+        # allocate 8B to 8*16=128 banks and 70B to 16*16=256 banks.
+        cases = (
+            (
+                LlamaModelSpec(
+                    hidden_size=4_096,
+                    num_attention_heads=32,
+                    num_kv_heads=8,
+                    intermediate_size=14_336,
+                ),
+                8,
+            ),
+            (
+                LlamaModelSpec(
+                    hidden_size=8_192,
+                    num_attention_heads=64,
+                    num_kv_heads=8,
+                    intermediate_size=28_672,
+                ),
+                16,
+            ),
+        )
+        for model, channels_per_block in cases:
+            with self.subTest(hidden_size=model.hidden_size):
+                program = compile_transformer_block(
+                    CompileRequest(
+                        model=model,
+                        hardware=target,
+                        placement=CentBlockPlacementSpec(
+                            channels_per_block=channels_per_block
+                        ),
+                        step=DecodeStepSpec(
+                            # A one-token decode keeps the emitted test trace
+                            # small while reserving Llama's 8192-token KV cache.
+                            sequence_length=1,
+                            max_sequence_length=8_192,
+                        ),
+                    )
+                )
+                self.assertGreater(len(program.instructions), 0)
 
 
 if __name__ == "__main__":
