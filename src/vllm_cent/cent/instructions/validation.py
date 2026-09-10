@@ -180,19 +180,16 @@ def validate_instruction(
         ValueError: If an operand is incompatible with the target.
     """
 
-    # Exact types force each new instruction to define all of its own checks.
-    instruction_type = type(instruction)
-
     # A single-bank transfer advances through DRAM bursts and Shared Buffer
     # slots. A write reads Rs; a read writes Rd.
-    if instruction_type in (WriteSingleBank, ReadSingleBank):
+    if isinstance(instruction, (WriteSingleBank, ReadSingleBank)):
         validate_address(instruction.address, hardware)
         _validate_operation_span(
             instruction.operation_size, instruction.address.column, hardware
         )
         shared_address = (
             instruction.source
-            if instruction_type is WriteSingleBank
+            if isinstance(instruction, WriteSingleBank)
             else instruction.destination
         )
         _validate_shared_buffer_span(
@@ -201,7 +198,7 @@ def validate_instruction(
         return
 
     # WR_ABK names one channel and broadcasts within that channel's banks.
-    if instruction_type is WriteAllBanks:
+    if isinstance(instruction, WriteAllBanks):
         if instruction.channel >= hardware.num_channels:
             raise ValueError("instruction channel is outside the target")
         _validate_row_column(instruction.row, instruction.column, hardware)
@@ -212,25 +209,30 @@ def validate_instruction(
         return
 
     # Every instruction in this group contains a CHmask.
-    channel_instructions = (
-        MacAllBanks,
-        ElementwiseMultiply,
-        ApplyActivation,
-        CopyBankToGlobalBuffer,
-        CopyGlobalBufferToBank,
-        WriteBias,
-        ReadMac,
-        WriteGlobalBuffer,
-    )
-    if instruction_type in channel_instructions:
+    if isinstance(
+        instruction,
+        (
+            MacAllBanks,
+            ElementwiseMultiply,
+            ApplyActivation,
+            CopyBankToGlobalBuffer,
+            CopyGlobalBufferToBank,
+            WriteBias,
+            ReadMac,
+            WriteGlobalBuffer,
+        ),
+    ):
         validate_channels(instruction.channels, hardware)
 
     # These instructions start at RO/CO and advance by one burst per operation.
-    if instruction_type in (
-        MacAllBanks,
-        ElementwiseMultiply,
-        CopyBankToGlobalBuffer,
-        CopyGlobalBufferToBank,
+    if isinstance(
+        instruction,
+        (
+            MacAllBanks,
+            ElementwiseMultiply,
+            CopyBankToGlobalBuffer,
+            CopyGlobalBufferToBank,
+        ),
     ):
         _validate_row_column(instruction.row, instruction.column, hardware)
         _validate_operation_span(
@@ -238,17 +240,17 @@ def validate_instruction(
         )
 
     # Regid selects a MAC register, not a DRAM or Shared Buffer address.
-    if instruction_type in (MacAllBanks, ApplyActivation, ReadMac):
+    if isinstance(instruction, (MacAllBanks, ApplyActivation, ReadMac)):
         _validate_accumulation_register(
             instruction.accumulation_register, hardware
         )
 
     # Check the Shared Buffer fields and any spans implied by OPsize.
-    if instruction_type is WriteBias:
+    if isinstance(instruction, WriteBias):
         validate_shared_buffer_address(instruction.source, hardware)
-    elif instruction_type is ReadMac:
+    elif isinstance(instruction, ReadMac):
         validate_shared_buffer_address(instruction.destination, hardware)
-    elif instruction_type is WriteGlobalBuffer:
+    elif isinstance(instruction, WriteGlobalBuffer):
         # TODO(architecture): We check this Global Buffer span with the DRAM row
         # width. We need a separate Global Buffer capacity in the hardware spec.
 
@@ -258,7 +260,7 @@ def validate_instruction(
         _validate_operation_span(
             instruction.operation_size, instruction.column, hardware
         )
-    elif instruction_type in (Exponent, Reduction, Accumulate, RunRiscV):
+    elif isinstance(instruction, (Exponent, Reduction, Accumulate, RunRiscV)):
         # TODO(paper/ABI): We assume equal input and output slot counts. We need
         # separate footprints for EXP, RED, ACC, and each RISC-V routine.
 
@@ -268,13 +270,13 @@ def validate_instruction(
         _validate_shared_buffer_span(
             instruction.destination, instruction.operation_size, hardware
         )
-    elif instruction_type is SendCxl:
+    elif isinstance(instruction, SendCxl):
         # TODO(architecture): We incorrectly check remote Rd against the local
         # device. We need the destination device's topology and buffer geometry.
 
         validate_shared_buffer_address(instruction.source, hardware)
         validate_shared_buffer_address(instruction.destination, hardware)
-    elif instruction_type is BroadcastCxl:
+    elif isinstance(instruction, BroadcastCxl):
         # TODO(architecture): We need a CXL topology to check the 8-bit DVcount
         # and the destination buffers on every receiving device.
 
@@ -299,7 +301,7 @@ def validate_instruction(
         ReadMac,
         WriteGlobalBuffer,
     )
-    if instruction_type not in known_types:
+    if not isinstance(instruction, known_types):
         raise TypeError(
             f"unsupported CENT instruction type: {type(instruction).__name__}"
         )

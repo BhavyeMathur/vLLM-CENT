@@ -67,6 +67,10 @@ def hardware() -> CentHardwareSpec:
     )
 
 
+class _WriteSingleBankVariant(WriteSingleBank):
+    """Test-only variant with the same instruction behavior."""
+
+
 class PrimitiveValueTests(unittest.TestCase):
     """Test basic values used by CENT instructions."""
 
@@ -359,6 +363,21 @@ class HardwareValidationTests(unittest.TestCase):
             with self.subTest(factory=factory):
                 with self.assertRaises(ValueError):
                     factory()
+
+    def test_instruction_subclasses_use_parent_rules(self) -> None:
+        """Validate and render an instruction subclass like its parent."""
+
+        instruction = _WriteSingleBankVariant(
+            address=CentMemoryAddress(channel=0, bank=1, row=2, column=4),
+            operation_size=2,
+            source=CentSharedBufferAddress(slot=3),
+        )
+
+        validate_instruction(instruction, hardware())
+        self.assertEqual(
+            render_instruction(instruction),
+            "WR_SBK 0 2 1 2 4 3",
+        )
 
     def test_validates_each_address_space_and_operation_span(self) -> None:
         """Accept the last valid address in each address space."""

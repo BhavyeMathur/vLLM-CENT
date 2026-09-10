@@ -41,12 +41,12 @@ requirements for this repository.
   value, dataclass field, and module-level collection.
 - Trust annotations for type correctness. Do not duplicate them with
   `isinstance` checks or `_require_<type>` helpers.
-- Distinguish values from class objects when narrowing a union. Use
-  `isinstance(value, SomeType)` only for intentional runtime polymorphism over
-  values. When a parameter contains a class such as `type[SomeInstruction]`,
-  use `instruction_type is SomeInstruction` for exact-class dispatch or
-  `issubclass(instruction_type, SomeInstruction)` only when subclasses are
-  intentionally supported.
+- When branching among instance types, use `isinstance(value, SomeType)`. This
+  makes the intended polymorphism clear and lets type checkers narrow the value.
+  Do not save `type(value)` and compare it with classes.
+- A parameter such as `type[SomeInstruction]` contains a class, not an instance.
+  Use `instruction_type is SomeInstruction` for exact-class dispatch, or use
+  `issubclass` when subclasses are intentionally supported.
 - Keep runtime validation for constraints annotations cannot express, including
   numeric ranges, alignment, capacity, and relationships among fields.
 - Prefer immutable, slotted dataclasses for structured values and instructions.
