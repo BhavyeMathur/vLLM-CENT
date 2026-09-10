@@ -11,3 +11,16 @@ from .cent import (
 from .compiler import compile_transformer_block
 from .models import LlamaModelSpec
 from .request import CompileRequest, DecodeStepSpec
+
+__all__ = [
+    "CentBlockPlacementSpec",
+    "CentHardwareSpec",
+    "CentInstruction",
+    "CentOpcode",
+    "CentProgram",
+    "CompileRequest",
+    "DecodeStepSpec",
+    "LlamaModelSpec",
+    "compile_transformer_block",
+    "render_text_program",
+]
