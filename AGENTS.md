@@ -7,6 +7,9 @@ These instructions apply to every file in this repository.
 - Coding agents may spawn multiple subagents whenever independent work can be
   completed in parallel more efficiently or an independent review would improve
   correctness.
+- Ask the user a question only when an unresolved choice would materially change
+  the design or behavior. Do not ask questions merely to confirm routine,
+  reversible implementation decisions that can be derived from the repository.
 - Give each subagent a concrete, bounded responsibility. Avoid delegation when
   coordination would cost more than completing the task directly.
 - The primary agent remains responsible for integrating subagent results,
@@ -123,8 +126,11 @@ requirements for this repository.
 
 - Generic hardware types, addresses, instructions, mapping, validation,
   program building, and rendering belong under `vllm_cent/cent/`.
-- Model specifications, tensor planning, and lowering belong under
-  `vllm_cent/models/<family>/`.
+- Reusable operation lowering belongs under `vllm_cent/lowering/`. Keep
+  transformer-family operations in a transformer subpackage rather than
+  treating them as universal neural-network operations.
+- Model specifications, model-specific tensor planning, and operation ordering
+  belong under `vllm_cent/models/<family>/`.
 - Never place Llama- or transformer-specific assumptions in the generic CENT
   backend.
 - Use descriptive Python names while documenting the corresponding paper terms,

@@ -14,7 +14,10 @@ from vllm_cent import (
 )
 from vllm_cent.cent import (
     Accumulate,
+    CentMemoryAddress,
     CentSharedBufferAddress,
+    ReadSingleBank,
+    WriteSingleBank,
     render_text_program,
 )
 from vllm_cent.models.base import ModelSpec
@@ -166,23 +169,25 @@ class TransformerBlockCompilerTests(unittest.TestCase):
         #   1 RD_MAC, 2 EW_MUL, 1 COPY_BKGB, 1 COPY_GBBK, and 1 RD_SBK.
         # - Wq, Wk, Wv, Wo, W3, and W2 each emit 1 WR_GB and four groups of
         #   WR_BIAS + MAC_ABK + RD_MAC for the four outputs assigned per bank.
-        # - W1 emits that same GEMV shape plus four AF instructions for SiLU.
-        # - Rotary emits 8 WR_SBK and 2 EW_MUL; the KV update emits 1 WR_SBK
-        #   for the key and 4 WR_ABK for the four value dimensions.
+        # - W1 emits that same GEMV shape, then preserves four raw results and
+        #   reads four separately activated results.
+        # - Rotary emits 2 WR_SBK, 2 RD_SBK, and 2 EW_MUL; the KV update emits
+        #   1 WR_SBK for the key and 4 WR_ABK for the value dimensions.
         # - Score GEMV emits one WR_GB/WR_BIAS/MAC_ABK/RD_MAC group. Two
         #   softmax passes total 4 WR_SBK, 2 EW_MUL, and 2 RD_SBK.
         # - Output GEMV emits 1 WR_GB and four WR_BIAS/MAC_ABK/RD_MAC groups.
         # - The gated SiLU product emits 3 WR_SBK, 2 EW_MUL, one of each copy,
-        #   and 1 RD_SBK. The two residual connections emit 2 ACC in total.
+        #   and 1 RD_SBK. Spilling the attention residual adds one WR_SBK and
+        #   reloading it adds one RD_SBK. The residuals emit 2 ACC in total.
         self.assertEqual(
             counts,
             {
-                CentOpcode.WRITE_SINGLE_BANK: 28,
-                CentOpcode.READ_SINGLE_BANK: 5,
+                CentOpcode.WRITE_SINGLE_BANK: 23,
+                CentOpcode.READ_SINGLE_BANK: 8,
                 CentOpcode.WRITE_ALL_BANKS: 4,
                 CentOpcode.WRITE_BIAS: 35,
                 CentOpcode.MAC_ALL_BANKS: 35,
-                CentOpcode.READ_MAC: 35,
+                CentOpcode.READ_MAC: 39,
                 CentOpcode.ELEMENTWISE_MULTIPLY: 10,
                 CentOpcode.WRITE_GLOBAL_BUFFER: 9,
                 CentOpcode.COPY_BANK_TO_GLOBAL_BUFFER: 3,
@@ -191,7 +196,7 @@ class TransformerBlockCompilerTests(unittest.TestCase):
                 CentOpcode.ACCUMULATION: 2,
             },
         )
-        self.assertEqual(len(program.instructions), 173)
+        self.assertEqual(len(program.instructions), 175)
 
     def test_residual_add_uses_nonoverlapping_shared_buffer_vectors(self) -> None:
         """Use separate Shared Buffer vectors for residual addition."""
@@ -203,16 +208,60 @@ class TransformerBlockCompilerTests(unittest.TestCase):
             if isinstance(instruction, Accumulate)
         ]
 
-        # A sixteen-value vector occupies four 4-value Shared Buffer slots.
-        # Rd begins at slot 0 and Rs begins immediately after it at slot 4.
-        expected_residual = Accumulate(
-            operation_size=4,
-            destination=CentSharedBufferAddress(slot=0),
-            source=CentSharedBufferAddress(slot=4),
-        )
+        # A sixteen-value vector occupies four four-value slots. The packed
+        # attention projection in slots 20..23 first adds the original input
+        # in slots 0..3. The final FFN projection in slots 4..7 then adds the
+        # attention residual reloaded into slots 20..23.
         self.assertEqual(
             residuals,
-            [expected_residual, expected_residual],
+            [
+                Accumulate(
+                    operation_size=4,
+                    destination=CentSharedBufferAddress(slot=20),
+                    source=CentSharedBufferAddress(slot=0),
+                ),
+                Accumulate(
+                    operation_size=4,
+                    destination=CentSharedBufferAddress(slot=4),
+                    source=CentSharedBufferAddress(slot=20),
+                ),
+            ],
+        )
+
+    def test_feed_forward_spills_and_reloads_the_attention_residual(self) -> None:
+        """Preserve the residual while FFN scratch reuses its buffer slots."""
+
+        program = compile_transformer_block(small_request())
+        instructions = list(program.instructions)
+        residual_indices = [
+            index
+            for index, instruction in enumerate(instructions)
+            if isinstance(instruction, Accumulate)
+        ]
+        first_residual, final_residual = residual_indices
+
+        # Row 31 is the planned ``sa`` workspace for this tiny model. The first
+        # ACC leaves its packed result in slots 20..23. It is stored immediately
+        # after that ACC and loaded immediately before the final ACC.
+        self.assertEqual(
+            instructions[first_residual + 1],
+            WriteSingleBank(
+                address=CentMemoryAddress(
+                    channel=0, bank=0, row=31, column=0
+                ),
+                operation_size=4,
+                source=CentSharedBufferAddress(slot=20),
+            ),
+        )
+        self.assertEqual(
+            instructions[final_residual - 1],
+            ReadSingleBank(
+                address=CentMemoryAddress(
+                    channel=0, bank=0, row=31, column=0
+                ),
+                operation_size=4,
+                destination=CentSharedBufferAddress(slot=20),
+            ),
         )
 
     def test_output_contains_only_paper_isa_mnemonics(self) -> None:

@@ -10,6 +10,7 @@ from ...cent import (
     WriteSingleBank,
     ceil_div,
 )
+from ...lowering import CentSharedBufferSpan
 from .planning import _LlamaCompileContext, _LlamaMemoryLayout
 
 __all__: list[str] = []
@@ -19,6 +20,7 @@ def _lower_silu_product(
     builder: CentProgramBuilder,
     context: _LlamaCompileContext,
     layout: _LlamaMemoryLayout,
+    workspace_buffer: CentSharedBufferSpan,
 ) -> None:
     """Multiply the SiLU gate by the other feed-forward projection.
 
@@ -26,12 +28,14 @@ def _lower_silu_product(
         builder: Program builder that receives the FFN instructions.
         context: Model sizes and hardware limits used by this block.
         layout: Starting DRAM rows of the intermediate FFN values.
+        workspace_buffer: Slots used while staging each FFN vector chunk.
     """
 
-    # TODO(FFN): Connect both inputs of the gated multiplication.
+    # TODO(dataflow): Connect W1, sigmoid(W1), and W3 to this workspace.
     #
-    # The multiplication needs sigmoid(W1 output) and W3 output in different
-    # banks. This function never uses ``layout.x3``, so W3 is not connected.
+    # The three projections now have separate compiler bindings. This function
+    # still needs instructions that repack each RD_MAC result into the common
+    # bank-group layout used below. The paper does not define that conversion.
 
     channels = builder.all_channels()
     intermediate_size = context.model.intermediate_size
@@ -57,8 +61,9 @@ def _lower_silu_product(
         )
         utilized_banks = ceil_div(chunk_size, group_length)
         chunk_details.append((row, group_length, utilized_banks))
-        # Bank positions 0 and 1 hold W1 output and sigmoid(W1 output).
-        for bank_group in (1, 0):
+        # Bank positions 0 and 1 hold W1 output and sigmoid(W1 output). The
+        # missing repacking step must stage each value here before its write.
+        for bank_group in (0, 1):
             builder.emit_bank_group_transfer(
                 WriteSingleBank,
                 context.placement.channels_per_block,
@@ -66,6 +71,7 @@ def _lower_silu_product(
                 bank_group,
                 row,
                 group_length,
+                shared_buffer=workspace_buffer.start,
             )
         op_size = ceil_div(group_length, context.hardware.burst_length)
         builder.append(
@@ -95,8 +101,8 @@ def _lower_silu_product(
             )
         )
 
-    # Put the SiLU result in bank position 1, multiply it by W3 output, and read
-    # the result from bank position 2 for the W2 projection.
+    # Put W3 in bank position 1 beside the SiLU result. The TODO above tracks
+    # the missing step that places W3 in this shared workspace first.
     for row, group_length, utilized_banks in chunk_details:
         builder.emit_bank_group_transfer(
             WriteSingleBank,
@@ -105,6 +111,7 @@ def _lower_silu_product(
             1,
             row,
             group_length,
+            shared_buffer=workspace_buffer.start,
         )
     for row, group_length, _ in chunk_details:
         builder.append(
@@ -125,4 +132,5 @@ def _lower_silu_product(
             2,
             row,
             group_length,
+            shared_buffer=workspace_buffer.start,
         )

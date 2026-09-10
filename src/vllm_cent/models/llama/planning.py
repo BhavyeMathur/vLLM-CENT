@@ -3,8 +3,20 @@
 from dataclasses import dataclass
 from typing import cast
 
-from ...cent import BANKS_PER_PU, CentBlockPlacementSpec, CentHardwareSpec
+from ...cent import (
+    BANKS_PER_PU,
+    CentBlockPlacementSpec,
+    CentHardwareSpec,
+    CentSharedBufferAddress,
+)
 from ...cent.utils import ceil_div, require_positive
+from ...lowering import CentDramRowRange, CentSharedBufferSpan
+from ...lowering.utils import _plan_partitioned_vector
+from ...lowering.transformer import (
+    TransformerAttentionBuffers,
+    TransformerAttentionRows,
+    TransformerAttentionSpec,
+)
 from ...request import CompileRequest, DecodeStepSpec
 from .spec import LlamaModelSpec
 
@@ -145,6 +157,78 @@ class _LlamaMemoryLayout:
     w2: int
     ffn: int
     end: int
+
+
+@dataclass(frozen=True, slots=True)
+class _LlamaBufferLayout:
+    """Shared Buffer spans used by one Llama block.
+
+    Q, K, and V use separate spans because attention needs all three. FFN spans
+    may reuse earlier attention storage after those values are no longer live.
+
+    Attributes:
+        input: Slots containing the block input during the first RMSNorm.
+        normalized: Slots containing the normalized projection input.
+        query_result: Accumulator results produced by the Q projection.
+        key_result: Accumulator results produced by the K projection.
+        value_result: Accumulator results produced by the V projection.
+        query: Slots containing Q in the packed vector layout used by attention.
+        key: Slots containing K in the packed vector layout used by attention.
+        value: Slots containing V in the packed vector layout used by attention.
+        ffn_gate: Slots receiving the raw W1 projection.
+        ffn_gate_sigmoid: Slots receiving sigmoid applied to W1.
+        ffn_up: Slots receiving the W3 projection.
+        ffn_product: Slots staging the gated FFN vector for W2.
+        end_slot: First slot not used by any span.
+    """
+
+    input: CentSharedBufferSpan
+    normalized: CentSharedBufferSpan
+    query_result: CentSharedBufferSpan
+    key_result: CentSharedBufferSpan
+    value_result: CentSharedBufferSpan
+    query: CentSharedBufferSpan
+    key: CentSharedBufferSpan
+    value: CentSharedBufferSpan
+    ffn_gate: CentSharedBufferSpan
+    ffn_gate_sigmoid: CentSharedBufferSpan
+    ffn_up: CentSharedBufferSpan
+    ffn_product: CentSharedBufferSpan
+    end_slot: int
+
+
+@dataclass(frozen=True, slots=True)
+class _LlamaAttentionPlan:
+    """Reusable attention operands derived from one Llama block plan.
+
+    Attributes:
+        spec: Transformer attention dimensions and decode lengths.
+        rows: DRAM regions used by attention lowering.
+        buffers: Shared Buffer spans passed between attention stages.
+    """
+
+    spec: TransformerAttentionSpec
+    rows: TransformerAttentionRows
+    buffers: TransformerAttentionBuffers
+
+
+@dataclass(frozen=True, slots=True)
+class _LlamaCompilePlan:
+    """All checked inputs and placements needed to lower one Llama block.
+
+    Attributes:
+        context: Derived model, hardware, and decode dimensions.
+        row_counts: DRAM space required by each tensor kind.
+        memory: DRAM row assigned to every Llama tensor.
+        buffers: Shared Buffer spans used as values move through the block.
+        attention: Model-independent operands for attention lowering.
+    """
+
+    context: _LlamaCompileContext
+    row_counts: _LlamaRowCounts
+    memory: _LlamaMemoryLayout
+    buffers: _LlamaBufferLayout
+    attention: _LlamaAttentionPlan
 
 
 @dataclass(slots=True)
@@ -422,3 +506,213 @@ def _plan_memory(context: _LlamaCompileContext) -> _LlamaMemoryLayout:
             f"but hardware provides {context.hardware.dram_rows}"
         )
     return layout
+
+
+def _plan_shared_buffer(context: _LlamaCompileContext) -> _LlamaBufferLayout:
+    """Assign Shared Buffer spans according to Llama value lifetimes.
+
+    Args:
+        context: Checked Llama dimensions and target hardware.
+
+    Returns:
+        Named spans used by attention and feed-forward lowering.
+
+    Raises:
+        ValueError: If the target Shared Buffer cannot hold the live spans.
+    """
+
+    burst_length = context.hardware.burst_length
+    pu_groups = context.total_banks // BANKS_PER_PU
+
+    hidden_slots = _plan_partitioned_vector(
+        context.model.hidden_size, pu_groups, burst_length
+    ).slot_count
+    kv_slots = _plan_partitioned_vector(
+        context.kv_width, pu_groups, burst_length
+    ).slot_count
+    intermediate_slots = _plan_partitioned_vector(
+        context.model.intermediate_size, pu_groups, burst_length
+    ).slot_count
+    intermediate_result_slots = ceil_div(
+        context.model.intermediate_size, context.total_banks
+    )
+    hidden_result_slots = ceil_div(
+        context.model.hidden_size, context.total_banks
+    )
+    kv_result_slots = ceil_div(context.kv_width, context.total_banks)
+
+    # The values are placed in the same order that the block produces them.
+    # Keeping the arithmetic here makes every boundary visible during review.
+    input_start = 0
+    normalized_start = input_start + hidden_slots
+    query_result_start = normalized_start + hidden_slots
+    key_result_start = query_result_start + hidden_result_slots
+    value_result_start = key_result_start + kv_result_slots
+    query_start = value_result_start + kv_result_slots
+    key_start = query_start + hidden_slots
+    value_start = key_start + kv_slots
+    attention_end_slot = value_start + kv_slots
+
+    # FFN lowering runs after attention, so it can reuse those slots. Its three
+    # accumulator outputs are adjacent at the start of the buffer.
+    ffn_gate_start = input_start
+    ffn_gate_sigmoid_start = ffn_gate_start + intermediate_result_slots
+    ffn_up_start = ffn_gate_sigmoid_start + intermediate_result_slots
+    ffn_product_start = input_start
+    ffn_projection_end = ffn_up_start + intermediate_result_slots
+    end_slot = max(
+        attention_end_slot,
+        intermediate_slots,
+        ffn_projection_end,
+    )
+
+    if end_slot > context.hardware.shared_buffer_slots:
+        raise ValueError(
+            f"attention projections require {end_slot} Shared Buffer slots, "
+            f"but hardware provides {context.hardware.shared_buffer_slots}"
+        )
+
+    return _LlamaBufferLayout(
+        input=CentSharedBufferSpan(
+            start=CentSharedBufferAddress(slot=input_start),
+            slot_count=hidden_slots,
+        ),
+        normalized=CentSharedBufferSpan(
+            start=CentSharedBufferAddress(slot=normalized_start),
+            slot_count=hidden_slots,
+        ),
+        query_result=CentSharedBufferSpan(
+            start=CentSharedBufferAddress(slot=query_result_start),
+            slot_count=hidden_result_slots,
+        ),
+        key_result=CentSharedBufferSpan(
+            start=CentSharedBufferAddress(slot=key_result_start),
+            slot_count=kv_result_slots,
+        ),
+        value_result=CentSharedBufferSpan(
+            start=CentSharedBufferAddress(slot=value_result_start),
+            slot_count=kv_result_slots,
+        ),
+        query=CentSharedBufferSpan(
+            start=CentSharedBufferAddress(slot=query_start),
+            slot_count=hidden_slots,
+        ),
+        key=CentSharedBufferSpan(
+            start=CentSharedBufferAddress(slot=key_start),
+            slot_count=kv_slots,
+        ),
+        value=CentSharedBufferSpan(
+            start=CentSharedBufferAddress(slot=value_start),
+            slot_count=kv_slots,
+        ),
+        ffn_gate=CentSharedBufferSpan(
+            start=CentSharedBufferAddress(slot=ffn_gate_start),
+            slot_count=intermediate_result_slots,
+        ),
+        ffn_gate_sigmoid=CentSharedBufferSpan(
+            start=CentSharedBufferAddress(slot=ffn_gate_sigmoid_start),
+            slot_count=intermediate_result_slots,
+        ),
+        ffn_up=CentSharedBufferSpan(
+            start=CentSharedBufferAddress(slot=ffn_up_start),
+            slot_count=intermediate_result_slots,
+        ),
+        ffn_product=CentSharedBufferSpan(
+            start=CentSharedBufferAddress(slot=ffn_product_start),
+            slot_count=intermediate_slots,
+        ),
+        end_slot=end_slot,
+    )
+
+
+def _create_attention_plan(
+    context: _LlamaCompileContext,
+    row_counts: _LlamaRowCounts,
+    memory: _LlamaMemoryLayout,
+    buffers: _LlamaBufferLayout,
+) -> _LlamaAttentionPlan:
+    """Convert Llama dimensions and placements into attention operands.
+
+    Args:
+        context: Derived Llama and hardware dimensions.
+        row_counts: DRAM space required by each tensor kind.
+        memory: DRAM row assigned to every Llama tensor.
+        buffers: Shared Buffer spans used by the Llama block.
+
+    Returns:
+        Model-independent specification, row ranges, and buffer bindings.
+    """
+
+    spec = TransformerAttentionSpec(
+        hidden_size=context.model.hidden_size,
+        num_attention_heads=context.model.num_attention_heads,
+        num_kv_heads=context.model.num_kv_heads,
+        head_size=context.head_size,
+        kv_width=context.kv_width,
+        repeat_count=context.repeat_count,
+        sequence_length=context.step.sequence_length,
+        max_sequence_length=context.step.max_sequence_length,
+    )
+    rows = TransformerAttentionRows(
+        query=CentDramRowRange(
+            start_row=memory.xq, row_count=row_counts.projection
+        ),
+        key=CentDramRowRange(
+            start_row=memory.xk, row_count=row_counts.projection
+        ),
+        key_cache=CentDramRowRange(
+            start_row=memory.cache_k, row_count=row_counts.cache_k
+        ),
+        scores=CentDramRowRange(
+            start_row=memory.scores, row_count=row_counts.scores
+        ),
+        value_cache=CentDramRowRange(
+            start_row=memory.cache_v, row_count=row_counts.cache_v
+        ),
+    )
+    attention_buffers = TransformerAttentionBuffers(
+        query=buffers.query,
+        key=buffers.key,
+        value=buffers.value,
+        # The input is dead after Q, K, and V have been produced.
+        scores=buffers.input,
+        # The normalized projection input is also dead after QKV projection.
+        output=buffers.normalized,
+    )
+    return _LlamaAttentionPlan(
+        spec=spec,
+        rows=rows,
+        buffers=attention_buffers,
+    )
+
+
+def _create_compile_plan(request: CompileRequest) -> _LlamaCompilePlan:
+    """Build every checked size and placement used by Llama lowering.
+
+    Args:
+        request: Llama model, hardware, block placement, and decode sizes.
+
+    Returns:
+        Complete immutable plan consumed by the Llama block compiler.
+
+    Raises:
+        ValueError: If the model does not fit the selected target.
+    """
+
+    context = _create_context(request)
+    row_counts = _row_counts(context)
+    memory = _plan_memory(context)
+    buffers = _plan_shared_buffer(context)
+    attention = _create_attention_plan(
+        context,
+        row_counts,
+        memory,
+        buffers,
+    )
+    return _LlamaCompilePlan(
+        context=context,
+        row_counts=row_counts,
+        memory=memory,
+        buffers=buffers,
+        attention=attention,
+    )

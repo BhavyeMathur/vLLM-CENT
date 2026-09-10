@@ -316,6 +316,8 @@ class CentProgramBuilder:
             bank_group: int,
             row: int,
             size_per_bank: int,
+            *,
+            shared_buffer: CentSharedBufferAddress | None = None,
     ) -> None:
         """Transfer vector pieces through one bank in each neighboring pair.
 
@@ -325,6 +327,8 @@ class CentProgramBuilder:
             bank_group: Position within each bank pair, either zero or one.
             row: First DRAM row used by every selected bank.
             size_per_bank: Number of vector values assigned to each bank.
+            shared_buffer: First staging slot used by the first vector piece.
+                The default is slot zero.
 
         Raises:
             ValueError: If the group or size is invalid.
@@ -355,14 +359,19 @@ class CentProgramBuilder:
         # Repeat the transfer for each equal-sized copy of the block.
         copies = self.hardware.num_channels // self.placement.channels_per_block
 
-        # A new vector piece starts after the slots used by earlier pieces.
+        # A new vector piece starts after the slots used by earlier pieces. An
+        # explicit base keeps unrelated tensors from silently sharing slot zero.
+        first_buffer = shared_buffer or CentSharedBufferAddress(slot=0)
         slots_per_partition = ceil_div(
             size_per_bank, self.hardware.burst_length
         )
         for partition in range(partitions):
             channel, bank = self.bank_index(partition * 2 + bank_group)
             buffer = CentSharedBufferAddress(
-                slot=partition * slots_per_partition
+                slot=(
+                    first_buffer.slot
+                    + partition * slots_per_partition
+                )
             )
             for copy in range(copies):
                 # Replicas use the same bank and Shared Buffer slots in another
@@ -384,6 +393,8 @@ class CentProgramBuilder:
             bank_group: int,
             row: int,
             size_per_bank: int,
+            *,
+            shared_buffer: CentSharedBufferAddress | None = None,
     ) -> None:
         """Transfer vector pieces through one bank in each four-bank group.
 
@@ -394,6 +405,8 @@ class CentProgramBuilder:
             bank_group: Position selected within every group, from zero to three.
             row: First DRAM row used by every selected bank.
             size_per_bank: Number of vector values assigned to each selected bank.
+            shared_buffer: First staging slot used by the first vector piece.
+                The default is slot zero.
 
         Raises:
             ValueError: If a channel, group, or size value is invalid.
@@ -413,6 +426,7 @@ class CentProgramBuilder:
 
         # bank_group selects the same position from each four-bank group.
         copies = self.hardware.num_channels // channels_required
+        first_buffer = shared_buffer or CentSharedBufferAddress(slot=0)
         slots_per_partition = ceil_div(
             size_per_bank, self.hardware.burst_length
         )
@@ -421,7 +435,10 @@ class CentProgramBuilder:
                 partition * BANKS_PER_PU + bank_group
             )
             buffer = CentSharedBufferAddress(
-                slot=partition * slots_per_partition
+                slot=(
+                    first_buffer.slot
+                    + partition * slots_per_partition
+                )
             )
             for copy in range(copies):
                 # Each copied layout uses the same Shared Buffer piece.

@@ -1,4 +1,4 @@
-"""Tests for the private Llama lowering helpers."""
+"""Tests for Llama planning and transformer-operation lowering."""
 
 import unittest
 from collections import Counter
@@ -13,39 +13,58 @@ from vllm_cent import (
     LlamaModelSpec,
 )
 from vllm_cent.cent import (
-    Accumulate,
     CentChannelSet,
     CentMemoryAddress,
     CentProgramBuilder,
     CentSharedBufferAddress,
     MacAllBanks,
+    ReadMac,
     ReadSingleBank,
     WriteAllBanks,
+    WriteGlobalBuffer,
     WriteSingleBank,
 )
-from vllm_cent.models.llama.attention import (
-    _lower_kv_cache_update,
-    _lower_output_gemv,
-    _lower_rotary_embedding,
-    _lower_score_gemv,
-    _lower_score_transfer,
-    _lower_softmax,
+from vllm_cent.lowering import (
+    CentDramRowRange,
+    CentSharedBufferSpan,
+    lower_rms_norm,
+)
+from vllm_cent.lowering.transformer import (
+    TransformerAttentionBuffers,
+    TransformerAttentionRows,
+    TransformerAttentionSpec,
+    lower_attention_output,
+    lower_kv_cache_update,
+    lower_rotary_embedding,
+    lower_score_gemv,
+    lower_softmax,
+)
+from vllm_cent.lowering.transformer.attention import _lower_score_transfer
+from vllm_cent.lowering.utils import (
+    _PartitionedVectorLayout,
+    _plan_partitioned_vector,
 )
 from vllm_cent.models.llama import compile_llama_transformer_block
-from vllm_cent.models.llama.compiler import _lower_residual_add
+from vllm_cent.models.llama.compiler import (
+    _lower_feed_forward,
+    _lower_self_attention,
+)
 from vllm_cent.models.llama.planning import (
+    _LlamaBufferLayout,
     _LlamaCompileContext,
     _LlamaMemoryLayout,
     _LlamaRowCounts,
     _RowAllocator,
     _create_context,
+    _create_attention_plan,
+    _create_compile_plan,
     _plan_memory,
+    _plan_shared_buffer,
     _row_counts,
     _validate_context,
 )
 from vllm_cent.models.llama.feed_forward import _lower_silu_product
-from vllm_cent.models.llama.linear import _lower_weight_gemv
-from vllm_cent.models.llama.normalization import _lower_rms_norm
+
 
 def make_request(
     *,
@@ -121,6 +140,33 @@ def make_state(
     )
 
 
+def make_attention_bindings(
+    context: _LlamaCompileContext,
+    layout: _LlamaMemoryLayout,
+) -> tuple[
+    TransformerAttentionSpec,
+    TransformerAttentionRows,
+    TransformerAttentionBuffers,
+]:
+    """Convert a Llama plan into reusable attention operands.
+
+    Args:
+        context: Derived Llama and hardware dimensions.
+        layout: DRAM rows assigned to the Llama block.
+
+    Returns:
+        Generic attention sizes, DRAM ranges, and Shared Buffer spans.
+    """
+
+    attention = _create_attention_plan(
+        context,
+        _row_counts(context),
+        layout,
+        _plan_shared_buffer(context),
+    )
+    return attention.spec, attention.rows, attention.buffers
+
+
 class ContextAndLayoutTests(unittest.TestCase):
     """Test derived Llama dimensions and DRAM allocation."""
 
@@ -155,7 +201,6 @@ class ContextAndLayoutTests(unittest.TestCase):
                 activation_capacity=32,
             ),
         )
-
     def test_context_validator_rejects_invalid_derived_capacity(self) -> None:
         """Reject an FFN that exceeds two activation passes."""
 
@@ -257,58 +302,127 @@ class ContextAndLayoutTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             allocator.reserve(0)
 
+    def test_grouped_buffer_slots_includes_partition_padding(self) -> None:
+        """Round each PU partition to its own Shared Buffer slot."""
 
-class LinearAndNormalizationTests(unittest.TestCase):
-    """Test linear, normalization, and feed-forward lowering."""
-
-    def test_weight_gemv_preserves_columns_registers_and_activation(self) -> None:
-        """Emit the expected GEMV rows, registers, and activations."""
-
-        _, _, builder = make_state()
-        _lower_weight_gemv(builder, 7, 16, 8, 4, apply_activation=True)
-        counts = Counter(i.opcode for i in builder.instructions)
-
-        # Eight outputs over four banks produce two outputs per bank. Fused
-        # activation reserves half of the four registers for activation state,
-        # leaving a two-register group. The 16-value input fits in one row, so
-        # the group needs one WR_GB and two MAC/AF/read sequences. Consecutive
-        # output weights occupy rows 7 and 8 and registers 0 and 1.
-        self.assertEqual(counts[CentOpcode.WRITE_GLOBAL_BUFFER], 1)
-        self.assertEqual(counts[CentOpcode.MAC_ALL_BANKS], 2)
-        self.assertEqual(counts[CentOpcode.ACTIVATION_FUNCTION], 2)
-        self.assertEqual(counts[CentOpcode.READ_MAC], 2)
-        macs = [
-            instruction
-            for instruction in builder.instructions
-            if isinstance(instruction, MacAllBanks)
-        ]
+        # Ten values split among four groups become 3, 3, 3, and 1 values.
+        # With four values per slot, every group still occupies one slot.
         self.assertEqual(
-            macs,
-            [
-                MacAllBanks(
-                    channels=CentChannelSet(channels=(0,)),
-                    operation_size=4,
-                    row=7,
-                    column=0,
-                    accumulation_register=0,
-                ),
-                MacAllBanks(
-                    channels=CentChannelSet(channels=(0,)),
-                    operation_size=4,
-                    row=8,
-                    column=0,
-                    accumulation_register=1,
-                ),
-            ],
+            _plan_partitioned_vector(10, 4, 4),
+            _PartitionedVectorLayout(
+                values_per_partition=3,
+                partition_count=4,
+                slot_count=4,
+            ),
         )
-        with self.assertRaises(ValueError):
-            _lower_weight_gemv(builder, 0, 16, 1, 1, apply_activation=True)
+        for arguments in ((0, 4, 4), (10, 0, 4), (10, 4, 0)):
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(ValueError):
+                    _plan_partitioned_vector(*arguments)
+
+    def test_shared_buffer_plan_separates_q_k_and_v(self) -> None:
+        """Give the attention projections nonoverlapping staging spans."""
+
+        context, _, _ = make_state()
+        layout = _plan_shared_buffer(context)
+
+        # Each projection first produces four accumulator-result slots. Those
+        # occupy 8..19. The separately packed Q, K, and V vectors then occupy
+        # slots 20..31 so the two physical layouts are not conflated.
+        self.assertEqual(
+            layout,
+            _LlamaBufferLayout(
+                input=CentSharedBufferSpan(
+                    start=CentSharedBufferAddress(slot=0),
+                    slot_count=4,
+                ),
+                normalized=CentSharedBufferSpan(
+                    start=CentSharedBufferAddress(slot=4),
+                    slot_count=4,
+                ),
+                query_result=CentSharedBufferSpan(
+                    start=CentSharedBufferAddress(slot=8),
+                    slot_count=4,
+                ),
+                key_result=CentSharedBufferSpan(
+                    start=CentSharedBufferAddress(slot=12),
+                    slot_count=4,
+                ),
+                value_result=CentSharedBufferSpan(
+                    start=CentSharedBufferAddress(slot=16),
+                    slot_count=4,
+                ),
+                query=CentSharedBufferSpan(
+                    start=CentSharedBufferAddress(slot=20),
+                    slot_count=4,
+                ),
+                key=CentSharedBufferSpan(
+                    start=CentSharedBufferAddress(slot=24),
+                    slot_count=4,
+                ),
+                value=CentSharedBufferSpan(
+                    start=CentSharedBufferAddress(slot=28),
+                    slot_count=4,
+                ),
+                ffn_gate=CentSharedBufferSpan(
+                    start=CentSharedBufferAddress(slot=0),
+                    slot_count=4,
+                ),
+                ffn_gate_sigmoid=CentSharedBufferSpan(
+                    start=CentSharedBufferAddress(slot=4),
+                    slot_count=4,
+                ),
+                ffn_up=CentSharedBufferSpan(
+                    start=CentSharedBufferAddress(slot=8),
+                    slot_count=4,
+                ),
+                ffn_product=CentSharedBufferSpan(
+                    start=CentSharedBufferAddress(slot=0),
+                    slot_count=4,
+                ),
+                end_slot=32,
+            ),
+        )
+
+    def test_shared_buffer_plan_rejects_insufficient_capacity(self) -> None:
+        """Reject a target that cannot hold live attention values."""
+
+        context, _, _ = make_state()
+        with self.assertRaisesRegex(ValueError, "Shared Buffer slots"):
+            _plan_shared_buffer(
+                replace(
+                    context,
+                    hardware=replace(context.hardware, shared_buffer_slots=31),
+                )
+            )
+
+
+class NormalizationAndFeedForwardTests(unittest.TestCase):
+    """Test normalization and Llama feed-forward lowering."""
 
     def test_rms_norm_and_silu_emit_paper_copy_shapes(self) -> None:
         """Emit the paper's bank-copy operand shapes."""
 
         context, layout, norm_builder = make_state()
-        _lower_rms_norm(norm_builder, context, layout.x, layout.x_copy, layout.sa_norm)
+        rows = _row_counts(context)
+        buffers = _plan_shared_buffer(context)
+        lower_rms_norm(
+            norm_builder,
+            input_rows=CentDramRowRange(
+                start_row=layout.x, row_count=rows.x
+            ),
+            work_rows=CentDramRowRange(
+                start_row=layout.x_copy, row_count=rows.x
+            ),
+            weight_rows=CentDramRowRange(
+                start_row=layout.sa_norm, row_count=rows.x
+            ),
+            input_buffer=buffers.input,
+            scale_buffer=buffers.normalized,
+            partial_sum_buffer=buffers.value,
+            output_buffer=buffers.normalized,
+            value_count=context.model.hidden_size,
+        )
         norm_counts = Counter(i.opcode for i in norm_builder.instructions)
         # RMSNorm copies its bank result into the Global Buffer once, then
         # copies that scalar scale back to banks once before the final multiply.
@@ -316,34 +430,18 @@ class LinearAndNormalizationTests(unittest.TestCase):
         self.assertEqual(norm_counts[CentOpcode.COPY_GLOBAL_BUFFER_TO_BANK], 1)
 
         silu_builder = CentProgramBuilder(context.hardware, context.placement)
-        _lower_silu_product(silu_builder, context, layout)
+        _lower_silu_product(
+            silu_builder,
+            context,
+            layout,
+            buffers.ffn_product,
+        )
         silu_counts = Counter(i.opcode for i in silu_builder.instructions)
         # The tiny FFN fits one activation chunk. It performs one multiply to
         # form SiLU, one copy through the Global Buffer, and a second multiply
         # combining the activated gate with the W3 projection.
         self.assertEqual(silu_counts[CentOpcode.COPY_BANK_TO_GLOBAL_BUFFER], 1)
         self.assertEqual(silu_counts[CentOpcode.ELEMENTWISE_MULTIPLY], 2)
-
-    def test_residual_add_uses_acc_instruction(self) -> None:
-        """Lower residual addition to the paper's ACC instruction."""
-
-        _, _, builder = make_state()
-        _lower_residual_add(builder, 16)
-
-        # Sixteen values occupy four four-value Shared Buffer slots. ACC reads
-        # its destination vector from Rd slot 0 and the nonoverlapping residual
-        # from Rs slot 4, and OPsize 4 covers the complete vectors.
-        self.assertEqual(
-            builder.instructions,
-            [
-                Accumulate(
-                    operation_size=4,
-                    destination=CentSharedBufferAddress(slot=0),
-                    source=CentSharedBufferAddress(slot=4),
-                )
-            ],
-        )
-
 
 class AttentionLoweringTests(unittest.TestCase):
     """Test each attention lowering stage."""
@@ -352,21 +450,58 @@ class AttentionLoweringTests(unittest.TestCase):
         """Use WR_SBK and EW_MUL for rotary data flow."""
 
         context, layout, builder = make_state()
-        _lower_rotary_embedding(builder, context, layout)
+        spec, rows, buffers = make_attention_bindings(context, layout)
+        lower_rotary_embedding(builder, spec, rows, buffers)
         counts = Counter(i.opcode for i in builder.instructions)
 
-        # The one-head query and key each transfer into bank group 1 and again
-        # into result bank group 2. Each group transfer expands across two live
-        # banks, giving 2 tensors * 2 groups * 2 banks = 8 WR_SBK. Query and key
-        # each need one elementwise rotation multiply.
-        self.assertEqual(counts[CentOpcode.WRITE_SINGLE_BANK], 8)
+        # Query and key are written into operand bank group 1. Their computed
+        # bank-group-2 results are then read back to the same named buffers.
+        self.assertEqual(counts[CentOpcode.WRITE_SINGLE_BANK], 2)
+        self.assertEqual(counts[CentOpcode.READ_SINGLE_BANK], 2)
         self.assertEqual(counts[CentOpcode.ELEMENTWISE_MULTIPLY], 2)
+
+    def test_rotary_embedding_rejects_an_undersized_query_span(self) -> None:
+        """Reject a query buffer that cannot hold all PU partitions."""
+
+        context, layout, builder = make_state()
+        spec, rows, buffers = make_attention_bindings(context, layout)
+        small_query = CentSharedBufferSpan(
+            start=buffers.query.start,
+            slot_count=buffers.query.slot_count - 1,
+        )
+
+        with self.assertRaisesRegex(ValueError, "query needs"):
+            lower_rotary_embedding(
+                builder,
+                spec,
+                rows,
+                replace(buffers, query=small_query),
+            )
+
+    def test_rotary_embedding_rejects_an_undersized_query_row_range(
+        self,
+    ) -> None:
+        """Reject a row range shorter than one query partition."""
+
+        context, layout, builder = make_state(
+            hidden_size=32,
+            num_attention_heads=2,
+            num_kv_heads=1,
+            intermediate_size=32,
+        )
+        spec, rows, buffers = make_attention_bindings(context, layout)
+
+        # This one-channel target has one PU group, so all 32 query values need
+        # two sixteen-value DRAM rows. The planned one-row range is too short.
+        with self.assertRaisesRegex(ValueError, "query rows needs 2"):
+            lower_rotary_embedding(builder, spec, rows, buffers)
 
     def test_kv_cache_update_writes_column_and_channel(self) -> None:
         """Put the new cache value in the expected column and channel."""
 
         context, layout, builder = make_state(sequence_length=5)
-        _lower_kv_cache_update(builder, context, layout)
+        spec, rows, buffers = make_attention_bindings(context, layout)
+        lower_kv_cache_update(builder, spec, rows, buffers)
 
         # Head size 16 spread across four banks gives four dimension writes.
         # sequence_length 5 means token index 4, which is column 4 of row zero;
@@ -382,38 +517,78 @@ class AttentionLoweringTests(unittest.TestCase):
                         column=0,
                     ),
                     operation_size=4,
-                    source=CentSharedBufferAddress(slot=0),
+                    source=CentSharedBufferAddress(slot=24),
                 ),
                 WriteAllBanks(
                     channel=0,
                     row=22,
                     column=4,
-                    source=CentSharedBufferAddress(slot=0),
+                    source=CentSharedBufferAddress(slot=28),
                     accumulation_register=0,
                 ),
                 WriteAllBanks(
                     channel=0,
                     row=23,
                     column=4,
-                    source=CentSharedBufferAddress(slot=0),
+                    source=CentSharedBufferAddress(slot=29),
                     accumulation_register=0,
                 ),
                 WriteAllBanks(
                     channel=0,
                     row=24,
                     column=4,
-                    source=CentSharedBufferAddress(slot=0),
+                    source=CentSharedBufferAddress(slot=30),
                     accumulation_register=0,
                 ),
                 WriteAllBanks(
                     channel=0,
                     row=25,
                     column=4,
-                    source=CentSharedBufferAddress(slot=0),
+                    source=CentSharedBufferAddress(slot=31),
                     accumulation_register=0,
                 ),
             ],
         )
+
+    def test_attention_stages_reject_undersized_input_spans(self) -> None:
+        """Check the buffer capacity required by each attention stage."""
+
+        context, layout, _ = make_state(sequence_length=16)
+        spec, rows, buffers = make_attention_bindings(context, layout)
+        one_slot = CentSharedBufferSpan(
+            start=CentSharedBufferAddress(slot=0),
+            slot_count=1,
+        )
+        cases = (
+            (
+                lower_kv_cache_update,
+                replace(buffers, key=one_slot),
+                "key needs",
+            ),
+            (
+                lower_score_gemv,
+                replace(buffers, query=one_slot),
+                "query needs",
+            ),
+            (
+                lower_softmax,
+                replace(buffers, scores=one_slot),
+                "scores needs",
+            ),
+            (
+                lower_attention_output,
+                replace(buffers, scores=one_slot),
+                "scores needs",
+            ),
+        )
+        for lowerer, stage_buffers, message in cases:
+            with self.subTest(lowerer=lowerer.__name__):
+                builder = CentProgramBuilder(
+                    context.hardware,
+                    context.placement,
+                )
+                with self.assertRaisesRegex(ValueError, message):
+                    lowerer(builder, spec, rows, stage_buffers)
 
     def test_score_gemv_uses_head_column_offsets(self) -> None:
         """Advance the MAC column between heads packed in one row."""
@@ -424,7 +599,8 @@ class AttentionLoweringTests(unittest.TestCase):
             num_kv_heads=4,
             intermediate_size=16,
         )
-        _lower_score_gemv(builder, context, layout)
+        spec, rows, buffers = make_attention_bindings(context, layout)
+        lower_score_gemv(builder, spec, rows, buffers)
         macs = [
             instruction
             for instruction in builder.instructions
@@ -472,7 +648,15 @@ class AttentionLoweringTests(unittest.TestCase):
         """Use source addresses for writes and destinations for reads."""
 
         context, layout, writes = make_state()
-        _lower_score_transfer(writes, context, layout, WriteSingleBank, 0)
+        spec, rows, buffers = make_attention_bindings(context, layout)
+        _lower_score_transfer(
+            writes,
+            spec,
+            rows,
+            WriteSingleBank,
+            0,
+            buffers,
+        )
         self.assertEqual(
             writes.instructions,
             [
@@ -490,7 +674,14 @@ class AttentionLoweringTests(unittest.TestCase):
         )
 
         reads = CentProgramBuilder(context.hardware, context.placement)
-        _lower_score_transfer(reads, context, layout, ReadSingleBank, 2)
+        _lower_score_transfer(
+            reads,
+            spec,
+            rows,
+            ReadSingleBank,
+            2,
+            buffers,
+        )
         self.assertEqual(
             reads.instructions,
             [
@@ -509,7 +700,14 @@ class AttentionLoweringTests(unittest.TestCase):
         # Score storage defines exactly three four-bank roles, numbered 0, 1,
         # and 2; group 3 therefore has no physical meaning.
         with self.assertRaises(ValueError):
-            _lower_score_transfer(reads, context, layout, ReadSingleBank, 3)
+            _lower_score_transfer(
+                reads,
+                spec,
+                rows,
+                ReadSingleBank,
+                3,
+                buffers,
+            )
 
     def test_softmax_and_output_gemv_emit_expected_operation_families(
         self,
@@ -517,7 +715,8 @@ class AttentionLoweringTests(unittest.TestCase):
         """Emit the expected softmax and output-GEMV instructions."""
 
         context, layout, softmax = make_state()
-        _lower_softmax(softmax, context, layout)
+        spec, rows, buffers = make_attention_bindings(context, layout)
+        lower_softmax(softmax, spec, rows, buffers)
         softmax_counts = Counter(i.opcode for i in softmax.instructions)
         # Softmax has two scaling passes: one for 1/sqrt(head_size), then one
         # for the reciprocal exponent sum. Each pass contributes one EW_MUL.
@@ -525,7 +724,7 @@ class AttentionLoweringTests(unittest.TestCase):
         self.assertGreater(softmax_counts[CentOpcode.WRITE_SINGLE_BANK], 0)
 
         output = CentProgramBuilder(context.hardware, context.placement)
-        _lower_output_gemv(output, context, layout)
+        lower_attention_output(output, spec, rows, buffers)
         output_counts = Counter(i.opcode for i in output.instructions)
         # One score row is loaded into the Global Buffer once. A 16-value head
         # distributed over four banks has four value dimensions, so output
@@ -551,6 +750,73 @@ class LlamaOrchestrationTests(unittest.TestCase):
                 instruction.opcode in CentOpcode
                 for instruction in program.instructions
             )
+        )
+
+    def test_private_block_stages_emit_their_expected_instruction_counts(
+        self,
+    ) -> None:
+        """Keep attention and FFN orchestration independently testable."""
+
+        plan = _create_compile_plan(make_request())
+        attention_builder = CentProgramBuilder(
+            plan.context.hardware,
+            plan.context.placement,
+        )
+        _lower_self_attention(attention_builder, plan)
+        feed_forward_builder = CentProgramBuilder(
+            plan.context.hardware,
+            plan.context.placement,
+        )
+        _lower_feed_forward(feed_forward_builder, plan)
+
+        # The tiny block has 104 attention instructions and 71 FFN
+        # instructions. Each stage owns exactly one residual ACC operation.
+        self.assertEqual(len(attention_builder.instructions), 104)
+        self.assertEqual(len(feed_forward_builder.instructions), 71)
+        self.assertEqual(
+            sum(
+                instruction.opcode is CentOpcode.ACCUMULATION
+                for instruction in attention_builder.instructions
+            ),
+            1,
+        )
+        self.assertEqual(
+            sum(
+                instruction.opcode is CentOpcode.ACCUMULATION
+                for instruction in feed_forward_builder.instructions
+            ),
+            1,
+        )
+
+    def test_q_k_and_v_share_an_input_but_not_an_output(self) -> None:
+        """Connect three projections to distinct Shared Buffer spans."""
+
+        program = compile_llama_transformer_block(make_request())
+        global_buffer_writes = [
+            instruction
+            for instruction in program.instructions
+            if isinstance(instruction, WriteGlobalBuffer)
+        ]
+
+        # RMSNorm writes normalized x to slots 4..7. The first three WR_GB
+        # instructions are Wq, Wk, and Wv, and all must read that same tensor.
+        self.assertEqual(
+            [instruction.source for instruction in global_buffer_writes[:3]],
+            [CentSharedBufferAddress(slot=4)] * 3,
+        )
+
+        mac_reads = [
+            instruction
+            for instruction in program.instructions
+            if isinstance(instruction, ReadMac)
+        ]
+        # RMSNorm first uses slot 28 for its partial sum. The following twelve
+        # reads are Q results in 8..11, K results in 12..15, and V results in
+        # 16..19. The packed attention vectors begin later at slot 20.
+        self.assertEqual(
+            [instruction.destination for instruction in mac_reads[:13]],
+            [CentSharedBufferAddress(slot=28)]
+            + [CentSharedBufferAddress(slot=slot) for slot in range(8, 20)],
         )
 
 

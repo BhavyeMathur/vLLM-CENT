@@ -318,6 +318,38 @@ class CentProgramBuilderTests(unittest.TestCase):
                 ),
             ],
         )
+
+    def test_bank_group_transfer_starts_at_requested_buffer_slot(self) -> None:
+        """Offset every partition from an explicit Shared Buffer address."""
+
+        builder = make_builder()
+        builder.emit_bank_group_transfer(
+            WriteSingleBank,
+            channels_required=1,
+            utilized_banks=1,
+            bank_group=0,
+            row=6,
+            size_per_bank=8,
+            shared_buffer=CentSharedBufferAddress(slot=5),
+        )
+
+        # Eight values occupy two four-value slots. The single selected bank
+        # therefore reads slots 5 and 6 in one two-burst instruction.
+        self.assertEqual(
+            builder.instructions,
+            [
+                WriteSingleBank(
+                    address=CentMemoryAddress(
+                        channel=0,
+                        bank=0,
+                        row=6,
+                        column=0,
+                    ),
+                    operation_size=2,
+                    source=CentSharedBufferAddress(slot=5),
+                )
+            ],
+        )
         for arguments in (
             (WriteSingleBank, 8, 2, 6, 4),
             (WriteSingleBank, 0, 0, 6, 4),
