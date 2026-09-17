@@ -17,7 +17,10 @@ from vllm_cent.cent import (
     CentMemoryAddress,
     CentProgramBuilder,
     CentSharedBufferAddress,
+    CopyBankToGlobalBuffer,
+    CopyGlobalBufferToBank,
     MacAllBanks,
+    MacOperandSource,
     ReadMac,
     ReadSingleBank,
     WriteAllBanks,
@@ -442,6 +445,48 @@ class NormalizationAndFeedForwardTests(unittest.TestCase):
         # combining the activated gate with the W3 projection.
         self.assertEqual(silu_counts[CentOpcode.COPY_BANK_TO_GLOBAL_BUFFER], 1)
         self.assertEqual(silu_counts[CentOpcode.ELEMENTWISE_MULTIPLY], 2)
+        copies = [
+            instruction
+            for instruction in silu_builder.instructions
+            if isinstance(
+                instruction,
+                (CopyBankToGlobalBuffer, CopyGlobalBufferToBank),
+            )
+        ]
+        # The first multiply leaves SiLU in bank two. The copy moves it to bank
+        # one; W3 is then staged in bank zero for the second multiply.
+        self.assertEqual(
+            copies,
+            [
+                CopyBankToGlobalBuffer(
+                    channels=CentChannelSet(channels=(0,)),
+                    operation_size=4,
+                    bank=2,
+                    row=layout.x1_sigmoid,
+                    column=0,
+                ),
+                CopyGlobalBufferToBank(
+                    channels=CentChannelSet(channels=(0,)),
+                    operation_size=4,
+                    bank=1,
+                    row=layout.x1_sigmoid,
+                    column=0,
+                ),
+            ],
+        )
+        self.assertEqual(
+            silu_builder.instructions[5],
+            WriteSingleBank(
+                address=CentMemoryAddress(
+                    channel=0,
+                    bank=0,
+                    row=layout.x1_sigmoid,
+                    column=0,
+                ),
+                operation_size=4,
+                source=buffers.ffn_product.start,
+            ),
+        )
 
 class AttentionLoweringTests(unittest.TestCase):
     """Test each attention lowering stage."""
@@ -619,6 +664,7 @@ class AttentionLoweringTests(unittest.TestCase):
                     row=53,
                     column=0,
                     accumulation_register=0,
+                    operand_source=MacOperandSource.GLOBAL_BUFFER,
                 ),
                 MacAllBanks(
                     channels=CentChannelSet(channels=(0,)),
@@ -626,6 +672,7 @@ class AttentionLoweringTests(unittest.TestCase):
                     row=53,
                     column=8,
                     accumulation_register=0,
+                    operand_source=MacOperandSource.GLOBAL_BUFFER,
                 ),
                 MacAllBanks(
                     channels=CentChannelSet(channels=(0,)),
@@ -633,6 +680,7 @@ class AttentionLoweringTests(unittest.TestCase):
                     row=54,
                     column=0,
                     accumulation_register=0,
+                    operand_source=MacOperandSource.GLOBAL_BUFFER,
                 ),
                 MacAllBanks(
                     channels=CentChannelSet(channels=(0,)),
@@ -640,6 +688,7 @@ class AttentionLoweringTests(unittest.TestCase):
                     row=54,
                     column=8,
                     accumulation_register=0,
+                    operand_source=MacOperandSource.GLOBAL_BUFFER,
                 ),
             ],
         )

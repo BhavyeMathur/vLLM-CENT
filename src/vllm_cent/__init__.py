@@ -6,6 +6,7 @@ from .cent import (
     CentInstruction,
     CentOpcode,
     CentProgram,
+    render_aim_trace,
     render_text_program,
 )
 from .compiler import compile_transformer_block
@@ -22,5 +23,6 @@ __all__ = [
     "DecodeStepSpec",
     "LlamaModelSpec",
     "compile_transformer_block",
+    "render_aim_trace",
     "render_text_program",
 ]

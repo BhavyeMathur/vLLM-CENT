@@ -20,6 +20,7 @@ from .data_movement import (
     BroadcastCxl,
     CopyBankToGlobalBuffer,
     CopyGlobalBufferToBank,
+    ReadActivation,
     ReadMac,
     ReadSingleBank,
     ReceiveCxl,
@@ -218,6 +219,7 @@ def validate_instruction(
             CopyBankToGlobalBuffer,
             CopyGlobalBufferToBank,
             WriteBias,
+            ReadActivation,
             ReadMac,
             WriteGlobalBuffer,
         ),
@@ -239,8 +241,16 @@ def validate_instruction(
             instruction.operation_size, instruction.column, hardware
         )
 
+    if isinstance(
+        instruction, (CopyBankToGlobalBuffer, CopyGlobalBufferToBank)
+    ) and instruction.bank >= hardware.num_banks:
+        raise ValueError("copy bank is outside the target channel")
+
     # Regid selects a MAC register, not a DRAM or Shared Buffer address.
-    if isinstance(instruction, (MacAllBanks, ApplyActivation, ReadMac)):
+    if isinstance(
+        instruction,
+        (MacAllBanks, ApplyActivation, ReadActivation, ReadMac),
+    ):
         _validate_accumulation_register(
             instruction.accumulation_register, hardware
         )
@@ -248,7 +258,7 @@ def validate_instruction(
     # Check the Shared Buffer fields and any spans implied by OPsize.
     if isinstance(instruction, WriteBias):
         validate_shared_buffer_address(instruction.source, hardware)
-    elif isinstance(instruction, ReadMac):
+    elif isinstance(instruction, (ReadActivation, ReadMac)):
         validate_shared_buffer_address(instruction.destination, hardware)
     elif isinstance(instruction, WriteGlobalBuffer):
         # TODO(architecture): We check this Global Buffer span with the DRAM row
@@ -298,6 +308,7 @@ def validate_instruction(
         CopyBankToGlobalBuffer,
         CopyGlobalBufferToBank,
         WriteBias,
+        ReadActivation,
         ReadMac,
         WriteGlobalBuffer,
     )

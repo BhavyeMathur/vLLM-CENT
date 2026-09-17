@@ -187,7 +187,8 @@ class TransformerBlockCompilerTests(unittest.TestCase):
                 CentOpcode.WRITE_ALL_BANKS: 4,
                 CentOpcode.WRITE_BIAS: 35,
                 CentOpcode.MAC_ALL_BANKS: 35,
-                CentOpcode.READ_MAC: 39,
+                CentOpcode.READ_MAC: 35,
+                CentOpcode.READ_ACTIVATION: 4,
                 CentOpcode.ELEMENTWISE_MULTIPLY: 10,
                 CentOpcode.WRITE_GLOBAL_BUFFER: 9,
                 CentOpcode.COPY_BANK_TO_GLOBAL_BUFFER: 3,
@@ -264,8 +265,10 @@ class TransformerBlockCompilerTests(unittest.TestCase):
             ),
         )
 
-    def test_output_contains_only_paper_isa_mnemonics(self) -> None:
-        """Leave reference-only commands out of paper ISA output."""
+    def test_output_distinguishes_target_extension_from_trace_controls(
+        self,
+    ) -> None:
+        """Render RD_AF without adding AiM trace framing to paper text."""
 
         assembly = render_text_program(
             compile_transformer_block(small_request())
@@ -275,7 +278,7 @@ class TransformerBlockCompilerTests(unittest.TestCase):
         self.assertIn("WR_SBK", assembly)
         self.assertNotIn("SYNC", assembly)
         self.assertNotIn("EOC", assembly)
-        self.assertNotIn("RD_AF", assembly)
+        self.assertIn("RD_AF", assembly)
 
     def test_grouped_query_attention_and_two_pass_activation_compile(self) -> None:
         """Compile grouped-query attention with two activation passes."""

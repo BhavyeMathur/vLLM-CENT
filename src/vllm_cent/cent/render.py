@@ -11,6 +11,7 @@ from .instructions import (
     ElementwiseMultiply,
     Exponent,
     MacAllBanks,
+    ReadActivation,
     ReadMac,
     ReadSingleBank,
     ReceiveCxl,
@@ -26,9 +27,9 @@ from .program import CentProgram
 
 __all__ = ["render_channel_mask", "render_instruction", "render_text_program"]
 
-# TODO(target ABI): This text follows the paper and is useful for inspection. It
-# is not yet an executable format. We need field widths, CHmask bit order, and a
-# decision about compatibility with the reference simulator's ``AiM`` format.
+# This text follows the paper and is useful for inspection. It is intentionally
+# distinct from the executable AiM trace ABI, whose channel mask, configuration
+# registers, and operand lists are handled by ``cent.aim``.
 
 
 def render_channel_mask(channels: CentChannelSet) -> str:
@@ -164,6 +165,12 @@ def render_instruction(instruction: CentInstruction) -> str:
             f"{instruction.source.slot}"
         )
     if isinstance(instruction, ReadMac):
+        return (
+            f"{opcode} {render_channel_mask(instruction.channels)} "
+            f"{instruction.destination.slot} "
+            f"{instruction.accumulation_register}"
+        )
+    if isinstance(instruction, ReadActivation):
         return (
             f"{opcode} {render_channel_mask(instruction.channels)} "
             f"{instruction.destination.slot} "

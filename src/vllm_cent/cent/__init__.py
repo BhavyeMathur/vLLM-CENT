@@ -1,5 +1,15 @@
 """Generic CENT hardware, instruction, program, and serialization types."""
 
+from .aim import (
+    AIM_SIMULATOR_BANKS,
+    AIM_SIMULATOR_BURST_LENGTH,
+    AIM_SIMULATOR_CHANNELS,
+    AimSimulatorCompatibilityError,
+    render_aim_channel_mask,
+    render_aim_instruction,
+    render_aim_trace,
+    validate_aim_hardware,
+)
 from .builder import CentProgramBuilder
 from .hardware import BANKS_PER_PU, CentBlockPlacementSpec, CentHardwareSpec
 from .instructions import (
@@ -16,6 +26,8 @@ from .instructions import (
     ElementwiseMultiply,
     Exponent,
     MacAllBanks,
+    MacOperandSource,
+    ReadActivation,
     ReadMac,
     ReadSingleBank,
     ReceiveCxl,
@@ -32,8 +44,12 @@ from .render import render_instruction, render_text_program
 from .utils import ceil_div
 
 __all__ = [
+    "AIM_SIMULATOR_BANKS",
+    "AIM_SIMULATOR_BURST_LENGTH",
+    "AIM_SIMULATOR_CHANNELS",
     "BANKS_PER_PU",
     "Accumulate",
+    "AimSimulatorCompatibilityError",
     "ApplyActivation",
     "BroadcastCxl",
     "CentBlockPlacementSpec",
@@ -50,6 +66,8 @@ __all__ = [
     "ElementwiseMultiply",
     "Exponent",
     "MacAllBanks",
+    "MacOperandSource",
+    "ReadActivation",
     "ReadMac",
     "ReadSingleBank",
     "ReceiveCxl",
@@ -61,6 +79,10 @@ __all__ = [
     "WriteGlobalBuffer",
     "WriteSingleBank",
     "ceil_div",
+    "render_aim_channel_mask",
+    "render_aim_instruction",
+    "render_aim_trace",
     "render_instruction",
     "render_text_program",
+    "validate_aim_hardware",
 ]

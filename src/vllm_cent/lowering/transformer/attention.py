@@ -9,6 +9,7 @@ from ...cent import (
     CentSharedBufferAddress,
     ElementwiseMultiply,
     MacAllBanks,
+    MacOperandSource,
     ReadMac,
     ReadSingleBank,
     WriteAllBanks,
@@ -429,6 +430,7 @@ def lower_score_gemv(
                             row=row,
                             column=head_index * spec.head_size,
                             accumulation_register=0,
+                            operand_source=MacOperandSource.GLOBAL_BUFFER,
                         )
                     )
                     builder.append(
@@ -698,6 +700,7 @@ def lower_attention_output(
                             ),
                             column=0,
                             accumulation_register=0,
+                            operand_source=MacOperandSource.GLOBAL_BUFFER,
                         )
                     )
                     builder.append(

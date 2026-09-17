@@ -11,8 +11,12 @@ from vllm_cent.cent import (
     CentMemoryAddress,
     CentProgramBuilder,
     CentSharedBufferAddress,
+    CopyBankToGlobalBuffer,
+    CopyGlobalBufferToBank,
     ElementwiseMultiply,
     MacAllBanks,
+    MacOperandSource,
+    ReadActivation,
     ReadMac,
     ReadSingleBank,
     WriteBias,
@@ -202,6 +206,7 @@ class LinearLoweringTests(unittest.TestCase):
                     row=7,
                     column=0,
                     accumulation_register=0,
+                    operand_source=MacOperandSource.GLOBAL_BUFFER,
                 ),
                 MacAllBanks(
                     operation_size=4,
@@ -209,6 +214,7 @@ class LinearLoweringTests(unittest.TestCase):
                     row=8,
                     column=0,
                     accumulation_register=1,
+                    operand_source=MacOperandSource.GLOBAL_BUFFER,
                 ),
                 ReadMac(
                     destination=CentSharedBufferAddress(slot=20),
@@ -347,7 +353,9 @@ class LinearLoweringTests(unittest.TestCase):
         result_instructions = [
             instruction
             for instruction in builder.instructions
-            if isinstance(instruction, (ReadMac, ApplyActivation))
+            if isinstance(
+                instruction, (ReadMac, ReadActivation, ApplyActivation)
+            )
         ]
         self.assertEqual(
             result_instructions,
@@ -362,7 +370,7 @@ class LinearLoweringTests(unittest.TestCase):
                     activation_function_id=3,
                     accumulation_register=0,
                 ),
-                ReadMac(
+                ReadActivation(
                     destination=CentSharedBufferAddress(slot=18),
                     accumulation_register=0,
                     channels=CentChannelSet(channels=(0,)),
@@ -488,6 +496,7 @@ class NormalizationLoweringTests(unittest.TestCase):
                     row=3,
                     column=0,
                     accumulation_register=0,
+                    operand_source=MacOperandSource.NEXT_BANK,
                 ),
                 ReadMac(
                     destination=CentSharedBufferAddress(slot=20),
@@ -694,6 +703,35 @@ class NormalizationLoweringTests(unittest.TestCase):
                     destination=CentSharedBufferAddress(slot=20),
                     accumulation_register=0,
                     channels=CentChannelSet(channels=(0,)),
+                ),
+            ],
+        )
+        copies = [
+            instruction
+            for instruction in builder.instructions
+            if isinstance(
+                instruction,
+                (CopyBankToGlobalBuffer, CopyGlobalBufferToBank),
+            )
+        ]
+        # AiM identifies one bank per copy. Bank two contains the first EW_MUL
+        # result, and bank one receives it beside weights stored in bank zero.
+        self.assertEqual(
+            copies,
+            [
+                CopyBankToGlobalBuffer(
+                    channels=CentChannelSet(channels=(0,)),
+                    operation_size=4,
+                    bank=2,
+                    row=4,
+                    column=0,
+                ),
+                CopyGlobalBufferToBank(
+                    channels=CentChannelSet(channels=(0,)),
+                    operation_size=4,
+                    bank=1,
+                    row=5,
+                    column=0,
                 ),
             ],
         )

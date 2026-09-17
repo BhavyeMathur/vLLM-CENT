@@ -19,6 +19,7 @@ class CentOpcode(str, Enum):
         WRITE_BIAS: Initialize MAC accumulators from the Shared Buffer.
         MAC_ALL_BANKS: Accumulate bank rows against the global buffer.
         READ_MAC: Copy MAC accumulator results into the Shared Buffer.
+        READ_ACTIVATION: Copy activation results into the Shared Buffer.
         ELEMENTWISE_MULTIPLY: Multiply paired values in four-bank groups.
         EXPONENT: Apply elementwise exponentiation in PNM units.
         REDUCTION: Reduce groups of Shared Buffer values in PNM units.
@@ -50,6 +51,7 @@ class CentOpcode(str, Enum):
     COPY_GLOBAL_BUFFER_TO_BANK = "COPY_GBBK"
     WRITE_BIAS = "WR_BIAS"
     READ_MAC = "RD_MAC"
+    READ_ACTIVATION = "RD_AF"
     WRITE_GLOBAL_BUFFER = "WR_GB"
 
 

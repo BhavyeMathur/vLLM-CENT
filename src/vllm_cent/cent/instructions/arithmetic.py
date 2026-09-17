@@ -1,6 +1,7 @@
 """Arithmetic instructions in the order used by Table 2 of the CENT paper."""
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import ClassVar
 
 from ..utils import require_nonnegative, require_positive
@@ -13,6 +14,7 @@ __all__ = [
     "ElementwiseMultiply",
     "Exponent",
     "MacAllBanks",
+    "MacOperandSource",
     "Reduction",
     "RunRiscV",
 ]
@@ -25,10 +27,22 @@ __all__ = [
 # position, and Regid chooses a register that keeps a running result.
 
 
-# TODO(ISA): Explain where MAC_ABK gets its second input.
-#
-# One input may come from the Global Buffer or a neighboring bank. MAC_ABK has
-# no operand that selects one. We need to learn how hardware makes that choice.
+class MacOperandSource(Enum):
+    """Select the nonlocal input consumed by ``MAC_ABK``.
+
+    AiM exposes this choice through configuration register zero rather than an
+    operand in the textual ``MAC_ABK`` instruction. Keeping the state explicit
+    in the compiler IR prevents two different calculations from becoming the
+    same apparent instruction.
+
+    Members:
+        GLOBAL_BUFFER: Multiply each bank value by the channel Global Buffer.
+        NEXT_BANK: Multiply even-numbered bank values by the following bank.
+    """
+
+    GLOBAL_BUFFER = 0
+    NEXT_BANK = 1
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class MacAllBanks(CentInstruction):
@@ -44,6 +58,8 @@ class MacAllBanks(CentInstruction):
         column: First scalar position in that row, or ``CO``.
         accumulation_register: Register that receives the running sum, or
             ``Regid``.
+        operand_source: Location of the second multiply input. The AiM target
+            writes this value to its broadcast configuration register.
         OPCODE: Fixed ``MAC_ABK`` instruction name.
     """
 
@@ -52,6 +68,11 @@ class MacAllBanks(CentInstruction):
     row: int
     column: int
     accumulation_register: int
+    # This is semantic compiler state, not an operand encoded in the physical
+    # MAC_ABK record. A target lowers it to the control-state update required
+    # before the MAC, which keeps this IR instruction independent of inherited
+    # configuration-register state.
+    operand_source: MacOperandSource
     OPCODE: ClassVar[CentOpcode] = CentOpcode.MAC_ALL_BANKS
 
     def __post_init__(self) -> None:
@@ -70,17 +91,14 @@ class MacAllBanks(CentInstruction):
         )
 
 
-# TODO(paper): Define each bank's role during EW_MUL.
-#
-# A group has two input banks and one result bank. We need to confirm which
-# numbered bank has each role. Current lowering follows the reference simulator.
-
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ElementwiseMultiply(CentInstruction):
     """Multiply corresponding values stored in neighboring banks.
 
-    This is ``EW_MUL CHmask OPsize RO CO`` in the paper. Bank roles are implicit,
-    so the instruction does not contain input or output bank numbers.
+    This is ``EW_MUL CHmask OPsize RO CO`` in the paper. Within each four-bank
+    processing-unit group, banks zero and one are inputs and bank two receives
+    the result. These roles are defined by CENT's functional reference model;
+    the instruction therefore does not carry explicit bank operands.
 
     Attributes:
         channels: Physical channels that perform the operation, or ``CHmask``.
@@ -109,10 +127,11 @@ class ElementwiseMultiply(CentInstruction):
         require_nonnegative("column", self.column)
 
 
-# TODO(target ABI): Define the activation IDs and how results are read.
+# TODO(target ABI): Define the activation-function IDs.
 #
-# The paper does not map AFid numbers to functions or explain how to read the
-# result. We need both rules from the target ABI.
+# AiM places AFid in CFR2 and exposes results through RD_AF, but it does not map
+# the eight numeric modes to activation functions. The hardware spec therefore
+# keeps the sigmoid ID explicit until that mapping has a stronger source.
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ApplyActivation(CentInstruction):

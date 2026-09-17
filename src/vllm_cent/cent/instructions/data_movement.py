@@ -15,6 +15,7 @@ __all__ = [
     "BroadcastCxl",
     "CopyBankToGlobalBuffer",
     "CopyGlobalBufferToBank",
+    "ReadActivation",
     "ReadMac",
     "ReadSingleBank",
     "ReceiveCxl",
@@ -240,22 +241,18 @@ class WriteAllBanks(CentInstruction):
 # Each channel has a Global Buffer used by nearby processing units. CHmask
 # chooses the channels. These copy instructions contain no bank number.
 
-# TODO(ISA): Define which bank COPY_BKGB and COPY_GBBK use.
-#
-# Table 3 has no BK field, but the reference simulator requires one. We need the
-# bank-selection rule before RMSNorm and SiLU can use these copies correctly.
-
-
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CopyBankToGlobalBuffer(CentInstruction):
     """Copy DRAM values into the selected channels' Global Buffers.
 
-    This is ``COPY_BKGB CHmask OPsize RO CO`` in the paper. ``RO``/``CO`` name
-    the first DRAM burst. The ISA does not say which bank supplies it.
+    The paper lists ``COPY_BKGB CHmask OPsize RO CO`` without a bank operand.
+    AiM's executable trace ABI additionally requires ``bank`` and uses it as the
+    source bank on every selected channel.
 
     Attributes:
         channels: Physical channels that perform the copy, or ``CHmask``.
         operation_size: Number of bursts to copy, or ``OPsize``.
+        bank: Source bank within every selected channel.
         row: First source DRAM row, or ``RO``.
         column: First position in that row, or ``CO``.
         OPCODE: Fixed ``COPY_BKGB`` instruction name.
@@ -263,6 +260,7 @@ class CopyBankToGlobalBuffer(CentInstruction):
 
     channels: CentChannelSet
     operation_size: int
+    bank: int
     row: int
     column: int
     OPCODE: ClassVar[CentOpcode] = CentOpcode.COPY_BANK_TO_GLOBAL_BUFFER
@@ -275,6 +273,7 @@ class CopyBankToGlobalBuffer(CentInstruction):
         """
 
         require_positive("operation_size", self.operation_size)
+        require_nonnegative("bank", self.bank)
         require_nonnegative("row", self.row)
         require_nonnegative("column", self.column)
 
@@ -283,12 +282,14 @@ class CopyBankToGlobalBuffer(CentInstruction):
 class CopyGlobalBufferToBank(CentInstruction):
     """Copy Global Buffer values into DRAM on selected channels.
 
-    This is ``COPY_GBBK CHmask OPsize RO CO`` in the paper. The ISA does not say
-    which bank receives the values.
+    The paper lists ``COPY_GBBK CHmask OPsize RO CO`` without a bank operand.
+    AiM's executable trace ABI additionally requires ``bank`` and uses it as the
+    destination bank on every selected channel.
 
     Attributes:
         channels: Physical channels that perform the copy, or ``CHmask``.
         operation_size: Number of bursts to copy, or ``OPsize``.
+        bank: Destination bank within every selected channel.
         row: First destination DRAM row, or ``RO``.
         column: First position in that row, or ``CO``.
         OPCODE: Fixed ``COPY_GBBK`` instruction name.
@@ -296,6 +297,7 @@ class CopyGlobalBufferToBank(CentInstruction):
 
     channels: CentChannelSet
     operation_size: int
+    bank: int
     row: int
     column: int
     OPCODE: ClassVar[CentOpcode] = CentOpcode.COPY_GLOBAL_BUFFER_TO_BANK
@@ -308,6 +310,7 @@ class CopyGlobalBufferToBank(CentInstruction):
         """
 
         require_positive("operation_size", self.operation_size)
+        require_nonnegative("bank", self.bank)
         require_nonnegative("row", self.row)
         require_nonnegative("column", self.column)
 
@@ -367,6 +370,39 @@ class ReadMac(CentInstruction):
 
     def __post_init__(self) -> None:
         """Validate MAC-register read operands.
+
+        Raises:
+            ValueError: If ``accumulation_register`` is negative.
+        """
+
+        require_nonnegative(
+            "accumulation_register", self.accumulation_register
+        )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ReadActivation(CentInstruction):
+    """Copy activation-function results into the Shared Buffer.
+
+    AiM calls this target-specific operation ``RD_AF GPR_0 channel_mask``.
+    ``destination`` names the corresponding 256-bit Shared Buffer/GPR slot in
+    the compiler IR. The target trace has no register operand, so its adapter
+    can represent only accumulator register zero.
+
+    Attributes:
+        channels: Physical channels whose activation results are read.
+        destination: First Shared Buffer output slot.
+        accumulation_register: Register whose activation result is expected.
+        OPCODE: Fixed ``RD_AF`` instruction name.
+    """
+
+    channels: CentChannelSet
+    destination: CentSharedBufferAddress
+    accumulation_register: int
+    OPCODE: ClassVar[CentOpcode] = CentOpcode.READ_ACTIVATION
+
+    def __post_init__(self) -> None:
+        """Validate the selected accumulator register.
 
         Raises:
             ValueError: If ``accumulation_register`` is negative.

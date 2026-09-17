@@ -82,33 +82,36 @@ def _lower_silu_product(
                 column=0,
             )
         )
-        # Move the SiLU result through the Global Buffer so it can become an
-        # operand of the next multiplication.
-        builder.append(
-            CopyBankToGlobalBuffer(
-                operation_size=op_size,
-                channels=channels,
-                row=row,
-                column=0,
+        # Move bank two's SiLU result to bank one in every four-bank group.
+        # AiM COPY instructions operate on one physical bank number at a time.
+        for result_bank in range(2, context.hardware.num_banks, BANKS_PER_PU):
+            builder.append(
+                CopyBankToGlobalBuffer(
+                    operation_size=op_size,
+                    channels=channels,
+                    bank=result_bank,
+                    row=row,
+                    column=0,
+                )
             )
-        )
-        builder.append(
-            CopyGlobalBufferToBank(
-                operation_size=op_size,
-                channels=channels,
-                row=row,
-                column=0,
+            builder.append(
+                CopyGlobalBufferToBank(
+                    operation_size=op_size,
+                    channels=channels,
+                    bank=result_bank - 1,
+                    row=row,
+                    column=0,
+                )
             )
-        )
 
-    # Put W3 in bank position 1 beside the SiLU result. The TODO above tracks
-    # the missing step that places W3 in this shared workspace first.
+    # Put W3 in bank position 0 beside the SiLU result in position 1. The TO-DO
+    # above tracks the missing step that places W3 in this workspace first.
     for row, group_length, utilized_banks in chunk_details:
         builder.emit_bank_group_transfer(
             WriteSingleBank,
             context.placement.channels_per_block,
             utilized_banks,
-            1,
+            0,
             row,
             group_length,
             shared_buffer=workspace_buffer.start,

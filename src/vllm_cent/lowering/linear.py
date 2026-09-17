@@ -4,6 +4,8 @@ from ..cent import (
     ApplyActivation,
     CentProgramBuilder,
     MacAllBanks,
+    MacOperandSource,
+    ReadActivation,
     ReadMac,
     WriteBias,
     WriteGlobalBuffer,
@@ -53,11 +55,6 @@ def lower_weight_gemv(
     #
     # RD_MAC reads a partial sum and WR_BIAS writes it back. WR_BIAS has no
     # register operand, so the paper does not say which register receives it.
-
-    # TODO(ISA): Define how to read an activated result.
-    #
-    # This code uses RD_MAC after AF. The reference simulator uses RD_AF, but
-    # RD_AF does not appear in the paper's instruction table.
 
     # TODO(dataflow): Define how RD_MAC packs results selected by CHmask.
     #
@@ -166,6 +163,7 @@ def lower_weight_gemv(
                         row=weights.row(weight_row_offset),
                         column=0,
                         accumulation_register=local_output,
+                        operand_source=MacOperandSource.GLOBAL_BUFFER,
                     )
                 )
 
@@ -199,7 +197,7 @@ def lower_weight_gemv(
                     )
                     output_offset = first_group_output + local_output
                     builder.append(
-                        ReadMac(
+                        ReadActivation(
                             destination=activated_output_buffer.address(
                                 output_offset
                             ),

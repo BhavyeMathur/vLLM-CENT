@@ -18,6 +18,8 @@ from vllm_cent.cent import (
     ElementwiseMultiply,
     Exponent,
     MacAllBanks,
+    MacOperandSource,
+    ReadActivation,
     ReadMac,
     ReadSingleBank,
     ReceiveCxl,
@@ -139,6 +141,7 @@ class PaperInstructionTests(unittest.TestCase):
                     row=3,
                     column=4,
                     accumulation_register=1,
+                    operand_source=MacOperandSource.GLOBAL_BUFFER,
                 ),
                 "MAC_ABK 0x3 2 3 4 1",
             ),
@@ -239,6 +242,7 @@ class PaperInstructionTests(unittest.TestCase):
                 CopyBankToGlobalBuffer(
                     channels=channels,
                     operation_size=2,
+                    bank=2,
                     row=3,
                     column=4,
                 ),
@@ -248,6 +252,7 @@ class PaperInstructionTests(unittest.TestCase):
                 CopyGlobalBufferToBank(
                     channels=channels,
                     operation_size=2,
+                    bank=1,
                     row=3,
                     column=4,
                 ),
@@ -263,6 +268,14 @@ class PaperInstructionTests(unittest.TestCase):
                 "RD_MAC 0x3 6 1",
             ),
             (
+                ReadActivation(
+                    channels=channels,
+                    destination=destination,
+                    accumulation_register=1,
+                ),
+                "RD_AF 0x3 6 1",
+            ),
+            (
                 WriteGlobalBuffer(
                     channels=channels,
                     operation_size=2,
@@ -273,9 +286,9 @@ class PaperInstructionTests(unittest.TestCase):
             ),
         )
 
-        # Tables 2 and 3 define seven arithmetic and eleven data-movement
-        # instructions, so the table-driven test must contain all 18.
-        self.assertEqual(len(cases), 18)
+        # Tables 2 and 3 define 18 instructions. RD_AF is the additional AiM
+        # target operation needed to retrieve activation-register results.
+        self.assertEqual(len(cases), 19)
         for instruction, expected in cases:
             with self.subTest(instruction=type(instruction).__name__):
                 validate_instruction(instruction, hardware())
@@ -302,6 +315,7 @@ class PaperInstructionTests(unittest.TestCase):
                 row=0,
                 column=0,
                 accumulation_register=0,
+                operand_source=MacOperandSource.GLOBAL_BUFFER,
             ),
             lambda: ApplyActivation(
                 channels=channels,

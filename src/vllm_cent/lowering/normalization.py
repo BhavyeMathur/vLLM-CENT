@@ -7,6 +7,7 @@ from ..cent import (
     CopyGlobalBufferToBank,
     ElementwiseMultiply,
     MacAllBanks,
+    MacOperandSource,
     ReadMac,
     ReadSingleBank,
     WriteBias,
@@ -98,6 +99,7 @@ def _lower_sum_of_squares(
             row=input_rows.start_row,
             column=0,
             accumulation_register=_SUM_OF_SQUARES_REGISTER,
+            operand_source=MacOperandSource.NEXT_BANK,
         )
     )
     builder.append(
@@ -279,24 +281,33 @@ def lower_rms_norm(
         hardware.burst_length,
     )
 
-    # The copy pair moves the scaled vector beside the learned weights. The
-    # second multiplication applies those weights, completing the known path.
-    builder.append(
-        CopyBankToGlobalBuffer(
-            operation_size=operation_size,
-            channels=channels,
-            row=work_rows.start_row,
-            column=0,
+    # EW_MUL leaves one result in bank two of each four-bank PU group. AiM's
+    # copy instructions name one physical bank, so move every result bank
+    # through the Global Buffer into bank one beside the learned weights in
+    # bank zero.
+    for result_bank in range(
+        _OUTPUT_BANK_GROUP,
+        hardware.num_banks,
+        BANKS_PER_PU,
+    ):
+        builder.append(
+            CopyBankToGlobalBuffer(
+                operation_size=operation_size,
+                channels=channels,
+                bank=result_bank,
+                row=work_rows.start_row,
+                column=0,
+            )
         )
-    )
-    builder.append(
-        CopyGlobalBufferToBank(
-            operation_size=operation_size,
-            channels=channels,
-            row=weight_rows.start_row,
-            column=0,
+        builder.append(
+            CopyGlobalBufferToBank(
+                operation_size=operation_size,
+                channels=channels,
+                bank=result_bank - 1,
+                row=weight_rows.start_row,
+                column=0,
+            )
         )
-    )
     builder.append(
         ElementwiseMultiply(
             operation_size=operation_size,
