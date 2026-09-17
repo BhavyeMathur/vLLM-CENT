@@ -115,6 +115,10 @@ requirements for this repository.
   partitioning, address calculations, and why a particular implementation is
   correct.
 - Place comments next to the code they explain.
+- Explain unusual language mechanisms even when the resulting code is short.
+  State why the ordinary implementation cannot be used and why the chosen
+  mechanism is appropriate. For example, explain that ``object.__setattr__``
+  is needed to normalize a field during initialization of a frozen dataclass.
 - Do not merely translate a line of Python into English. Comments should supply
   the missing reasoning or domain context.
 - Explain every nontrivial hard-coded expected value in tests, including how it
@@ -132,6 +136,10 @@ requirements for this repository.
 
 - Generic hardware types, addresses, instructions, mapping, validation,
   program building, and rendering belong under `vllm_cent/cent/`.
+- Keep layout selection separate from instruction emission. Model and target
+  planners should create immutable operation plans with explicit partitions,
+  placements, channels, and memory bindings. Lowerers should validate and emit
+  the supplied plan without silently choosing a different layout.
 - Reusable operation lowering belongs under `vllm_cent/lowering/`. Keep
   transformer-family operations in a transformer subpackage rather than
   treating them as universal neural-network operations.
@@ -150,6 +158,20 @@ requirements for this repository.
   or commit history. Remove or update the TODO after it is resolved and tested.
   Check the paper and reference code first. If either answers the question,
   document the answer instead of adding a TODO.
+- Put the TODO at the first function or type whose behavior depends on the
+  missing answer. A TODO in a later caller does not adequately document an
+  incomplete lowerer.
+- Audit every lowerer for numerical completeness, not only for valid instruction
+  construction. Trace where every input is initialized, where every result is
+  stored, and whether required packing, padding, reductions, synchronization,
+  and cross-stage transfers are present.
+- A public operation must not silently emit only part of the operation named by
+  its API. If implementation must proceed in stages, name and document the
+  partial stage explicitly and place a TODO at that stage describing what still
+  separates it from the complete mathematical result.
+- Do not treat a structurally valid program or a passing instruction-level test
+  as evidence of numerical correctness. Tests must cover the dataflow contract
+  once an emulator or other numerical oracle is available.
 - Do not invent unsupported instructions, operands, or numeric encodings. If a
   required value is absent from the paper, make it explicit configuration or
   report the unsupported operation clearly.

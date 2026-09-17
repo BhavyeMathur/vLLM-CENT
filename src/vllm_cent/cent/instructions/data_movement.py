@@ -43,6 +43,7 @@ __all__ = [
 # SEND_CXL has no OPsize or byte count. We need its payload size and message
 # boundary rules.
 
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class SendCxl(CentInstruction):
     """Send data from the local Shared Buffer to one CXL device.
@@ -77,6 +78,7 @@ class SendCxl(CentInstruction):
 # We know receive blocks. We need to learn how it chooses a send and reports
 # completion or failure when several messages are waiting.
 
+
 @dataclass(frozen=True, slots=True)
 class ReceiveCxl(CentInstruction):
     """Wait for an incoming CXL transfer.
@@ -95,6 +97,7 @@ class ReceiveCxl(CentInstruction):
 # We know DVcount is 8 bits, but the paper also mentions a device-ID mask. We
 # need the target order, whether it includes the sender, wrapping rules, and
 # payload size. Validation also needs a CXL topology.
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class BroadcastCxl(CentInstruction):
@@ -197,6 +200,7 @@ class ReadSingleBank(CentInstruction):
 # learn what that register does and whether "all banks" means 16 paper banks or
 # every bank on a custom target.
 
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class WriteAllBanks(CentInstruction):
     """Write values from one Shared Buffer slot across a channel's banks.
@@ -231,15 +235,27 @@ class WriteAllBanks(CentInstruction):
         require_nonnegative("channel", self.channel)
         require_nonnegative("row", self.row)
         require_nonnegative("column", self.column)
-        require_nonnegative(
-            "accumulation_register", self.accumulation_register
-        )
+        require_nonnegative("accumulation_register", self.accumulation_register)
 
 
 # Global Buffer and DRAM-bank transfers ------------------------------------
 #
 # Each channel has a Global Buffer used by nearby processing units. CHmask
 # chooses the channels. These copy instructions contain no bank number.
+
+# TODO(ISA): Reconcile the paper and AiM copy-instruction operands.
+#
+# The paper provides a row and column but no bank:
+#
+#     COPY_BKGB CHmask OPsize RO CO
+#
+# AiM instead requires a bank and omits the column:
+#
+#     COPY_BKGB OPsize CHmask BK RO
+#
+# Confirm how CENT chooses the bank, whether AiM's bank is an extension, and
+# whether the real instruction can start anywhere other than column zero.
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CopyBankToGlobalBuffer(CentInstruction):
@@ -320,17 +336,27 @@ class CopyGlobalBufferToBank(CentInstruction):
 # These commands move data between the Shared Buffer and MAC result registers.
 # Regid is a register number; Rs and Rd are Shared Buffer slots.
 
-# TODO(ISA): Define how Rs and Rd work when CHmask selects several channels.
+# TODO(ISA): Define where RD_MAC stores results from several channels.
 #
-# RD_MAC may produce one value per channel but has only one Rd. We need to know
-# how those results occupy separate slots. We also need to know whether WR_BIAS
-# broadcasts one Rs or reads a different slot for each channel.
+# One channel produces a 256-bit result containing values from its 16 banks.
+# RD_MAC still provides only one Rd when CHmask selects several channels. Confirm
+# whether those channel results use consecutive slots, channel-local slots, or
+# another layout. Also confirm whether WR_BIAS broadcasts one Rs or reads a
+# different slot for each channel.
 
 
 # TODO(ISA): Define which accumulator WR_BIAS initializes.
 #
-# MAC_ABK names a register, but WR_BIAS does not. Current GEMV lowering assumes
-# the source slot selects the register. We need to confirm that rule.
+# MAC_ABK and RD_MAC name a register, but WR_BIAS does not. Confirm whether it
+# selects an implicit register, initializes every register, or uses hidden state.
+
+
+# TODO(runtime): Define how WR_BIAS source values enter the Shared Buffer.
+#
+# WR_BIAS reads Rs; it does not create a constant. Operations that start an
+# accumulation need a slot containing zeros, but neither the paper trace nor the
+# public AiM timing simulator defines how the runtime loads that slot.
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class WriteBias(CentInstruction):
@@ -375,9 +401,7 @@ class ReadMac(CentInstruction):
             ValueError: If ``accumulation_register`` is negative.
         """
 
-        require_nonnegative(
-            "accumulation_register", self.accumulation_register
-        )
+        require_nonnegative("accumulation_register", self.accumulation_register)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -408,9 +432,7 @@ class ReadActivation(CentInstruction):
             ValueError: If ``accumulation_register`` is negative.
         """
 
-        require_nonnegative(
-            "accumulation_register", self.accumulation_register
-        )
+        require_nonnegative("accumulation_register", self.accumulation_register)
 
 
 # Shared Buffer to Global Buffer -------------------------------------------

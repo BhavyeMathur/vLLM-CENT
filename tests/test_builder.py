@@ -15,6 +15,7 @@ from vllm_cent.cent import (
 )
 from vllm_cent.cent.builder import _single_bank_transfers
 
+
 def make_builder(*, num_channels: int = 1) -> CentProgramBuilder:
     """Create the small CENT builder used by these tests.
 
@@ -395,25 +396,38 @@ class CentProgramBuilderTests(unittest.TestCase):
         )
         # These calls use an invalid channel count, bank count, group, or size.
         invalid_calls = (
-            lambda: builder.emit_bank_group_transfer(
-                ReadSingleBank, 0, 1, 0, 0, 4
-            ),
-            lambda: builder.emit_bank_group_transfer(
-                ReadSingleBank, 3, 1, 0, 0, 4
-            ),
-            lambda: builder.emit_bank_group_transfer(
-                ReadSingleBank, 1, 0, 0, 0, 4
-            ),
-            lambda: builder.emit_bank_group_transfer(
-                ReadSingleBank, 1, 1, 4, 0, 4
-            ),
-            lambda: builder.emit_bank_group_transfer(
-                ReadSingleBank, 1, 1, 0, 0, 0
-            ),
+            lambda: builder.emit_bank_group_transfer(ReadSingleBank, 0, 1, 0, 0, 4),
+            lambda: builder.emit_bank_group_transfer(ReadSingleBank, 3, 1, 0, 0, 4),
+            lambda: builder.emit_bank_group_transfer(ReadSingleBank, 1, 0, 0, 0, 4),
+            lambda: builder.emit_bank_group_transfer(ReadSingleBank, 1, 1, 4, 0, 4),
+            lambda: builder.emit_bank_group_transfer(ReadSingleBank, 1, 1, 0, 0, 0),
         )
         for call in invalid_calls:
             with self.assertRaises(ValueError):
                 call()
+
+        two_channel_block = CentProgramBuilder(
+            CentHardwareSpec(
+                num_channels=4,
+                num_banks=4,
+                dram_rows=64,
+                dram_columns=16,
+                burst_length=4,
+                accumulator_slots_per_bank=2,
+                sigmoid_activation_function_id=0,
+                shared_buffer_slots=32,
+            ),
+            CentBlockPlacementSpec(channels_per_block=2),
+        )
+        with self.assertRaisesRegex(ValueError, "placement.channels_per_block"):
+            two_channel_block.emit_bank_group_transfer(
+                ReadSingleBank,
+                channels_required=1,
+                utilized_banks=1,
+                bank_group=0,
+                row=0,
+                size_per_bank=4,
+            )
 
     def test_append_validates_and_finish_freezes_the_sequence(self) -> None:
         """Freeze the instruction sequence when the builder finishes."""
@@ -438,6 +452,71 @@ class CentProgramBuilderTests(unittest.TestCase):
             builder.finish()
         with self.assertRaises(ValueError):
             builder.append(program.instructions[0])
+
+    def test_batch_append_rejects_every_instruction_atomically(self) -> None:
+        """Leave the builder unchanged when a later command is invalid."""
+
+        builder = make_builder()
+        valid = WriteSingleBank(
+            address=CentMemoryAddress(
+                channel=0,
+                bank=0,
+                row=0,
+                column=0,
+            ),
+            operation_size=1,
+            source=CentSharedBufferAddress(slot=0),
+        )
+        invalid = WriteSingleBank(
+            # The test target provides rows 0 through 63. Row 64 therefore
+            # fails target validation after the first command has been checked.
+            address=CentMemoryAddress(
+                channel=0,
+                bank=0,
+                row=64,
+                column=0,
+            ),
+            operation_size=1,
+            source=CentSharedBufferAddress(slot=1),
+        )
+
+        with self.assertRaisesRegex(ValueError, "row"):
+            builder._append_all((valid, invalid))
+        self.assertEqual(builder.instructions, [])
+
+        builder._append_all((valid,))
+        self.assertEqual(builder.instructions, [valid])
+
+    def test_multi_instruction_emitters_do_not_leave_partial_work(self) -> None:
+        """Reject invalid later rows or slots without keeping a valid prefix."""
+
+        row_builder = make_builder()
+        with self.assertRaisesRegex(ValueError, "row"):
+            # Row 63 has room for the first burst at column 12. The second
+            # burst would continue into nonexistent row 64.
+            row_builder.emit_single_bank_transfer(
+                WriteSingleBank,
+                channel=0,
+                bank=0,
+                row=63,
+                column=12,
+                value_count=8,
+            )
+        self.assertEqual(row_builder.instructions, [])
+
+        buffer_builder = make_builder()
+        with self.assertRaisesRegex(ValueError, "Shared Buffer"):
+            # Partition zero uses the final valid slot 31. Partition one would
+            # begin at slot 32, outside this target's 32-slot buffer.
+            buffer_builder.emit_neighbor_bank_transfer(
+                WriteSingleBank,
+                value_count=8,
+                bank_group=0,
+                row=0,
+                size_per_bank=4,
+                shared_buffer=CentSharedBufferAddress(slot=31),
+            )
+        self.assertEqual(buffer_builder.instructions, [])
 
 
 if __name__ == "__main__":

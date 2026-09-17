@@ -120,9 +120,7 @@ def _require_zero_column(instruction: CentInstruction, column: int) -> None:
         )
 
 
-def _require_simulator_register(
-    instruction: CentInstruction, register: int
-) -> None:
+def _require_simulator_register(instruction: CentInstruction, register: int) -> None:
     """Reject a MAC register ID absent from the AiM trace grammar.
 
     Args:
@@ -135,8 +133,7 @@ def _require_simulator_register(
 
     if register != _SIMULATOR_REGISTER:
         raise AimSimulatorCompatibilityError(
-            f"AiM trace cannot encode {instruction.opcode.value} register "
-            f"{register}"
+            f"AiM trace cannot encode {instruction.opcode.value} register {register}"
         )
 
 
@@ -180,7 +177,9 @@ def render_aim_instruction(instruction: CentInstruction) -> tuple[str, ...]:
 
     Configuration-register writes are emitted immediately before operations
     whose meaning depends on that hidden state. The result may therefore hold
-    more than one line.
+    more than one line. Callers rendering a standalone instruction are
+    responsible for validating its target-dependent address bounds first;
+    :func:`render_aim_trace` receives an already validated program.
 
     Args:
         instruction: Typed CENT instruction to serialize.
@@ -198,9 +197,7 @@ def render_aim_instruction(instruction: CentInstruction) -> tuple[str, ...]:
 
     if isinstance(instruction, WriteAllBanks):
         _require_zero_column(instruction, instruction.column)
-        _require_simulator_register(
-            instruction, instruction.accumulation_register
-        )
+        _require_simulator_register(instruction, instruction.accumulation_register)
         channels = CentChannelSet(channels=(instruction.channel,))
         return (
             f"AiM WR_ABK {instruction.source.slot} "
@@ -209,9 +206,7 @@ def render_aim_instruction(instruction: CentInstruction) -> tuple[str, ...]:
 
     if isinstance(instruction, MacAllBanks):
         _require_zero_column(instruction, instruction.column)
-        _require_simulator_register(
-            instruction, instruction.accumulation_register
-        )
+        _require_simulator_register(instruction, instruction.accumulation_register)
         channel_mask = render_aim_channel_mask(instruction.channels)
         # CFR0 is persistent simulator state rather than a MAC_ABK operand.
         # Reassert it immediately before every MAC so the rendered meaning does
@@ -231,19 +226,14 @@ def render_aim_instruction(instruction: CentInstruction) -> tuple[str, ...]:
         )
 
     if isinstance(instruction, ApplyActivation):
-        _require_simulator_register(
-            instruction, instruction.accumulation_register
-        )
+        _require_simulator_register(instruction, instruction.accumulation_register)
         channel_mask = render_aim_channel_mask(instruction.channels)
         return (
-            f"W CFR {_ACTIVATION_FUNCTION_CFR} "
-            f"{instruction.activation_function_id}",
+            f"W CFR {_ACTIVATION_FUNCTION_CFR} {instruction.activation_function_id}",
             f"AiM AF {channel_mask}",
         )
 
-    if isinstance(
-        instruction, (CopyBankToGlobalBuffer, CopyGlobalBufferToBank)
-    ):
+    if isinstance(instruction, (CopyBankToGlobalBuffer, CopyGlobalBufferToBank)):
         _require_zero_column(instruction, instruction.column)
         return (
             f"AiM {instruction.opcode.value} {instruction.operation_size} "
@@ -258,9 +248,7 @@ def render_aim_instruction(instruction: CentInstruction) -> tuple[str, ...]:
         )
 
     if isinstance(instruction, (ReadMac, ReadActivation)):
-        _require_simulator_register(
-            instruction, instruction.accumulation_register
-        )
+        _require_simulator_register(instruction, instruction.accumulation_register)
         return (
             f"AiM {instruction.opcode.value} {instruction.destination.slot} "
             f"{render_aim_channel_mask(instruction.channels)}",
@@ -274,8 +262,15 @@ def render_aim_instruction(instruction: CentInstruction) -> tuple[str, ...]:
             f"{render_aim_channel_mask(instruction.channels)}",
         )
 
+    # Known CENT instructions report their assembly name. The base class and
+    # unknown subclasses have no opcode, so report the Python type without
+    # accidentally raising AttributeError while formatting this error.
+    opcode = getattr(type(instruction), "OPCODE", None)
+    instruction_name = (
+        opcode.value if opcode is not None else type(instruction).__name__
+    )
     raise AimSimulatorCompatibilityError(
-        f"AiM simulator does not implement {instruction.opcode.value}"
+        f"AiM simulator does not implement {instruction_name}"
     )
 
 

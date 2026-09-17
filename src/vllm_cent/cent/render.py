@@ -75,7 +75,9 @@ def render_instruction(instruction: CentInstruction) -> str:
     """Render one instruction in the operand order used by the paper.
 
     For example, Python's ``address.row`` becomes ``RO``. A Shared Buffer slot
-    becomes ``Rs`` when read and ``Rd`` when written.
+    becomes ``Rs`` when read and ``Rd`` when written. This inspection format is
+    not round-trippable: it omits semantic fields that the paper's assembly
+    table does not encode, such as the MAC operand source and copy-bank index.
 
     Args:
         instruction: Typed CENT command to render.
@@ -87,11 +89,8 @@ def render_instruction(instruction: CentInstruction) -> str:
         TypeError: If ``instruction`` has an unknown type.
     """
 
-    # Rendering only changes representation. All placement and address choices
-    # have already been made by the compiler.
-    opcode = instruction.opcode.value
-
     if isinstance(instruction, (WriteSingleBank, ReadSingleBank)):
+        opcode = instruction.opcode.value
         address = instruction.address
 
         # WR_SBK reads its Shared Buffer source. RD_SBK writes its Shared Buffer
@@ -106,18 +105,21 @@ def render_instruction(instruction: CentInstruction) -> str:
             f"{address.bank} {address.row} {address.column} {buffer.slot}"
         )
     if isinstance(instruction, MacAllBanks):
+        opcode = instruction.opcode.value
         return (
             f"{opcode} {render_channel_mask(instruction.channels)} "
             f"{instruction.operation_size} {instruction.row} "
             f"{instruction.column} {instruction.accumulation_register}"
         )
     if isinstance(instruction, ElementwiseMultiply):
+        opcode = instruction.opcode.value
         return (
             f"{opcode} {render_channel_mask(instruction.channels)} "
             f"{instruction.operation_size} {instruction.row} "
             f"{instruction.column}"
         )
     if isinstance(instruction, ApplyActivation):
+        opcode = instruction.opcode.value
         return (
             f"{opcode} {render_channel_mask(instruction.channels)} "
             f"{instruction.activation_function_id} "
@@ -125,66 +127,72 @@ def render_instruction(instruction: CentInstruction) -> str:
         )
     # EXP, RED, and ACC use the same OPsize/Rd/Rs field order.
     if isinstance(instruction, (Exponent, Reduction, Accumulate)):
+        opcode = instruction.opcode.value
         return f"{opcode} {_shared_buffer_operands(instruction)}"
     if isinstance(instruction, RunRiscV):
+        opcode = instruction.opcode.value
         return (
             f"{opcode} {instruction.operation_size} "
             f"{instruction.program_counter} {instruction.destination.slot} "
             f"{instruction.source.slot}"
         )
     if isinstance(instruction, SendCxl):
+        opcode = instruction.opcode.value
         return (
             f"{opcode} {instruction.destination_device} "
             f"{instruction.source.slot} {instruction.destination.slot}"
         )
     if isinstance(instruction, ReceiveCxl):
-        return opcode
+        return instruction.opcode.value
     if isinstance(instruction, BroadcastCxl):
+        opcode = instruction.opcode.value
         return (
             f"{opcode} {instruction.device_count} {instruction.source.slot} "
             f"{instruction.destination.slot}"
         )
     if isinstance(instruction, WriteAllBanks):
+        opcode = instruction.opcode.value
         return (
             f"{opcode} {instruction.channel} {instruction.row} "
             f"{instruction.column} {instruction.source.slot} "
             f"{instruction.accumulation_register}"
         )
     # The opcode, rather than an operand, records the direction of these copies.
-    if isinstance(
-        instruction, (CopyBankToGlobalBuffer, CopyGlobalBufferToBank)
-    ):
+    if isinstance(instruction, (CopyBankToGlobalBuffer, CopyGlobalBufferToBank)):
+        opcode = instruction.opcode.value
         return (
             f"{opcode} {render_channel_mask(instruction.channels)} "
             f"{instruction.operation_size} {instruction.row} "
             f"{instruction.column}"
         )
     if isinstance(instruction, WriteBias):
+        opcode = instruction.opcode.value
         return (
             f"{opcode} {render_channel_mask(instruction.channels)} "
             f"{instruction.source.slot}"
         )
     if isinstance(instruction, ReadMac):
+        opcode = instruction.opcode.value
         return (
             f"{opcode} {render_channel_mask(instruction.channels)} "
             f"{instruction.destination.slot} "
             f"{instruction.accumulation_register}"
         )
     if isinstance(instruction, ReadActivation):
+        opcode = instruction.opcode.value
         return (
             f"{opcode} {render_channel_mask(instruction.channels)} "
             f"{instruction.destination.slot} "
             f"{instruction.accumulation_register}"
         )
     if isinstance(instruction, WriteGlobalBuffer):
+        opcode = instruction.opcode.value
         return (
             f"{opcode} {render_channel_mask(instruction.channels)} "
             f"{instruction.operation_size} {instruction.column} "
             f"{instruction.source.slot}"
         )
-    raise TypeError(
-        f"unsupported CENT instruction type: {type(instruction).__name__}"
-    )
+    raise TypeError(f"unsupported CENT instruction type: {type(instruction).__name__}")
 
 
 def render_text_program(program: CentProgram) -> str:
@@ -198,6 +206,9 @@ def render_text_program(program: CentProgram) -> str:
     """
 
     # The final newline makes the result a normal text file.
-    return "\n".join(
-        render_instruction(instruction) for instruction in program.instructions
-    ) + "\n"
+    return (
+        "\n".join(
+            render_instruction(instruction) for instruction in program.instructions
+        )
+        + "\n"
+    )

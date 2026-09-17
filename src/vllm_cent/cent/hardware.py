@@ -63,13 +63,8 @@ class CentHardwareSpec:
             raise ValueError("num_channels must be between 1 and 32")
 
         # A partial four-bank group cannot be assigned to a processing unit.
-        if (
-            self.num_banks < BANKS_PER_PU
-            or self.num_banks % BANKS_PER_PU != 0
-        ):
-            raise ValueError(
-                "num_banks must be at least 4 and divisible by 4"
-            )
+        if self.num_banks < BANKS_PER_PU or self.num_banks % BANKS_PER_PU != 0:
+            raise ValueError("num_banks must be at least 4 and divisible by 4")
         # One burst cannot cross a row boundary, so a row must contain a whole
         # number of bursts.
         if self.dram_rows < 1:

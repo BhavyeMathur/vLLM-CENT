@@ -9,6 +9,7 @@ from vllm_cent.cent import (
     BroadcastCxl,
     CentChannelSet,
     CentHardwareSpec,
+    CentInstruction,
     CentMemoryAddress,
     CentOpcode,
     CentProgram,
@@ -48,6 +49,7 @@ from vllm_cent.cent.render import (
     render_channel_mask,
 )
 from vllm_cent.cent.utils import require_nonnegative, require_positive
+
 
 def hardware() -> CentHardwareSpec:
     """Create the small hardware target used by these tests.
@@ -113,6 +115,8 @@ class PrimitiveValueTests(unittest.TestCase):
         channels = CentChannelSet(channels=(0, 3))
 
         self.assertEqual(channels, CentChannelSet(channels=(0, 3)))
+        self.assertEqual(channels, CentChannelSet(channels=(3, 0)))
+        self.assertEqual(hash(channels), hash(CentChannelSet(channels=(3, 0))))
         # CHmask uses one bit per channel: channels 0 and 3 set binary 1001,
         # which is rendered as hexadecimal 0x9.
         self.assertEqual(render_channel_mask(channels), "0x9")
@@ -404,9 +408,7 @@ class HardwareValidationTests(unittest.TestCase):
         validate_shared_buffer_address(CentSharedBufferAddress(slot=7), target)
         _validate_row_column(7, 15, target)
         _validate_operation_span(1, 12, target)
-        _validate_shared_buffer_span(
-            CentSharedBufferAddress(slot=6), 2, target
-        )
+        _validate_shared_buffer_span(CentSharedBufferAddress(slot=6), 2, target)
         _validate_accumulation_register(1, target)
 
         # Each invalid case moves one step past a limit. The two-operation
@@ -489,9 +491,7 @@ class ProgramAndRenderingTests(unittest.TestCase):
         """Require at least one instruction in a program."""
 
         instruction = ReceiveCxl()
-        program = CentProgram(
-            hardware=hardware(), instructions=(instruction,)
-        )
+        program = CentProgram(hardware=hardware(), instructions=(instruction,))
         self.assertEqual(program.hardware, hardware())
         self.assertEqual(program.instructions, (instruction,))
         with self.assertRaises(ValueError):
@@ -527,6 +527,12 @@ class ProgramAndRenderingTests(unittest.TestCase):
         # Table 2 orders these operands as OPsize, destination Rd, then source
         # Rs, hence two operations followed by slots 6 and 5.
         self.assertEqual(_shared_buffer_operands(instruction), "2 6 5")
+
+    def test_renderer_rejects_an_instruction_without_an_opcode(self) -> None:
+        """Report an unsupported base instruction with the documented error."""
+
+        with self.assertRaisesRegex(TypeError, "CentInstruction"):
+            render_instruction(CentInstruction())
 
 
 if __name__ == "__main__":

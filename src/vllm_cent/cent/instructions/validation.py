@@ -39,9 +39,7 @@ __all__ = [
 ]
 
 
-def validate_address(
-    address: CentMemoryAddress, hardware: CentHardwareSpec
-) -> None:
+def validate_address(address: CentMemoryAddress, hardware: CentHardwareSpec) -> None:
     """Check that every part of a DRAM address exists on the target.
 
     Args:
@@ -60,9 +58,7 @@ def validate_address(
     _validate_row_column(address.row, address.column, hardware)
 
 
-def validate_channels(
-    channels: CentChannelSet, hardware: CentHardwareSpec
-) -> None:
+def validate_channels(channels: CentChannelSet, hardware: CentHardwareSpec) -> None:
     """Check that every channel selected by ``CHmask`` exists.
 
     Args:
@@ -96,9 +92,7 @@ def validate_shared_buffer_address(
         raise ValueError("Shared Buffer address is outside the target")
 
 
-def _validate_row_column(
-    row: int, column: int, hardware: CentHardwareSpec
-) -> None:
+def _validate_row_column(row: int, column: int, hardware: CentHardwareSpec) -> None:
     """Check a DRAM row and column against the target.
 
     Args:
@@ -204,9 +198,7 @@ def validate_instruction(
             raise ValueError("instruction channel is outside the target")
         _validate_row_column(instruction.row, instruction.column, hardware)
         validate_shared_buffer_address(instruction.source, hardware)
-        _validate_accumulation_register(
-            instruction.accumulation_register, hardware
-        )
+        _validate_accumulation_register(instruction.accumulation_register, hardware)
         return
 
     # Every instruction in this group contains a CHmask.
@@ -241,9 +233,10 @@ def validate_instruction(
             instruction.operation_size, instruction.column, hardware
         )
 
-    if isinstance(
-        instruction, (CopyBankToGlobalBuffer, CopyGlobalBufferToBank)
-    ) and instruction.bank >= hardware.num_banks:
+    if (
+        isinstance(instruction, (CopyBankToGlobalBuffer, CopyGlobalBufferToBank))
+        and instruction.bank >= hardware.num_banks
+    ):
         raise ValueError("copy bank is outside the target channel")
 
     # Regid selects a MAC register, not a DRAM or Shared Buffer address.
@@ -251,9 +244,7 @@ def validate_instruction(
         instruction,
         (MacAllBanks, ApplyActivation, ReadActivation, ReadMac),
     ):
-        _validate_accumulation_register(
-            instruction.accumulation_register, hardware
-        )
+        _validate_accumulation_register(instruction.accumulation_register, hardware)
 
     # Check the Shared Buffer fields and any spans implied by OPsize.
     if isinstance(instruction, WriteBias):
@@ -318,9 +309,7 @@ def validate_instruction(
         )
 
 
-def _validate_accumulation_register(
-    register: int, hardware: CentHardwareSpec
-) -> None:
+def _validate_accumulation_register(register: int, hardware: CentHardwareSpec) -> None:
     """Check a ``Regid`` against the target's MAC register count.
 
     Args:

@@ -52,8 +52,8 @@ class CentChannelSet:
 
     Attributes:
         channels: Unique, zero-based channel numbers. At least one channel is
-            required. Order is preserved for display but does not change the
-            meaning of the mask.
+            required. The tuple is stored in ascending order because order does
+            not change the meaning of a channel mask.
     """
 
     channels: tuple[int, ...]
@@ -77,6 +77,13 @@ class CentChannelSet:
         # Each channel contributes one bit, so listing it twice has no meaning.
         if len(set(self.channels)) != len(self.channels):
             raise ValueError("channels cannot contain duplicates")
+
+        # A channel mask is a set. Canonical storage makes equality and hashing
+        # reflect that meaning instead of the caller's tuple order.
+        # A frozen dataclass rejects normal assignment, even in __post_init__.
+        # object.__setattr__ allows this one-time normalization during creation;
+        # the completed object remains immutable.
+        object.__setattr__(self, "channels", tuple(sorted(self.channels)))
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

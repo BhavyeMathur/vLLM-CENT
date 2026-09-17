@@ -56,16 +56,6 @@ python_version = "3.14"
 strict = true
 files = ["src"]
 
-# These lowering modules reassign narrow inferred values to sibling union
-# members. Keep every other strict mypy check active while that code is refined.
-[[tool.mypy.overrides]]
-module = [
-    "vllm_cent.lowering.transformer.attention",
-    "vllm_cent.models.llama.attention",
-    "vllm_cent.models.llama.feed_forward",
-]
-disable_error_code = ["assignment"]
-
 [tool.coverage.run]
 branch = true
 source = ["vllm_cent"]

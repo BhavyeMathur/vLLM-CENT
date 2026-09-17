@@ -1,6 +1,6 @@
 """Map logical data transfers to valid CENT instructions."""
 
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from typing import TypeAlias
 
 from .hardware import BANKS_PER_PU, CentBlockPlacementSpec, CentHardwareSpec
@@ -18,22 +18,20 @@ from .utils import ceil_div, require_nonnegative, require_positive
 
 __all__ = ["CentProgramBuilder"]
 
-SingleBankInstructionType: TypeAlias = (
-        type[WriteSingleBank] | type[ReadSingleBank]
-)
+SingleBankInstructionType: TypeAlias = type[WriteSingleBank] | type[ReadSingleBank]
 
 
 def _single_bank_transfers(
-        instruction_type: SingleBankInstructionType,
-        *,
-        channel: int,
-        bank: int,
-        row: int,
-        column: int,
-        value_count: int,
-        shared_buffer: CentSharedBufferAddress,
-        burst_length: int,
-        row_width: int,
+    instruction_type: SingleBankInstructionType,
+    *,
+    channel: int,
+    bank: int,
+    row: int,
+    column: int,
+    value_count: int,
+    shared_buffer: CentSharedBufferAddress,
+    burst_length: int,
+    row_width: int,
 ) -> Iterator[WriteSingleBank | ReadSingleBank]:
     """Split one transfer into instructions that do not cross DRAM rows.
 
@@ -61,9 +59,9 @@ def _single_bank_transfers(
     """
 
     for name, value in (
-            ("value_count", value_count),
-            ("burst_length", burst_length),
-            ("row_width", row_width),
+        ("value_count", value_count),
+        ("burst_length", burst_length),
+        ("row_width", row_width),
     ):
         require_positive(name, value)
     require_nonnegative("column", column)
@@ -144,7 +142,7 @@ class CentProgramBuilder:
     # every replica, and then represent each physical group explicitly.
 
     def __init__(
-            self, hardware: CentHardwareSpec, placement: CentBlockPlacementSpec
+        self, hardware: CentHardwareSpec, placement: CentBlockPlacementSpec
     ) -> None:
         """Create an empty builder and check its channel allocation.
 
@@ -200,14 +198,20 @@ class CentProgramBuilder:
             ValueError: If it is outside its valid range.
         """
 
+        # TODO(placement): Keep matrix copies inside their block channel regions.
+        #
+        # This method currently packs copies every ``channels_per_matrix``. Other
+        # transfer helpers space copies every ``channels_per_block``. When those
+        # sizes differ, the two methods select different physical layouts.
+
         if not 1 <= utilized_banks <= self.total_banks:
             raise ValueError("utilized_banks must be between 1 and total_banks")
         # Banks are filled one channel at a time. Round up to find the whole
         # channels needed by one copy, then keep every complete copy on the device.
         channels_per_matrix = ceil_div(utilized_banks, self.hardware.num_banks)
         count = (
-                        self.hardware.num_channels // channels_per_matrix
-                ) * channels_per_matrix
+            self.hardware.num_channels // channels_per_matrix
+        ) * channels_per_matrix
         return CentChannelSet(channels=tuple(range(count)))
 
     def channel_set(self, channels: range | tuple[int, ...]) -> CentChannelSet:
@@ -259,21 +263,41 @@ class CentProgramBuilder:
                 was already finished.
         """
 
+        self._append_all((instruction,))
+
+    def _append_all(self, instructions: Iterable[CentInstruction]) -> None:
+        """Validate and append one instruction batch atomically.
+
+        Args:
+            instructions: Commands to append in their execution order.
+
+        Raises:
+            TypeError: If any command is unsupported.
+            ValueError: If any command is incompatible with the target or the
+                builder was already finished.
+        """
+
         if self._finished:
             raise ValueError("cannot append after the builder is finished")
-        validate_instruction(instruction, self.hardware)
-        self.instructions.append(instruction)
+
+        # Materialize generators before validation. If instruction generation
+        # or validation fails, the builder remains exactly as it was before the
+        # batch began.
+        pending = tuple(instructions)
+        for instruction in pending:
+            validate_instruction(instruction, self.hardware)
+        self.instructions.extend(pending)
 
     def emit_single_bank_transfer(
-            self,
-            instruction_type: SingleBankInstructionType,
-            channel: int,
-            bank: int,
-            row: int,
-            value_count: int,
-            *,
-            column: int = 0,
-            shared_buffer: CentSharedBufferAddress | None = None,
+        self,
+        instruction_type: SingleBankInstructionType,
+        channel: int,
+        bank: int,
+        row: int,
+        value_count: int,
+        *,
+        column: int = 0,
+        shared_buffer: CentSharedBufferAddress | None = None,
     ) -> None:
         """Move values between the Shared Buffer and one DRAM bank.
 
@@ -296,7 +320,8 @@ class CentProgramBuilder:
 
         # The helper decides where row splits occur. append() then checks each
         # generated instruction against the hardware.
-        for instruction in _single_bank_transfers(
+        self._append_all(
+            _single_bank_transfers(
                 instruction_type,
                 channel=channel,
                 bank=bank,
@@ -306,18 +331,18 @@ class CentProgramBuilder:
                 shared_buffer=buffer_address,
                 burst_length=self.hardware.burst_length,
                 row_width=self.hardware.dram_columns,
-        ):
-            self.append(instruction)
+            )
+        )
 
     def emit_neighbor_bank_transfer(
-            self,
-            instruction_type: SingleBankInstructionType,
-            value_count: int,
-            bank_group: int,
-            row: int,
-            size_per_bank: int,
-            *,
-            shared_buffer: CentSharedBufferAddress | None = None,
+        self,
+        instruction_type: SingleBankInstructionType,
+        value_count: int,
+        bank_group: int,
+        row: int,
+        size_per_bank: int,
+        *,
+        shared_buffer: CentSharedBufferAddress | None = None,
     ) -> None:
         """Transfer vector pieces through one bank in each neighboring pair.
 
@@ -362,39 +387,41 @@ class CentProgramBuilder:
         # A new vector piece starts after the slots used by earlier pieces. An
         # explicit base keeps unrelated tensors from silently sharing slot zero.
         first_buffer = shared_buffer or CentSharedBufferAddress(slot=0)
-        slots_per_partition = ceil_div(
-            size_per_bank, self.hardware.burst_length
-        )
+        slots_per_partition = ceil_div(size_per_bank, self.hardware.burst_length)
+        instructions: list[WriteSingleBank | ReadSingleBank] = []
         for partition in range(partitions):
             channel, bank = self.bank_index(partition * 2 + bank_group)
             buffer = CentSharedBufferAddress(
-                slot=(
-                    first_buffer.slot
-                    + partition * slots_per_partition
-                )
+                slot=(first_buffer.slot + partition * slots_per_partition)
             )
             for copy in range(copies):
                 # Replicas use the same bank and Shared Buffer slots in another
                 # physical channel group.
-                self.emit_single_bank_transfer(
-                    instruction_type,
-                    channel + self.placement.channels_per_block * copy,
-                    bank,
-                    row,
-                    size_per_bank,
-                    shared_buffer=buffer,
+                instructions.extend(
+                    _single_bank_transfers(
+                        instruction_type,
+                        channel=(channel + self.placement.channels_per_block * copy),
+                        bank=bank,
+                        row=row,
+                        column=0,
+                        value_count=size_per_bank,
+                        shared_buffer=buffer,
+                        burst_length=self.hardware.burst_length,
+                        row_width=self.hardware.dram_columns,
+                    )
                 )
+        self._append_all(instructions)
 
     def emit_bank_group_transfer(
-            self,
-            instruction_type: SingleBankInstructionType,
-            channels_required: int,
-            utilized_banks: int,
-            bank_group: int,
-            row: int,
-            size_per_bank: int,
-            *,
-            shared_buffer: CentSharedBufferAddress | None = None,
+        self,
+        instruction_type: SingleBankInstructionType,
+        channels_required: int,
+        utilized_banks: int,
+        bank_group: int,
+        row: int,
+        size_per_bank: int,
+        *,
+        shared_buffer: CentSharedBufferAddress | None = None,
     ) -> None:
         """Transfer vector pieces through one bank in each four-bank group.
 
@@ -412,44 +439,44 @@ class CentProgramBuilder:
             ValueError: If a channel, group, or size value is invalid.
         """
 
-        # TODO(placement): ``channels_required`` controls replication, but bank
-        # numbering uses ``placement.channels_per_block``. We need to decide if
-        # these values may differ or remove the duplicate placement value.
-
         require_positive("channels_required", channels_required)
         require_positive("utilized_banks", utilized_banks)
         require_positive("size_per_bank", size_per_bank)
         if self.hardware.num_channels % channels_required:
             raise ValueError("channels_required must divide num_channels")
+        if channels_required != self.placement.channels_per_block:
+            raise ValueError(
+                "channels_required must equal placement.channels_per_block"
+            )
         if bank_group not in range(BANKS_PER_PU):
             raise ValueError("bank_group must be between 0 and 3")
 
         # bank_group selects the same position from each four-bank group.
         copies = self.hardware.num_channels // channels_required
         first_buffer = shared_buffer or CentSharedBufferAddress(slot=0)
-        slots_per_partition = ceil_div(
-            size_per_bank, self.hardware.burst_length
-        )
+        slots_per_partition = ceil_div(size_per_bank, self.hardware.burst_length)
+        instructions: list[WriteSingleBank | ReadSingleBank] = []
         for partition in range(utilized_banks):
-            channel, bank = self.bank_index(
-                partition * BANKS_PER_PU + bank_group
-            )
+            channel, bank = self.bank_index(partition * BANKS_PER_PU + bank_group)
             buffer = CentSharedBufferAddress(
-                slot=(
-                    first_buffer.slot
-                    + partition * slots_per_partition
-                )
+                slot=(first_buffer.slot + partition * slots_per_partition)
             )
             for copy in range(copies):
                 # Each copied layout uses the same Shared Buffer piece.
-                self.emit_single_bank_transfer(
-                    instruction_type,
-                    channel + channels_required * copy,
-                    bank,
-                    row,
-                    size_per_bank,
-                    shared_buffer=buffer,
+                instructions.extend(
+                    _single_bank_transfers(
+                        instruction_type,
+                        channel=channel + channels_required * copy,
+                        bank=bank,
+                        row=row,
+                        column=0,
+                        value_count=size_per_bank,
+                        shared_buffer=buffer,
+                        burst_length=self.hardware.burst_length,
+                        row_width=self.hardware.dram_columns,
+                    )
                 )
+        self._append_all(instructions)
 
     def finish(self) -> CentProgram:
         """Finish building and return an immutable program.

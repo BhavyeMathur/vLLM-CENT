@@ -2,6 +2,7 @@ import unittest
 
 from vllm_cent import LlamaModelSpec
 
+
 class LlamaModelSpecTests(unittest.TestCase):
     """Test Llama model dimensions."""
 

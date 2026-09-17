@@ -92,16 +92,12 @@ class AimTraceRenderingTests(unittest.TestCase):
         channel_zero = CentChannelSet(channels=(0,))
         instructions = (
             WriteSingleBank(
-                address=CentMemoryAddress(
-                    channel=0, bank=2, row=3, column=0
-                ),
+                address=CentMemoryAddress(channel=0, bank=2, row=3, column=0),
                 operation_size=2,
                 source=CentSharedBufferAddress(slot=5),
             ),
             ReadSingleBank(
-                address=CentMemoryAddress(
-                    channel=0, bank=2, row=3, column=0
-                ),
+                address=CentMemoryAddress(channel=0, bank=2, row=3, column=0),
                 operation_size=1,
                 destination=CentSharedBufferAddress(slot=7),
             ),
@@ -174,9 +170,7 @@ class AimTraceRenderingTests(unittest.TestCase):
                 column=0,
             ),
         )
-        program = CentProgram(
-            hardware=aim_hardware(), instructions=instructions
-        )
+        program = CentProgram(hardware=aim_hardware(), instructions=instructions)
 
         # WR_SBK expands into two one-burst records because AiM's grammar has
         # no OPsize field. MAC mode and AFid become explicit CFR writes.
@@ -237,9 +231,7 @@ class AimTraceCompatibilityTests(unittest.TestCase):
             replace(base.hardware, burst_length=8),
         ):
             with self.subTest(hardware=hardware):
-                changed = CentProgram(
-                    hardware=hardware, instructions=base.instructions
-                )
+                changed = CentProgram(hardware=hardware, instructions=base.instructions)
                 with self.assertRaises(AimSimulatorCompatibilityError):
                     validate_aim_hardware(changed)
 
@@ -284,6 +276,12 @@ class AimTraceCompatibilityTests(unittest.TestCase):
             "does not implement ACC",
         ):
             render_aim_trace(program_with(instruction))
+
+        with self.assertRaisesRegex(
+            AimSimulatorCompatibilityError,
+            "CentInstruction",
+        ):
+            render_aim_instruction(CentInstruction())
 
 
 if __name__ == "__main__":

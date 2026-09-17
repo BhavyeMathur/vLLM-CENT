@@ -7,10 +7,12 @@ __all__ = ["CentInstruction", "CentOpcode"]
 
 
 class CentOpcode(str, Enum):
-    """Instruction names from Tables 2 and 3 of the CENT paper.
+    """CENT instruction names used by the compiler IR.
 
     The opcode says what CENT should do. The matching instruction dataclass
-    stores the values needed to do it.
+    stores the values needed to do it. Most names come from Tables 2 and 3 of
+    the paper. ``RD_AF`` is an AiM target extension used to retrieve activation
+    results.
 
     Members:
         WRITE_SINGLE_BANK: Copy Shared Buffer slots into one DRAM bank.

@@ -60,6 +60,10 @@ class MacAllBanks(CentInstruction):
             ``Regid``.
         operand_source: Location of the second multiply input. The AiM target
             writes this value to its broadcast configuration register.
+        NEXT_BANK_FIRST_OPERAND_BANK: Position of the first input within each
+            neighboring-bank pair when ``operand_source`` is ``NEXT_BANK``.
+        NEXT_BANK_SECOND_OPERAND_BANK: Position of the second input within each
+            neighboring-bank pair when ``operand_source`` is ``NEXT_BANK``.
         OPCODE: Fixed ``MAC_ABK`` instruction name.
     """
 
@@ -73,6 +77,8 @@ class MacAllBanks(CentInstruction):
     # before the MAC, which keeps this IR instruction independent of inherited
     # configuration-register state.
     operand_source: MacOperandSource
+    NEXT_BANK_FIRST_OPERAND_BANK: ClassVar[int] = 0
+    NEXT_BANK_SECOND_OPERAND_BANK: ClassVar[int] = 1
     OPCODE: ClassVar[CentOpcode] = CentOpcode.MAC_ALL_BANKS
 
     def __post_init__(self) -> None:
@@ -86,9 +92,7 @@ class MacAllBanks(CentInstruction):
         require_positive("operation_size", self.operation_size)
         require_nonnegative("row", self.row)
         require_nonnegative("column", self.column)
-        require_nonnegative(
-            "accumulation_register", self.accumulation_register
-        )
+        require_nonnegative("accumulation_register", self.accumulation_register)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -105,6 +109,9 @@ class ElementwiseMultiply(CentInstruction):
         operation_size: Number of burst-sized operations, or ``OPsize``.
         row: First DRAM row, or ``RO``.
         column: First scalar position in that row, or ``CO``.
+        FIRST_OPERAND_BANK: Position of the first input within each PU group.
+        SECOND_OPERAND_BANK: Position of the second input within each PU group.
+        RESULT_BANK: Position receiving the product within each PU group.
         OPCODE: Fixed ``EW_MUL`` instruction name.
     """
 
@@ -112,6 +119,9 @@ class ElementwiseMultiply(CentInstruction):
     operation_size: int
     row: int
     column: int
+    FIRST_OPERAND_BANK: ClassVar[int] = 0
+    SECOND_OPERAND_BANK: ClassVar[int] = 1
+    RESULT_BANK: ClassVar[int] = 2
     OPCODE: ClassVar[CentOpcode] = CentOpcode.ELEMENTWISE_MULTIPLY
 
     def __post_init__(self) -> None:
@@ -132,6 +142,7 @@ class ElementwiseMultiply(CentInstruction):
 # AiM places AFid in CFR2 and exposes results through RD_AF, but it does not map
 # the eight numeric modes to activation functions. The hardware spec therefore
 # keeps the sigmoid ID explicit until that mapping has a stronger source.
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ApplyActivation(CentInstruction):
@@ -160,12 +171,8 @@ class ApplyActivation(CentInstruction):
         """
 
         # The target later checks Regid. AFid remains opaque until its ABI exists.
-        require_nonnegative(
-            "activation_function_id", self.activation_function_id
-        )
-        require_nonnegative(
-            "accumulation_register", self.accumulation_register
-        )
+        require_nonnegative("activation_function_id", self.activation_function_id)
+        require_nonnegative("accumulation_register", self.accumulation_register)
 
 
 # PNM instructions ----------------------------------------------------------
@@ -178,6 +185,7 @@ class ApplyActivation(CentInstruction):
 #
 # We know EXP uses a tenth-order Taylor approximation. We still need its
 # coefficients, input range, rounding, overflow, and special-value behavior.
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Exponent(CentInstruction):
@@ -208,23 +216,25 @@ class Exponent(CentInstruction):
         require_positive("operation_size", self.operation_size)
 
 
-# TODO(emulator ABI): Define the exact RED result.
+# TODO(emulator ABI): Define the RED operation and result layout.
 #
-# We know RED sums 16 BF16 values in each input slot. We still need the addition
-# order, intermediate precision, rounding, overflow, and unused output lanes.
+# The paper names this instruction "Reduction" but does not say whether it sums,
+# multiplies, finds a minimum or maximum, or supports a configurable operation.
+# We also need to know whether it combines lanes within each slot, combines
+# several slots, and where it writes the result.
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Reduction(CentInstruction):
-    """Sum the 16 BF16 values in each selected Shared Buffer slot.
+    """Request the paper's currently underspecified reduction operation.
 
-    This is ``RED OPsize Rd Rs`` in the paper. Each source slot produces one sum
-    in the first BF16 lane of its destination slot. Different slots are not
-    combined with each other.
+    This is ``RED OPsize Rd Rs`` in the paper. The reduction operation and
+    output layout must be confirmed before numerical lowering can depend on it.
 
     Attributes:
-        operation_size: Number of slots to reduce, or ``OPsize``.
-        destination: First slot that receives a sum, or ``Rd``.
-        source: First slot containing 16 values to sum, or ``Rs``.
+        operation_size: Amount of work selected by ``OPsize``.
+        destination: First output slot, or ``Rd``.
+        source: First input slot, or ``Rs``.
         OPCODE: Fixed ``RED`` instruction name.
     """
 
@@ -248,14 +258,13 @@ class Reduction(CentInstruction):
 # We know ACC adds matching BF16 lanes. We still need its intermediate
 # precision, rounding, overflow, and source/destination overlap rules.
 
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Accumulate(CentInstruction):
     """Add Shared Buffer source values into destination values in place.
 
     This is ``ACC OPsize Rd Rs`` in the paper. Each lane performs
     ``Rd[i] = Rd[i] + Rs[i]``, so ``Rd`` must already contain valid values.
-
-    Note: Rs and Rd may overlap.
 
     Attributes:
         operation_size: Number of slots to add, or ``OPsize``.
@@ -283,6 +292,7 @@ class Accumulate(CentInstruction):
 #
 # We need entry addresses for reciprocal, square root, and RoPE. We also need PC
 # limits and alignment, work assignment across cores, and completion behavior.
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class RunRiscV(CentInstruction):

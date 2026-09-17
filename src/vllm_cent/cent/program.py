@@ -10,6 +10,7 @@ __all__ = ["CentProgram"]
 # TODO(runtime): Instructions do not tell a loader what each address contains.
 # We need to add tensor locations, initial data, inputs, and output locations.
 
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CentProgram:
     """An immutable sequence of instructions for one CENT device.
