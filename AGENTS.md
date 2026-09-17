@@ -4,17 +4,92 @@ These instructions apply to every file in this repository.
 
 ## Collaboration
 
-- Coding agents may spawn multiple subagents whenever independent work can be
-  completed in parallel more efficiently or an independent review would improve
-  correctness.
+- The primary agent owns the user's complete objective, maintains the coherent
+  project understanding, and handles all user interaction. It may work directly;
+  delegation is a tool for preserving context and improving execution, not a
+  requirement for every task.
+- Delegate concrete, bounded subtasks when they are independent and one of the
+  following is true: parallel execution will save meaningful time, exploration
+  would produce large tool outputs that do not belong in the primary context, a
+  specialist can inspect a separate source or subsystem, or an independent
+  review would materially improve correctness.
+- Good delegation candidates include inspecting separate reference repositories,
+  tracing disjoint subsystems, researching independent source questions, running
+  focused test investigations, reviewing a completed change, and implementing
+  changes in non-overlapping files.
+- Work directly when the task is small, tightly coupled to the current reasoning,
+  depends heavily on the user's conversational context, modifies the same files
+  as active work, or consists of final integration and verification. Never spawn
+  a subagent merely to satisfy a delegation policy.
+- Give every subagent a concrete scope, the relevant context and source
+  boundaries, an explicit deliverable, and clear permission about whether it may
+  edit files. Subagents must distinguish established evidence, inference, local
+  design proposals, and unresolved questions.
+- Require concise, evidence-rich handoffs. A useful handoff states the conclusion,
+  supporting file paths and line numbers or external sources, files changed,
+  checks run, failures, assumptions, and remaining questions. Do not copy large
+  command outputs into the primary context when a short summary and precise
+  pointers are sufficient.
+- Avoid overlapping writes. Subagents share the workspace, so assign read-only
+  investigations or disjoint files whenever work runs concurrently. The primary
+  agent must inspect the working tree before integration and preserve unrelated
+  user or agent changes.
+- The primary agent must evaluate rather than merely relay subagent conclusions.
+  It remains responsible for resolving conflicts, integrating changes, checking
+  claims against the cited evidence, running proportionate final verification,
+  and accurately reporting what was completed.
+- Keep durable project knowledge outside conversation history. Record accepted
+  architectural decisions, source-backed findings, unresolved contracts, and
+  important invariants in the appropriate code, tests, TODOs, or project
+  documentation. Use subagents to reduce disposable exploration in the primary
+  context, but keep the decisions and reasoning needed for future user dialogue
+  in the primary thread.
 - Ask the user a question only when an unresolved choice would materially change
   the design or behavior. Do not ask questions merely to confirm routine,
   reversible implementation decisions that can be derived from the repository.
-- Give each subagent a concrete, bounded responsibility. Avoid delegation when
-  coordination would cost more than completing the task directly.
-- The primary agent remains responsible for integrating subagent results,
-  resolving conflicts, running final verification, and accurately reporting
-  what was completed.
+
+## Documentation and shared context
+
+- Treat `docs/` as curated shared memory for work that must survive across
+  tasks, not as a transcript archive. Follow `docs/README.md` for the directory
+  structure and keep source code, tests, and Git history as the authoritative
+  record of implementation details.
+- At the start of substantial work, the primary agent reads `docs/README.md`,
+  `docs/PROJECT_STATE.md`, the relevant accepted decisions and research note,
+  `git status`, and the source files in scope. Give subagents only the relevant
+  excerpts or file pointers rather than making every agent load every document.
+- Use the smallest useful team, normally one to three subagents. Give each a
+  distinct role such as source research, isolated implementation, or independent
+  review. Do not launch duplicate investigations unless independent confirmation
+  is the purpose.
+- During coordinated work, one primary agent owns edits to shared coordination
+  documents, especially `docs/PROJECT_STATE.md` and the decision register.
+  Subagents return concise handoffs to the primary unless explicitly assigned a
+  non-overlapping research document. This prevents merge conflicts and several
+  agents recording incompatible conclusions as accepted fact.
+- Keep `docs/PROJECT_STATE.md` short and current. Rewrite or remove stale entries
+  when the boundary changes; do not append a chronological work log. It should
+  contain only the current verified capabilities, major blockers, immediate
+  milestone, and ordered next steps.
+- Update an existing accepted-decision topic before creating another document.
+  Record only decisions that affect multiple modules or future tasks, including
+  the evidence and consequences needed to apply them. Keep unresolved local
+  questions beside the affected code as `TODO` comments; put a question in
+  `PROJECT_STATE.md` only when it blocks multiple areas.
+- Create or extend a research note only when it contains source-backed findings
+  another task is likely to reuse. Separate paper claims, reference behavior,
+  simulator behavior, local inference, and unanswered questions. Prefer precise
+  links and file locations over copied source passages or command output.
+- Do not create a permanent handoff file for every task or agent. Use agent
+  messages for work that the primary can integrate immediately. Use
+  `docs/handoffs/` only when unfinished work must outlive its task, and delete the
+  handoff after its durable findings are incorporated into code, tests, project
+  state, a decision, or a research note.
+- Before declaring coordinated work complete, the primary agent reconciles the
+  subagent reports with the current working tree, updates only the shared
+  documents whose facts actually changed, removes obsolete temporary handoffs,
+  and verifies that documentation describes the current code rather than a
+  proposed future state.
 
 ## Project goal
 

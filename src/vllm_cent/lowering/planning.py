@@ -152,10 +152,10 @@ class CentPartitionedVectorLayout:
 
 
 def pack_zero_padded_vector[ValueT](
-    values: Sequence[ValueT],
-    layout: CentPartitionedVectorLayout,
-    *,
-    zero: ValueT,
+        values: Sequence[ValueT],
+        layout: CentPartitionedVectorLayout,
+        *,
+        zero: ValueT,
 ) -> tuple[ValueT, ...]:
     """Pack logical values and overwrite every padding lane with zero.
 
@@ -199,9 +199,9 @@ def pack_zero_padded_vector[ValueT](
 
 
 def plan_partitioned_vector(
-    value_count: int,
-    maximum_partition_count: int,
-    burst_length: int,
+        value_count: int,
+        maximum_partition_count: int,
+        burst_length: int,
 ) -> CentPartitionedVectorLayout:
     """Choose the baseline even layout for a vector.
 
