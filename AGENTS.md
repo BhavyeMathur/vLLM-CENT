@@ -59,6 +59,8 @@ requirements for this repository.
   such as `dataclasses.asdict` or field introspection instead of manually
   rebuilding the same schema.
 - Prefer enums and typed constants over free-form strings.
+- Avoid metaclasses when an ordinary class, property, or convention expresses
+  the same design. Use a metaclass only when its behavior is genuinely needed.
 - Do not use nontrivial magic numbers. Give architectural values, IDs, offsets,
   capacities, and repeated constants descriptive module-level names. Trivial
   values such as zero-based initial indices do not require constants.
@@ -79,6 +81,10 @@ requirements for this repository.
   them. Public APIs should be small and deliberate.
 - Put reusable, domain-independent checks and calculations in an appropriate
   `utils` module. Keep domain-specific validation with its domain types.
+- Treat duplicated behavior as a design problem. Move shared calculations,
+  validation, and control flow into one well-named helper or utility unless the
+  copies have meaningfully different semantics. Document the reason when
+  duplication is intentionally retained.
 
 ## Documentation
 

@@ -11,31 +11,12 @@ from ..cent import (
 )
 from ..cent.utils import require_positive
 from .bindings import CentDramRowRange, CentSharedBufferSpan
+from .utils import (
+    _require_dram_row_capacity,
+    _require_shared_buffer_capacity,
+)
 
 __all__ = ["lower_weight_gemv"]
-
-
-def _require_span_capacity(
-    name: str,
-    span: CentSharedBufferSpan,
-    required_slots: int,
-) -> None:
-    """Check that a Shared Buffer span can hold an operation operand.
-
-    Args:
-        name: Operand name used in an error message.
-        span: Shared Buffer region assigned to the operand.
-        required_slots: Slots that the operation will access.
-
-    Raises:
-        ValueError: If the span has fewer than ``required_slots`` slots.
-    """
-
-    if span.slot_count < required_slots:
-        raise ValueError(
-            f"{name} needs {required_slots} Shared Buffer slots, "
-            f"but its span contains {span.slot_count}"
-        )
 
 
 def lower_weight_gemv(
@@ -96,19 +77,15 @@ def lower_weight_gemv(
     rows_per_output = ceil_div(vector_size, hardware.dram_columns)
     outputs_per_bank = ceil_div(output_size, builder.total_banks)
     required_weight_rows = outputs_per_bank * rows_per_output
-    if weights.row_count < required_weight_rows:
-        raise ValueError(
-            f"weights needs {required_weight_rows} DRAM rows, "
-            f"but its range contains {weights.row_count}"
-        )
+    _require_dram_row_capacity("weights", weights, required_weight_rows)
 
     input_slots = ceil_div(vector_size, hardware.burst_length)
-    _require_span_capacity("input_buffer", input_buffer, input_slots)
-    _require_span_capacity(
+    _require_shared_buffer_capacity("input_buffer", input_buffer, input_slots)
+    _require_shared_buffer_capacity(
         "output_buffer", output_buffer, outputs_per_bank
     )
     if activated_output_buffer is not None:
-        _require_span_capacity(
+        _require_shared_buffer_capacity(
             "activated_output_buffer",
             activated_output_buffer,
             outputs_per_bank,

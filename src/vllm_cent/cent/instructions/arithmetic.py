@@ -236,6 +236,8 @@ class Accumulate(CentInstruction):
     This is ``ACC OPsize Rd Rs`` in the paper. Each lane performs
     ``Rd[i] = Rd[i] + Rs[i]``, so ``Rd`` must already contain valid values.
 
+    Note: Rs and Rd may overlap.
+
     Attributes:
         operation_size: Number of slots to add, or ``OPsize``.
         destination: First input-and-output slot, or ``Rd``.

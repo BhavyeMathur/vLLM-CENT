@@ -7,12 +7,13 @@ from .data_movement import (
 )
 from .elementwise import lower_accumulate
 from .linear import lower_weight_gemv
-from .normalization import lower_rms_norm
+from .normalization import lower_l2_norm, lower_rms_norm
 
 __all__ = [
     "CentDramRowRange",
     "CentSharedBufferSpan",
     "lower_accumulate",
+    "lower_l2_norm",
     "lower_load_bank_group_vector",
     "lower_rms_norm",
     "lower_store_bank_group_vector",

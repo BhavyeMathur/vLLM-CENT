@@ -11,6 +11,7 @@ from vllm_cent.cent import (
     CentMemoryAddress,
     CentProgramBuilder,
     CentSharedBufferAddress,
+    ElementwiseMultiply,
     MacAllBanks,
     ReadMac,
     ReadSingleBank,
@@ -23,6 +24,7 @@ from vllm_cent.lowering import (
     CentSharedBufferSpan,
     lower_accumulate,
     lower_load_bank_group_vector,
+    lower_l2_norm,
     lower_rms_norm,
     lower_store_bank_group_vector,
     lower_weight_gemv,
@@ -30,7 +32,12 @@ from vllm_cent.lowering import (
 from vllm_cent.lowering.data_movement import (
     _lower_bank_group_vector_transfer,
 )
+from vllm_cent.lowering.normalization import _lower_sum_of_squares
 from vllm_cent.lowering.transformer import TransformerAttentionSpec
+from vllm_cent.lowering.utils import (
+    _require_dram_row_capacity,
+    _require_shared_buffer_capacity,
+)
 
 
 def make_builder(
@@ -64,6 +71,41 @@ def make_builder(
         hardware,
         CentBlockPlacementSpec(channels_per_block=1),
     )
+
+
+class LoweringUtilityTests(unittest.TestCase):
+    """Test validation shared by reusable lowering operations."""
+
+    def test_shared_buffer_capacity_reports_the_named_span(self) -> None:
+        """Accept an exact fit and identify an undersized buffer."""
+
+        span = CentSharedBufferSpan(
+            start=CentSharedBufferAddress(slot=5),
+            slot_count=2,
+        )
+        _require_shared_buffer_capacity("input", span, 2)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "input needs 3 Shared Buffer slots, but its span contains 2",
+        ):
+            _require_shared_buffer_capacity("input", span, 3)
+        with self.assertRaisesRegex(ValueError, "required_slots"):
+            _require_shared_buffer_capacity("input", span, 0)
+
+    def test_dram_capacity_reports_the_named_range(self) -> None:
+        """Accept an exact fit and identify an undersized row range."""
+
+        rows = CentDramRowRange(start_row=7, row_count=2)
+        _require_dram_row_capacity("weights", rows, 2)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "weights needs 3 DRAM rows, but its range contains 2",
+        ):
+            _require_dram_row_capacity("weights", rows, 3)
+        with self.assertRaisesRegex(ValueError, "required_rows"):
+            _require_dram_row_capacity("weights", rows, 0)
 
 
 class LoweringBindingTests(unittest.TestCase):
@@ -382,7 +424,169 @@ class LinearLoweringTests(unittest.TestCase):
 
 
 class NormalizationLoweringTests(unittest.TestCase):
-    """Test model-independent RMSNorm lowering."""
+    """Test reusable vector-normalization lowering."""
+
+    def test_sum_of_squares_emits_neighbor_bank_mac(self) -> None:
+        """Square vector partitions and read their partial sums."""
+
+        builder = make_builder()
+        _lower_sum_of_squares(
+            builder,
+            input_rows=CentDramRowRange(start_row=3, row_count=1),
+            input_buffer=CentSharedBufferSpan(
+                start=CentSharedBufferAddress(slot=4),
+                slot_count=4,
+            ),
+            partial_sum_buffer=CentSharedBufferSpan(
+                start=CentSharedBufferAddress(slot=20),
+                slot_count=1,
+            ),
+            value_count=16,
+        )
+
+        # Four banks split the vector into two eight-value partitions. Each
+        # partition is copied into a neighboring bank pair so MAC_ABK squares
+        # matching values and accumulates one partial sum per active PU.
+        self.assertEqual(
+            builder.instructions,
+            [
+                WriteSingleBank(
+                    address=CentMemoryAddress(
+                        channel=0, bank=0, row=3, column=0
+                    ),
+                    operation_size=2,
+                    source=CentSharedBufferAddress(slot=4),
+                ),
+                WriteSingleBank(
+                    address=CentMemoryAddress(
+                        channel=0, bank=2, row=3, column=0
+                    ),
+                    operation_size=2,
+                    source=CentSharedBufferAddress(slot=6),
+                ),
+                WriteSingleBank(
+                    address=CentMemoryAddress(
+                        channel=0, bank=1, row=3, column=0
+                    ),
+                    operation_size=2,
+                    source=CentSharedBufferAddress(slot=4),
+                ),
+                WriteSingleBank(
+                    address=CentMemoryAddress(
+                        channel=0, bank=3, row=3, column=0
+                    ),
+                    operation_size=2,
+                    source=CentSharedBufferAddress(slot=6),
+                ),
+                WriteBias(
+                    source=CentSharedBufferAddress(slot=20),
+                    channels=CentChannelSet(channels=(0,)),
+                ),
+                MacAllBanks(
+                    operation_size=2,
+                    channels=CentChannelSet(channels=(0,)),
+                    row=3,
+                    column=0,
+                    accumulation_register=0,
+                ),
+                ReadMac(
+                    destination=CentSharedBufferAddress(slot=20),
+                    accumulation_register=0,
+                    channels=CentChannelSet(channels=(0,)),
+                ),
+            ],
+        )
+
+    def test_l2_norm_scales_the_input_after_sum_of_squares(self) -> None:
+        """Place the vector and its scale in neighboring input banks."""
+
+        builder = make_builder()
+        lower_l2_norm(
+            builder,
+            input_rows=CentDramRowRange(start_row=3, row_count=1),
+            work_rows=CentDramRowRange(start_row=4, row_count=1),
+            input_buffer=CentSharedBufferSpan(
+                start=CentSharedBufferAddress(slot=4),
+                slot_count=4,
+            ),
+            scale_buffer=CentSharedBufferSpan(
+                start=CentSharedBufferAddress(slot=12),
+                slot_count=4,
+            ),
+            partial_sum_buffer=CentSharedBufferSpan(
+                start=CentSharedBufferAddress(slot=20),
+                slot_count=1,
+            ),
+            value_count=16,
+        )
+
+        # _lower_sum_of_squares emits the first seven instructions tested
+        # above. L2 normalization then writes all 16 input values to bank zero,
+        # writes the four-slot repeated scale to bank one, and multiplies both
+        # banks into bank two.
+        self.assertEqual(
+            builder.instructions[7:],
+            [
+                WriteSingleBank(
+                    address=CentMemoryAddress(
+                        channel=0, bank=0, row=4, column=0
+                    ),
+                    operation_size=4,
+                    source=CentSharedBufferAddress(slot=4),
+                ),
+                WriteSingleBank(
+                    address=CentMemoryAddress(
+                        channel=0, bank=1, row=4, column=0
+                    ),
+                    operation_size=4,
+                    source=CentSharedBufferAddress(slot=12),
+                ),
+                ElementwiseMultiply(
+                    operation_size=4,
+                    channels=CentChannelSet(channels=(0,)),
+                    row=4,
+                    column=0,
+                ),
+            ],
+        )
+
+    def test_l2_norm_rejects_undersized_scale_or_work_rows(self) -> None:
+        """Reject storage that cannot hold every normalized value."""
+
+        full = CentSharedBufferSpan(
+            start=CentSharedBufferAddress(slot=0),
+            slot_count=4,
+        )
+        partial = CentSharedBufferSpan(
+            start=CentSharedBufferAddress(slot=8),
+            slot_count=1,
+        )
+
+        with self.assertRaisesRegex(ValueError, "scale_buffer"):
+            lower_l2_norm(
+                make_builder(),
+                input_rows=CentDramRowRange(start_row=3, row_count=1),
+                work_rows=CentDramRowRange(start_row=4, row_count=1),
+                input_buffer=full,
+                # Sixteen values occupy four Shared Buffer slots.
+                scale_buffer=replace(full, slot_count=3),
+                partial_sum_buffer=partial,
+                value_count=16,
+            )
+
+        with self.assertRaisesRegex(ValueError, "work_rows needs 2"):
+            lower_l2_norm(
+                make_builder(dram_columns=8),
+                input_rows=CentDramRowRange(start_row=3, row_count=1),
+                work_rows=CentDramRowRange(start_row=4, row_count=1),
+                input_buffer=full,
+                scale_buffer=full,
+                partial_sum_buffer=partial,
+                # This target has one four-bank PU, so all 16 values occupy its
+                # selected bank. Eight columns per row therefore require two
+                # work rows.
+                value_count=16,
+            )
 
     def test_rms_norm_uses_each_explicit_buffer(self) -> None:
         """Connect input, scale, partial-sum, and output spans."""

@@ -53,46 +53,7 @@ class CentOpcode(str, Enum):
     WRITE_GLOBAL_BUFFER = "WR_GB"
 
 
-class _ImmutableOpcodeMeta(type):
-    """Prevent an instruction class from changing its opcode.
-
-    ``OPCODE`` belongs to the class because every instance of that class has the
-    same operation. A class may define it once and cannot replace or delete it.
-    """
-
-    def __setattr__(cls, name: str, value: object) -> None:
-        """Set a class attribute unless ``OPCODE`` is already defined.
-
-        Args:
-            name: Name of the class attribute.
-            value: Value to assign.
-
-        Raises:
-            AttributeError: If an existing ``OPCODE`` would be replaced.
-        """
-
-        # Python may set OPCODE once while creating a concrete instruction class.
-        if name == "OPCODE" and "OPCODE" in cls.__dict__:
-            raise AttributeError("OPCODE cannot be modified")
-        super().__setattr__(name, value)
-
-    def __delattr__(cls, name: str) -> None:
-        """Delete a class attribute unless it is the opcode.
-
-        Args:
-            name: Name of the class attribute.
-
-        Raises:
-            AttributeError: If ``OPCODE`` would be deleted.
-        """
-
-        # Removing OPCODE would leave the instruction without a stable identity.
-        if name == "OPCODE":
-            raise AttributeError("OPCODE cannot be deleted")
-        super().__delattr__(name)
-
-
-class CentInstruction(metaclass=_ImmutableOpcodeMeta):
+class CentInstruction:
     """Base class for every typed CENT instruction.
 
     Concrete dataclasses store operands. Every instance reads the one ``OPCODE``

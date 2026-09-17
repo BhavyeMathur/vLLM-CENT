@@ -9,7 +9,11 @@ from ..cent import (
 )
 from ..cent.utils import require_positive
 from .bindings import CentDramRowRange, CentSharedBufferSpan
-from .utils import _plan_partitioned_vector
+from .utils import (
+    _plan_partitioned_vector,
+    _require_dram_row_capacity,
+    _require_shared_buffer_capacity,
+)
 
 __all__ = ["lower_load_bank_group_vector", "lower_store_bank_group_vector"]
 
@@ -44,20 +48,12 @@ def _lower_bank_group_vector_transfer(
         group_count,
         builder.hardware.burst_length,
     )
-    if buffer.slot_count < layout.slot_count:
-        raise ValueError(
-            f"buffer needs {layout.slot_count} Shared Buffer slots, "
-            f"but its span contains {buffer.slot_count}"
-        )
+    _require_shared_buffer_capacity("buffer", buffer, layout.slot_count)
     required_rows = ceil_div(
         layout.values_per_partition,
         builder.hardware.dram_columns,
     )
-    if rows.row_count < required_rows:
-        raise ValueError(
-            f"rows needs {required_rows} DRAM rows, "
-            f"but its range contains {rows.row_count}"
-        )
+    _require_dram_row_capacity("rows", rows, required_rows)
 
     # Each used PU group receives one consecutive partition. The builder maps
     # those partitions to channels and banks and advances the buffer slot.

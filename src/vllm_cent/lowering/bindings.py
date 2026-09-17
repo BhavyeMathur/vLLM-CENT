@@ -12,9 +12,6 @@ __all__ = ["CentDramRowRange", "CentSharedBufferSpan"]
 class CentSharedBufferSpan:
     """Identify consecutive slots in CENT's Shared Buffer.
 
-    A span gives an operation an explicit input, output, or workspace. This
-    prevents unrelated values from silently sharing slot zero.
-
     Attributes:
         start: Address of the first 256-bit Shared Buffer slot.
         slot_count: Number of consecutive slots in the span.

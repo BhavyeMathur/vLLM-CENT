@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 
 from ..cent import ceil_div
+from ..cent.utils import require_positive
+from .bindings import CentDramRowRange, CentSharedBufferSpan
 
 __all__: list[str] = []
 
@@ -20,6 +22,54 @@ class _PartitionedVectorLayout:
     values_per_partition: int
     partition_count: int
     slot_count: int
+
+
+def _require_shared_buffer_capacity(
+    name: str,
+    span: CentSharedBufferSpan,
+    required_slots: int,
+) -> None:
+    """Check that a Shared Buffer span covers every accessed slot.
+
+    Args:
+        name: Buffer name used in an error message.
+        span: Shared Buffer region assigned to an operation.
+        required_slots: Slots the operation will access.
+
+    Raises:
+        ValueError: If ``required_slots`` is invalid or the span is too small.
+    """
+
+    require_positive("required_slots", required_slots)
+    if span.slot_count < required_slots:
+        raise ValueError(
+            f"{name} needs {required_slots} Shared Buffer slots, "
+            f"but its span contains {span.slot_count}"
+        )
+
+
+def _require_dram_row_capacity(
+    name: str,
+    rows: CentDramRowRange,
+    required_rows: int,
+) -> None:
+    """Check that a DRAM row range covers every accessed row.
+
+    Args:
+        name: Row-range name used in an error message.
+        rows: DRAM row range assigned to an operation.
+        required_rows: Rows the operation will access.
+
+    Raises:
+        ValueError: If ``required_rows`` is invalid or the range is too small.
+    """
+
+    require_positive("required_rows", required_rows)
+    if rows.row_count < required_rows:
+        raise ValueError(
+            f"{name} needs {required_rows} DRAM rows, "
+            f"but its range contains {rows.row_count}"
+        )
 
 
 def _plan_partitioned_vector(

@@ -3,6 +3,7 @@
 from ..cent import Accumulate, CentProgramBuilder, ceil_div
 from ..cent.utils import require_positive
 from .bindings import CentSharedBufferSpan
+from .utils import _require_shared_buffer_capacity
 
 __all__ = ["lower_accumulate"]
 
@@ -26,19 +27,10 @@ def lower_accumulate(
         ValueError: If the vector is empty or either span is too small.
     """
 
-    # TODO(ISA): Confirm which vector additions should use ACC.
-    #
-    # The paper defines ACC but does not explain its intended dataflow. Figure
-    # 10 places some vector additions on the RISC-V cores instead.
-
     require_positive("value_count", value_count)
     operation_size = ceil_div(value_count, builder.hardware.burst_length)
     for name, span in (("destination", destination), ("source", source)):
-        if span.slot_count < operation_size:
-            raise ValueError(
-                f"{name} needs {operation_size} Shared Buffer slots, "
-                f"but its span contains {span.slot_count}"
-            )
+        _require_shared_buffer_capacity(name, span, operation_size)
 
     builder.append(
         Accumulate(

@@ -1,7 +1,7 @@
 """Tests for the CENT instruction layer."""
 
 import unittest
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import replace
 
 from vllm_cent.cent import (
     Accumulate,
@@ -282,17 +282,13 @@ class PaperInstructionTests(unittest.TestCase):
                 self.assertEqual(render_instruction(instruction), expected)
                 self.assertEqual(instruction.opcode.value, expected.split()[0])
 
-    def test_static_opcode_cannot_be_changed_on_class_or_instance(self) -> None:
-        """Prevent changes to an instruction class's opcode."""
+    def test_instruction_exposes_its_class_opcode(self) -> None:
+        """Read an instruction's opcode from its concrete class constant."""
 
         instruction = ReceiveCxl()
 
-        with self.assertRaises(AttributeError):
-            ReceiveCxl.OPCODE = CentOpcode.SEND_CXL  # type: ignore[misc]
-        with self.assertRaises(AttributeError):
-            del ReceiveCxl.OPCODE
-        with self.assertRaises((AttributeError, FrozenInstanceError, TypeError)):
-            instruction.opcode = CentOpcode.SEND_CXL  # type: ignore[misc]
+        self.assertIs(ReceiveCxl.OPCODE, CentOpcode.RECEIVE_CXL)
+        self.assertIs(instruction.opcode, ReceiveCxl.OPCODE)
 
     def test_local_validation_rejects_invalid_operand_ranges(self) -> None:
         """Reject invalid instruction operands during construction."""

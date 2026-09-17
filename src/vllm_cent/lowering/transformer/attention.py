@@ -19,7 +19,11 @@ from ...cent import (
 )
 from ...cent.utils import require_positive
 from ..bindings import CentDramRowRange, CentSharedBufferSpan
-from ..utils import _plan_partitioned_vector
+from ..utils import (
+    _plan_partitioned_vector,
+    _require_dram_row_capacity,
+    _require_shared_buffer_capacity,
+)
 
 __all__ = [
     "TransformerAttentionBuffers",
@@ -114,29 +118,6 @@ class TransformerAttentionBuffers:
     output: CentSharedBufferSpan
 
 
-def _require_span_capacity(
-    name: str,
-    span: CentSharedBufferSpan,
-    required_slots: int,
-) -> None:
-    """Check that an attention buffer covers every accessed slot.
-
-    Args:
-        name: Buffer name used in an error message.
-        span: Shared Buffer region assigned to the value.
-        required_slots: Slots accessed by the lowering stage.
-
-    Raises:
-        ValueError: If the span is too small.
-    """
-
-    if span.slot_count < required_slots:
-        raise ValueError(
-            f"{name} needs {required_slots} Shared Buffer slots, "
-            f"but its span contains {span.slot_count}"
-        )
-
-
 def lower_rotary_embedding(
     builder: CentProgramBuilder,
     spec: TransformerAttentionSpec,
@@ -172,24 +153,18 @@ def lower_rotary_embedding(
         group_count,
         builder.hardware.burst_length,
     )
-    _require_span_capacity("query", buffers.query, query_layout.slot_count)
-    _require_span_capacity("key", buffers.key, key_layout.slot_count)
+    _require_shared_buffer_capacity(
+        "query", buffers.query, query_layout.slot_count
+    )
+    _require_shared_buffer_capacity("key", buffers.key, key_layout.slot_count)
     query_row_count = ceil_div(
         query_layout.values_per_partition, builder.hardware.dram_columns
     )
     key_row_count = ceil_div(
         key_layout.values_per_partition, builder.hardware.dram_columns
     )
-    if rows.query.row_count < query_row_count:
-        raise ValueError(
-            f"query rows needs {query_row_count} DRAM rows, "
-            f"but its range contains {rows.query.row_count}"
-        )
-    if rows.key.row_count < key_row_count:
-        raise ValueError(
-            f"key rows needs {key_row_count} DRAM rows, "
-            f"but its range contains {rows.key.row_count}"
-        )
+    _require_dram_row_capacity("query rows", rows.query, query_row_count)
+    _require_dram_row_capacity("key rows", rows.key, key_row_count)
 
     # Q and K are partitioned independently because grouped-query attention
     # usually makes K narrower. These writes place the second multiply operand
@@ -295,7 +270,7 @@ def lower_kv_cache_update(
     channels_per_block = builder.placement.channels_per_block
     copies = hardware.num_channels // channels_per_block
     key_slots = ceil_div(spec.kv_width, hardware.burst_length)
-    _require_span_capacity("key", buffers.key, key_slots)
+    _require_shared_buffer_capacity("key", buffers.key, key_slots)
 
     # Consecutive tokens go to consecutive banks. After every assigned bank has
     # one token, storage continues in the next row group. ``copies`` repeats the
@@ -339,7 +314,7 @@ def lower_kv_cache_update(
     )
     dimension_iterations = ceil_div(spec.head_size, hardware.num_banks)
     value_slots = spec.num_kv_heads * dimension_iterations
-    _require_span_capacity("value", buffers.value, value_slots)
+    _require_shared_buffer_capacity("value", buffers.value, value_slots)
     for head_slot in range(heads_per_channel):
         head_row_offset = (
             rows_per_dimension * dimension_iterations * head_slot
@@ -403,8 +378,8 @@ def lower_score_gemv(
     # fit, and ``mac_size`` says how many bursts make up one head.
     rows_per_key = ceil_div(spec.kv_width, hardware.dram_columns)
     mac_size = spec.head_size // hardware.burst_length
-    _require_span_capacity("query", buffers.query, mac_size)
-    _require_span_capacity("scores", buffers.scores, 1)
+    _require_shared_buffer_capacity("query", buffers.query, mac_size)
+    _require_shared_buffer_capacity("scores", buffers.scores, 1)
     heads_per_row = hardware.dram_columns // spec.head_size
     sequence_iterations = ceil_div(
         spec.sequence_length, builder.total_banks
@@ -497,7 +472,7 @@ def _lower_score_transfer(
         min(spec.sequence_length, hardware.dram_columns),
         hardware.burst_length,
     )
-    _require_span_capacity("scores", buffers.scores, score_slots)
+    _require_shared_buffer_capacity("scores", buffers.scores, score_slots)
 
     # Scores are laid out by head and token position. These loops visit every
     # DRAM burst that contains scores.
@@ -593,7 +568,7 @@ def lower_softmax(
         min(spec.sequence_length, hardware.dram_columns),
         hardware.burst_length,
     )
-    _require_span_capacity("scores", buffers.scores, score_slots)
+    _require_shared_buffer_capacity("scores", buffers.scores, score_slots)
     channels = builder.all_channels()
     rows_per_score = ceil_div(spec.sequence_length, hardware.dram_columns)
     heads_per_bank = ceil_div(
@@ -666,8 +641,8 @@ def lower_attention_output(
         min(spec.sequence_length, hardware.dram_columns),
         hardware.burst_length,
     )
-    _require_span_capacity("scores", buffers.scores, score_slots)
-    _require_span_capacity("output", buffers.output, 1)
+    _require_shared_buffer_capacity("scores", buffers.scores, score_slots)
+    _require_shared_buffer_capacity("output", buffers.output, 1)
 
     # One value-cache row follows one head value across many token positions.
     # Copying scores to the Global Buffer lets different banks calculate
