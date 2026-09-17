@@ -16,11 +16,14 @@ from vllm_cent.cent import (
     Accumulate,
     CentMemoryAddress,
     CentSharedBufferAddress,
+    ElementwiseMultiply,
     ReadSingleBank,
     WriteSingleBank,
     render_text_program,
 )
 from vllm_cent.models.base import ModelSpec
+from vllm_cent.models.llama import compile_llama_transformer_block
+from vllm_cent.models.llama.planning import _create_compile_plan
 
 
 class UnsupportedModelSpec(ModelSpec):
@@ -80,9 +83,7 @@ def small_request(
             # target-ABI value chosen explicitly for these tests.
             sigmoid_activation_function_id=0,
         ),
-        placement=CentBlockPlacementSpec(
-            channels_per_block=channels_per_block
-        ),
+        placement=CentBlockPlacementSpec(channels_per_block=channels_per_block),
         step=DecodeStepSpec(
             sequence_length=sequence_length,
             max_sequence_length=max_sequence_length,
@@ -105,10 +106,10 @@ class CompilerInputTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(TypeError, "UnsupportedModelSpec"):
             compile_transformer_block(unsupported)
+        with self.assertRaisesRegex(TypeError, "LlamaModelSpec"):
+            compile_llama_transformer_block(unsupported)
         with self.assertRaisesRegex(ValueError, "cannot exceed"):
-            compile_transformer_block(
-                small_request(channels_per_block=2)
-            )
+            compile_transformer_block(small_request(channels_per_block=2))
         with self.assertRaisesRegex(ValueError, "must divide"):
             compile_transformer_block(
                 small_request(num_channels=3, channels_per_block=2)
@@ -151,6 +152,24 @@ class CompilerInputTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     compile_transformer_block(request)
 
+    def test_decode_step_rejects_invalid_lengths_and_accepts_capacity(self) -> None:
+        """Validate both decode lengths and their inclusive upper boundary."""
+
+        self.assertEqual(
+            DecodeStepSpec(sequence_length=8, max_sequence_length=8),
+            DecodeStepSpec(sequence_length=8, max_sequence_length=8),
+        )
+        for sequence_length, max_sequence_length in ((1, 0), (0, 1), (2, 1)):
+            with self.subTest(
+                sequence_length=sequence_length,
+                max_sequence_length=max_sequence_length,
+            ):
+                with self.assertRaises(ValueError):
+                    DecodeStepSpec(
+                        sequence_length=sequence_length,
+                        max_sequence_length=max_sequence_length,
+                    )
+
 
 class TransformerBlockCompilerTests(unittest.TestCase):
     """Test complete Llama block compilation."""
@@ -165,7 +184,7 @@ class TransformerBlockCompilerTests(unittest.TestCase):
         # WR_SBK and RD_SBK count row transfers; OPsize stores the burst count.
         #
         # The totals below are sums of the compiler's ordered lowering stages:
-        # - Each of two RMSNorms emits 6 WR_SBK, 1 WR_BIAS, 1 MAC_ABK,
+        # - Each of two RMSNorms emits 4 WR_SBK, 1 WR_BIAS, 1 MAC_ABK,
         #   1 RD_MAC, 2 EW_MUL, 1 COPY_BKGB, 1 COPY_GBBK, and 1 RD_SBK.
         # - Wq, Wk, Wv, Wo, W3, and W2 each emit 1 WR_GB and four groups of
         #   WR_BIAS + MAC_ABK + RD_MAC for the four outputs assigned per bank.
@@ -182,7 +201,7 @@ class TransformerBlockCompilerTests(unittest.TestCase):
         self.assertEqual(
             counts,
             {
-                CentOpcode.WRITE_SINGLE_BANK: 23,
+                CentOpcode.WRITE_SINGLE_BANK: 19,
                 CentOpcode.READ_SINGLE_BANK: 8,
                 CentOpcode.WRITE_ALL_BANKS: 4,
                 CentOpcode.WRITE_BIAS: 35,
@@ -197,7 +216,7 @@ class TransformerBlockCompilerTests(unittest.TestCase):
                 CentOpcode.ACCUMULATION: 2,
             },
         )
-        self.assertEqual(len(program.instructions), 175)
+        self.assertEqual(len(program.instructions), 171)
 
     def test_residual_add_uses_nonoverlapping_shared_buffer_vectors(self) -> None:
         """Use separate Shared Buffer vectors for residual addition."""
@@ -247,9 +266,7 @@ class TransformerBlockCompilerTests(unittest.TestCase):
         self.assertEqual(
             instructions[first_residual + 1],
             WriteSingleBank(
-                address=CentMemoryAddress(
-                    channel=0, bank=0, row=31, column=0
-                ),
+                address=CentMemoryAddress(channel=0, bank=0, row=31, column=0),
                 operation_size=4,
                 source=CentSharedBufferAddress(slot=20),
             ),
@@ -257,9 +274,7 @@ class TransformerBlockCompilerTests(unittest.TestCase):
         self.assertEqual(
             instructions[final_residual - 1],
             ReadSingleBank(
-                address=CentMemoryAddress(
-                    channel=0, bank=0, row=31, column=0
-                ),
+                address=CentMemoryAddress(channel=0, bank=0, row=31, column=0),
                 operation_size=4,
                 destination=CentSharedBufferAddress(slot=20),
             ),
@@ -270,9 +285,7 @@ class TransformerBlockCompilerTests(unittest.TestCase):
     ) -> None:
         """Render RD_AF without adding AiM trace framing to paper text."""
 
-        assembly = render_text_program(
-            compile_transformer_block(small_request())
-        )
+        assembly = render_text_program(compile_transformer_block(small_request()))
 
         self.assertIn("MAC_ABK", assembly)
         self.assertIn("WR_SBK", assembly)
@@ -283,26 +296,66 @@ class TransformerBlockCompilerTests(unittest.TestCase):
     def test_grouped_query_attention_and_two_pass_activation_compile(self) -> None:
         """Compile grouped-query attention with two activation passes."""
 
-        program = compile_transformer_block(
-            small_request(
-                hidden_size=64,
-                num_attention_heads=4,
-                num_kv_heads=2,
-                intermediate_size=128,
-                num_channels=4,
-                channels_per_block=4,
-                sequence_length=17,
-                max_sequence_length=17,
-                accumulator_slots_per_bank=4,
-            )
+        request = small_request(
+            hidden_size=64,
+            num_attention_heads=4,
+            num_kv_heads=2,
+            intermediate_size=128,
+            num_channels=4,
+            channels_per_block=4,
+            sequence_length=17,
+            max_sequence_length=17,
+            accumulator_slots_per_bank=4,
         )
+        plan = _create_compile_plan(request)
+        program = compile_transformer_block(request)
         # Four query heads share two KV heads. Four channels, one PU per
         # channel, and 16 columns give 4 * 1 * 16 = 64 activation values per
         # pass. The 128-value FFN therefore needs both supported passes.
         self.assertGreater(len(program.instructions), 0)
-        self.assertGreater(
-            sum(i.opcode is CentOpcode.WRITE_ALL_BANKS for i in program.instructions),
-            0,
+        self.assertEqual(
+            [
+                (
+                    chunk.row,
+                    chunk.value_count,
+                    chunk.partition_count,
+                    chunk.values_per_partition,
+                )
+                for chunk in plan.feed_forward.silu_product.chunks
+            ],
+            [
+                (plan.memory.x1, 64, 4, 16),
+                (plan.memory.x1_sigmoid, 64, 4, 16),
+            ],
+        )
+
+    def test_small_and_multirow_normalization_layouts_compile(self) -> None:
+        """Compile partition-padding and multirow normalization boundaries."""
+
+        small = compile_transformer_block(
+            small_request(
+                hidden_size=4,
+                num_attention_heads=1,
+                intermediate_size=4,
+            )
+        )
+        multirow = compile_transformer_block(
+            small_request(
+                hidden_size=32,
+                num_attention_heads=2,
+                intermediate_size=32,
+            )
+        )
+
+        self.assertGreater(len(small.instructions), 0)
+        # The target row holds four bursts. Every multirow elementwise pass is
+        # split into separate instructions instead of crossing that boundary.
+        self.assertTrue(
+            all(
+                instruction.operation_size <= 4
+                for instruction in multirow.instructions
+                if isinstance(instruction, ElementwiseMultiply)
+            )
         )
 
     def test_llama_3_8b_and_70b_shapes_compile(self) -> None:
@@ -343,22 +396,32 @@ class TransformerBlockCompilerTests(unittest.TestCase):
         )
         for model, channels_per_block in cases:
             with self.subTest(hidden_size=model.hidden_size):
-                program = compile_transformer_block(
-                    CompileRequest(
-                        model=model,
-                        hardware=target,
-                        placement=CentBlockPlacementSpec(
-                            channels_per_block=channels_per_block
-                        ),
-                        step=DecodeStepSpec(
-                            # A one-token decode keeps the emitted test trace
-                            # small while reserving Llama's 8192-token KV cache.
-                            sequence_length=1,
-                            max_sequence_length=8_192,
-                        ),
-                    )
+                request = CompileRequest(
+                    model=model,
+                    hardware=target,
+                    placement=CentBlockPlacementSpec(
+                        channels_per_block=channels_per_block
+                    ),
+                    step=DecodeStepSpec(
+                        # A one-token decode keeps the emitted test trace small
+                        # while reserving Llama's 8192-token KV cache.
+                        sequence_length=1,
+                        max_sequence_length=8_192,
+                    ),
                 )
+                plan = _create_compile_plan(request)
+                program = compile_transformer_block(request)
                 self.assertGreater(len(program.instructions), 0)
+                self.assertEqual(plan.context.kv_width, 1_024)
+                self.assertEqual(
+                    plan.context.total_banks,
+                    channels_per_block * target.num_banks,
+                )
+                self.assertEqual(
+                    plan.self_attention.query_projection.utilized_banks,
+                    plan.context.total_banks,
+                )
+                self.assertLessEqual(plan.memory.end, target.dram_rows)
 
 
 if __name__ == "__main__":

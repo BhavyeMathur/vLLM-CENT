@@ -306,6 +306,8 @@ class PaperInstructionTests(unittest.TestCase):
 
         self.assertIs(ReceiveCxl.OPCODE, CentOpcode.RECEIVE_CXL)
         self.assertIs(instruction.opcode, ReceiveCxl.OPCODE)
+        self.assertEqual(MacAllBanks.NEXT_BANK_FIRST_OPERAND_BANK, 0)
+        self.assertEqual(MacAllBanks.NEXT_BANK_SECOND_OPERAND_BANK, 1)
 
     def test_local_validation_rejects_invalid_operand_ranges(self) -> None:
         """Reject invalid instruction operands during construction."""

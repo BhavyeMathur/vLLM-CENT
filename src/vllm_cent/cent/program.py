@@ -8,7 +8,9 @@ from .instructions import CentInstruction, validate_instruction
 __all__ = ["CentProgram"]
 
 # TODO(runtime): Instructions do not tell a loader what each address contains.
-# We need to add tensor locations, initial data, inputs, and output locations.
+# We need tensor locations, initial data, inputs, and output locations. When the
+# runtime materializes a logical vector, it must use the vector layout to write
+# every occupied lane and explicitly zero each partition's padding lanes.
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

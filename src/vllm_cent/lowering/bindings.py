@@ -2,15 +2,25 @@
 
 from dataclasses import dataclass
 
-from ..cent import CentSharedBufferAddress
+from ..cent import BANKS_PER_PU, CentSharedBufferAddress
 from ..cent.utils import require_nonnegative, require_positive
+from .planning import CentPartitionedVectorLayout
 
-__all__ = ["CentDramRowRange", "CentSharedBufferSpan"]
+__all__ = [
+    "CentDramRowRange",
+    "CentDramVector",
+    "CentSharedBufferSpan",
+    "CentSharedBufferVector",
+]
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CentSharedBufferSpan:
     """Identify consecutive slots in CENT's Shared Buffer.
+
+    A span describes capacity only. It does not promise that any lane has been
+    initialized. Use :class:`CentSharedBufferVector` when the slots contain a
+    complete zero-padded logical vector.
 
     Attributes:
         start: Address of the first 256-bit Shared Buffer slot.
@@ -53,7 +63,8 @@ class CentDramRowRange:
     """Identify consecutive row numbers used in every selected DRAM bank.
 
     An operation decides how values are distributed among channels and banks.
-    This type records only the row interval so that its bounds are explicit.
+    This type records only the row interval so that its bounds are explicit. It
+    makes no promise about stored values or padding.
 
     Attributes:
         start_row: First row in the range.
@@ -90,3 +101,89 @@ class CentDramRowRange:
         if row_offset >= self.row_count:
             raise ValueError("row_offset is outside the DRAM row range")
         return self.start_row + row_offset
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CentSharedBufferVector:
+    """Bind a zero-padded logical vector to exact Shared Buffer storage.
+
+    This binding carries a data contract, not only a capacity. A valid value in
+    ``span`` has every lane written. Within each partition, logical values come
+    first and every remaining lane is zero. A producer establishes that
+    contract before a consumer uses the binding.
+
+    Attributes:
+        span: Exact Shared Buffer slots occupied by the physical vector.
+        layout: Logical values, partitions, slots, and zero-padding positions.
+    """
+
+    span: CentSharedBufferSpan
+    layout: CentPartitionedVectorLayout
+
+    def __post_init__(self) -> None:
+        """Require the binding to identify exactly the occupied slots.
+
+        Raises:
+            ValueError: If the span includes fewer or more slots than the
+                vector layout occupies.
+        """
+
+        if self.span.slot_count != self.layout.slot_count:
+            raise ValueError(
+                "vector span must contain exactly "
+                f"{self.layout.slot_count} slots, but contains "
+                f"{self.span.slot_count}"
+            )
+
+    @property
+    def start(self) -> CentSharedBufferAddress:
+        """Return the first physical slot occupied by the vector.
+
+        Returns:
+            Address of the vector's first Shared Buffer slot.
+        """
+
+        return self.span.start
+
+    def address(self, slot_offset: int) -> CentSharedBufferAddress:
+        """Return one occupied slot in the vector.
+
+        Args:
+            slot_offset: Number of slots after the vector's first slot.
+
+        Returns:
+            Shared Buffer address at the requested offset.
+
+        Raises:
+            ValueError: If the offset is outside the vector storage.
+        """
+
+        return self.span.address(slot_offset)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CentDramVector:
+    """Bind a zero-padded logical vector to partitioned DRAM rows.
+
+    As with :class:`CentSharedBufferVector`, the binding promises that every
+    physical lane is initialized and every non-logical lane is zero.
+
+    Attributes:
+        rows: DRAM rows used by every selected bank partition.
+        layout: Logical values, partitions, slots, and zero-padding positions.
+        bank_group: Bank position selected in each four-bank PU group.
+    """
+
+    rows: CentDramRowRange
+    layout: CentPartitionedVectorLayout
+    bank_group: int = 0
+
+    def __post_init__(self) -> None:
+        """Validate the selected position in each four-bank PU group.
+
+        Raises:
+            ValueError: If ``bank_group`` is outside a PU's four banks.
+        """
+
+        if self.bank_group not in range(BANKS_PER_PU):
+            raise ValueError("bank_group must be between 0 and 3")

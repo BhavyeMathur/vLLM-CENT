@@ -1,5 +1,7 @@
 """Lower reusable vector transfers between the Shared Buffer and DRAM."""
 
+from dataclasses import dataclass
+
 from ..cent import (
     BANKS_PER_PU,
     CentProgramBuilder,
@@ -7,53 +9,69 @@ from ..cent import (
     WriteSingleBank,
     ceil_div,
 )
-from ..cent.utils import require_positive
-from .bindings import CentDramRowRange, CentSharedBufferSpan
-from .utils import (
-    _plan_partitioned_vector,
-    _require_dram_row_capacity,
-    _require_shared_buffer_capacity,
-)
+from .bindings import CentDramVector, CentSharedBufferVector
+from .utils import _require_dram_row_capacity
 
-__all__ = ["lower_load_bank_group_vector", "lower_store_bank_group_vector"]
+__all__ = [
+    "CentBankGroupVectorTransferPlan",
+    "lower_load_bank_group_vector",
+    "lower_store_bank_group_vector",
+]
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CentBankGroupVectorTransferPlan:
+    """Bind one zero-padded vector in DRAM and the Shared Buffer.
+
+    Attributes:
+        dram: Partitioned DRAM representation of the vector.
+        buffer: Shared Buffer representation of the same vector.
+    """
+
+    dram: CentDramVector
+    buffer: CentSharedBufferVector
+
+    def __post_init__(self) -> None:
+        """Require both bindings to describe the same physical vector.
+
+        Raises:
+            ValueError: If the DRAM and Shared Buffer layouts differ.
+        """
+
+        if self.dram.layout != self.buffer.layout:
+            raise ValueError("DRAM and Shared Buffer layouts must match")
 
 
 def _lower_bank_group_vector_transfer(
     builder: CentProgramBuilder,
-    *,
-    rows: CentDramRowRange,
-    buffer: CentSharedBufferSpan,
-    value_count: int,
-    bank_group: int,
+    plan: CentBankGroupVectorTransferPlan,
     instruction_type: type[WriteSingleBank] | type[ReadSingleBank],
 ) -> None:
     """Lower one direction of a partitioned vector transfer.
 
     Args:
         builder: Program builder that receives the transfer instructions.
-        rows: DRAM rows holding the distributed vector.
-        buffer: Shared Buffer slots holding the packed vector.
-        value_count: Values moved by the transfer.
-        bank_group: Bank position within each four-bank PU group.
+        plan: Checked vector layout and its memory bindings.
         instruction_type: Direction of the transfer.
 
     Raises:
-        ValueError: If the vector is empty or the buffer is too small.
+        ValueError: If the plan is incompatible with the target hardware or a
+            memory region is too small.
     """
 
-    require_positive("value_count", value_count)
-    group_count = builder.total_banks // BANKS_PER_PU
-    layout = _plan_partitioned_vector(
-        value_count,
-        group_count,
-        builder.hardware.burst_length,
-    )
-    _require_shared_buffer_capacity("buffer", buffer, layout.slot_count)
+    layout = plan.buffer.layout
+    if layout.burst_length != builder.hardware.burst_length:
+        raise ValueError("layout burst_length does not match the target")
+
+    available_groups = builder.total_banks // BANKS_PER_PU
+    if layout.partition_count > available_groups:
+        raise ValueError("layout uses more bank groups than the block owns")
+
     required_rows = ceil_div(
-        layout.values_per_partition,
+        layout.physical_values_per_partition,
         builder.hardware.dram_columns,
     )
-    _require_dram_row_capacity("rows", rows, required_rows)
+    _require_dram_row_capacity("rows", plan.dram.rows, required_rows)
 
     # Each used PU group receives one consecutive partition. The builder maps
     # those partitions to channels and banks and advances the buffer slot.
@@ -61,70 +79,58 @@ def _lower_bank_group_vector_transfer(
         instruction_type,
         builder.placement.channels_per_block,
         layout.partition_count,
-        bank_group,
-        rows.start_row,
-        layout.values_per_partition,
-        shared_buffer=buffer.start,
+        plan.dram.bank_group,
+        plan.dram.rows.start_row,
+        layout.physical_values_per_partition,
+        shared_buffer=plan.buffer.start,
     )
 
 
 def lower_store_bank_group_vector(
     builder: CentProgramBuilder,
-    *,
-    rows: CentDramRowRange,
-    buffer: CentSharedBufferSpan,
-    value_count: int,
-    bank_group: int = 0,
+    plan: CentBankGroupVectorTransferPlan,
 ) -> None:
-    """Store a packed Shared Buffer vector across DRAM bank groups.
+    """Store a zero-padded Shared Buffer vector across DRAM bank groups.
+
+    Every occupied slot is copied, so zeros in the source binding become zeros
+    in the matching DRAM padding lanes.
 
     Args:
         builder: Program builder that receives the write instructions.
-        rows: DRAM rows receiving the distributed vector.
-        buffer: Shared Buffer slots containing the packed vector.
-        value_count: Values stored by the transfer.
-        bank_group: Bank position within each four-bank PU group.
+        plan: Vector layout and the source and destination memory regions.
 
     Raises:
-        ValueError: If the vector is empty or the buffer is too small.
+        ValueError: If the plan is incompatible with the target hardware or a
+            memory region is too small.
     """
 
     _lower_bank_group_vector_transfer(
         builder,
-        rows=rows,
-        buffer=buffer,
-        value_count=value_count,
-        bank_group=bank_group,
+        plan,
         instruction_type=WriteSingleBank,
     )
 
 
 def lower_load_bank_group_vector(
     builder: CentProgramBuilder,
-    *,
-    rows: CentDramRowRange,
-    buffer: CentSharedBufferSpan,
-    value_count: int,
-    bank_group: int = 0,
+    plan: CentBankGroupVectorTransferPlan,
 ) -> None:
-    """Load a distributed DRAM vector into packed Shared Buffer slots.
+    """Load a zero-padded DRAM vector into complete Shared Buffer slots.
+
+    The load writes every occupied lane and preserves the DRAM binding's zero
+    padding. It does not rely on previous Shared Buffer contents.
 
     Args:
         builder: Program builder that receives the read instructions.
-        rows: DRAM rows containing the distributed vector.
-        buffer: Shared Buffer slots receiving the packed vector.
-        value_count: Values loaded by the transfer.
-        bank_group: Bank position within each four-bank PU group.
+        plan: Vector layout and the source and destination memory regions.
 
     Raises:
-        ValueError: If the vector is empty or the buffer is too small.
+        ValueError: If the plan is incompatible with the target hardware or a
+            memory region is too small.
     """
 
     _lower_bank_group_vector_transfer(
         builder,
-        rows=rows,
-        buffer=buffer,
-        value_count=value_count,
-        bank_group=bank_group,
+        plan,
         instruction_type=ReadSingleBank,
     )

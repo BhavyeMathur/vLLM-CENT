@@ -72,11 +72,10 @@ def _single_bank_transfers(
     if row_width % burst_length:
         raise ValueError("row_width must be divisible by burst_length")
 
-    # TODO(runtime): We round a partial final burst up to a full slot. We need to
-    # define the values placed in unused lanes or add a valid-lane mask.
-
-    # OPsize counts bursts, not scalar values. Each burst uses one Shared Buffer
-    # slot, including a final burst that is only partly full.
+    # OPsize counts bursts, not scalar values. Each burst uses one complete
+    # Shared Buffer slot. Logical-vector lowerers therefore pass a physical
+    # value count rounded to complete slots, and their vector bindings guarantee
+    # that unused lanes contain zero. Raw transfers make no such data promise.
     remaining_operations = ceil_div(value_count, burst_length)
     completed_operations = 0
     current_row = row

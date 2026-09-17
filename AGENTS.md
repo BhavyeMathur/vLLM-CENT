@@ -147,6 +147,14 @@ requirements for this repository.
   belong under `vllm_cent/models/<family>/`.
 - Never place Llama- or transformer-specific assumptions in the generic CENT
   backend.
+- Represent a logical Shared Buffer vector with its vector binding, not a raw
+  capacity span. A producer must write every lane in every occupied slot. It
+  must set lanes outside the logical vector to zero separately in each physical
+  partition. Consumers may rely on this invariant and should preserve it.
+- Keep results as raw Shared Buffer spans when the ISA or runtime cannot yet
+  prove their lane order or zero padding. Do not label unresolved `RD_MAC`,
+  activation, reduction, exponential, RISC-V, or CXL output as a logical vector
+  merely because enough slots were reserved.
 - Use descriptive Python names while documenting the corresponding paper terms,
   such as `row` for `RO`, `column` for `CO`, and `operation_size` for `OPsize`.
 - Distinguish paper-defined facts, behavior found only in reference code, local
