@@ -1,9 +1,7 @@
 """Public typed instruction interface for CENT programs."""
 
 from .address import (
-    CentBankRegisterAddress,
     CentChannelSet,
-    CentGlobalBufferAddress,
     CentMemoryAddress,
     CentSharedBufferAddress,
 )
@@ -43,9 +41,7 @@ __all__ = [
     "Accumulate",
     "ApplyActivation",
     "BroadcastCxl",
-    "CentBankRegisterAddress",
     "CentChannelSet",
-    "CentGlobalBufferAddress",
     "CentInstruction",
     "CentMemoryAddress",
     "CentOpcode",

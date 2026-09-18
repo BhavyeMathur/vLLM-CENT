@@ -119,7 +119,6 @@ def make_request(
             num_banks=4,
             dram_rows=1_000,
             dram_columns=16,
-            global_buffer_columns=16,
             burst_length=4,
             accumulator_slots_per_bank=4,
             sigmoid_activation_function_id=0,

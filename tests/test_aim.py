@@ -33,7 +33,6 @@ from vllm_cent.cent import (
     render_aim_trace,
     validate_aim_hardware,
 )
-from vllm_cent.cent.aim import _render_single_bank_transfer
 
 
 def aim_hardware() -> CentHardwareSpec:
@@ -48,7 +47,6 @@ def aim_hardware() -> CentHardwareSpec:
         num_banks=AIM_SIMULATOR_BANKS,
         dram_rows=64,
         dram_columns=64,
-        global_buffer_columns=64,
         burst_length=AIM_SIMULATOR_BURST_LENGTH,
         accumulator_slots_per_bank=4,
         sigmoid_activation_function_id=3,
@@ -72,10 +70,6 @@ def program_with(instruction: CentInstruction) -> CentProgram:
     )
 
 
-class _WriteSingleBankVariant(WriteSingleBank):
-    """Test-only subtype that inherits its target-adapter behavior."""
-
-
 class AimTraceRenderingTests(unittest.TestCase):
     """Test exact trace records accepted by AiM's parser."""
 
@@ -90,62 +84,6 @@ class AimTraceRenderingTests(unittest.TestCase):
         )
         with self.assertRaises(AimSimulatorCompatibilityError):
             render_aim_channel_mask(CentChannelSet(channels=(32,)))
-
-    def test_dispatch_catalog_matches_the_supported_aim_subset(self) -> None:
-        """Keep AiM's target-specific support matrix explicit and complete."""
-
-        expected_types = {
-            ApplyActivation,
-            CopyBankToGlobalBuffer,
-            CopyGlobalBufferToBank,
-            ElementwiseMultiply,
-            MacAllBanks,
-            ReadActivation,
-            ReadMac,
-            ReadSingleBank,
-            WriteAllBanks,
-            WriteBias,
-            WriteGlobalBuffer,
-            WriteSingleBank,
-        }
-
-        # The object registration is singledispatch's compatibility-error
-        # fallback for every PNM, RISC-V, and CXL instruction AiM cannot encode.
-        self.assertSetEqual(
-            set(render_aim_instruction.registry) - {object},
-            expected_types,
-        )
-
-    def test_instruction_subclasses_use_parent_aim_renderer(self) -> None:
-        """Dispatch a target-compatible instruction subtype like its parent."""
-
-        instruction = _WriteSingleBankVariant(
-            address=CentMemoryAddress(channel=0, bank=2, row=3, column=0),
-            operation_size=1,
-            source=CentSharedBufferAddress(slot=5),
-        )
-
-        self.assertEqual(
-            render_aim_instruction(instruction),
-            ("AiM WR_SBK 5 0x80000000 2 3",),
-        )
-
-    def test_private_transfer_expander_uses_the_selected_first_gpr(self) -> None:
-        """Expand every burst from the explicitly selected Shared Buffer slot."""
-
-        instruction = WriteSingleBank(
-            address=CentMemoryAddress(channel=0, bank=2, row=3, column=0),
-            operation_size=2,
-            source=CentSharedBufferAddress(slot=5),
-        )
-
-        self.assertEqual(
-            _render_single_bank_transfer(instruction, first_gpr=7),
-            (
-                "AiM WR_SBK 7 0x80000000 2 3",
-                "AiM WR_SBK 8 0x80000000 2 3",
-            ),
-        )
 
     def test_renders_every_supported_dram_instruction_and_eoc(self) -> None:
         """Serialize data movement, MAC mode, activation, and completion."""

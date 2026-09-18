@@ -77,7 +77,6 @@ def small_request(
             num_banks=4,
             dram_rows=dram_rows,
             dram_columns=16,
-            global_buffer_columns=16,
             burst_length=4,
             accumulator_slots_per_bank=accumulator_slots_per_bank,
             # The paper does not assign numeric AFid values; zero is a fake
@@ -367,7 +366,6 @@ class TransformerBlockCompilerTests(unittest.TestCase):
             num_banks=16,
             dram_rows=16_384,
             dram_columns=1_024,
-            global_buffer_columns=1_024,
             burst_length=16,
             accumulator_slots_per_bank=32,
             sigmoid_activation_function_id=0,

@@ -1,7 +1,5 @@
 """Serialize the DRAM portion of a CENT program for the AiM simulator."""
 
-from functools import singledispatch
-
 from .instructions import (
     ApplyActivation,
     CentChannelSet,
@@ -141,8 +139,6 @@ def _require_simulator_register(instruction: CentInstruction, register: int) -> 
 
 def _render_single_bank_transfer(
     instruction: WriteSingleBank | ReadSingleBank,
-        *,
-        first_gpr: int,
 ) -> tuple[str, ...]:
     """Expand a paper transfer into the simulator's one-burst records.
 
@@ -152,7 +148,6 @@ def _render_single_bank_transfer(
 
     Args:
         instruction: Single-bank read or write to serialize.
-        first_gpr: Shared Buffer source or destination slot for the first burst.
 
     Returns:
         One trace record for each burst in the instruction.
@@ -165,6 +160,11 @@ def _render_single_bank_transfer(
     _require_zero_column(instruction, instruction.address.column)
     channels = CentChannelSet(channels=(instruction.address.channel,))
     channel_mask = render_aim_channel_mask(channels)
+    first_gpr = (
+        instruction.source.slot
+        if isinstance(instruction, WriteSingleBank)
+        else instruction.destination.slot
+    )
     return tuple(
         f"AiM {instruction.opcode.value} {first_gpr + offset} "
         f"{channel_mask} {instruction.address.bank} {instruction.address.row}"
@@ -172,7 +172,6 @@ def _render_single_bank_transfer(
     )
 
 
-@singledispatch
 def render_aim_instruction(instruction: CentInstruction) -> tuple[str, ...]:
     """Render one supported instruction as AiM trace records.
 
@@ -193,6 +192,76 @@ def render_aim_instruction(instruction: CentInstruction) -> tuple[str, ...]:
             or cannot encode one of its operands.
     """
 
+    if isinstance(instruction, (WriteSingleBank, ReadSingleBank)):
+        return _render_single_bank_transfer(instruction)
+
+    if isinstance(instruction, WriteAllBanks):
+        _require_zero_column(instruction, instruction.column)
+        _require_simulator_register(instruction, instruction.accumulation_register)
+        channels = CentChannelSet(channels=(instruction.channel,))
+        return (
+            f"AiM WR_ABK {instruction.source.slot} "
+            f"{render_aim_channel_mask(channels)} {instruction.row}",
+        )
+
+    if isinstance(instruction, MacAllBanks):
+        _require_zero_column(instruction, instruction.column)
+        _require_simulator_register(instruction, instruction.accumulation_register)
+        channel_mask = render_aim_channel_mask(instruction.channels)
+        # CFR0 is persistent simulator state rather than a MAC_ABK operand.
+        # Reassert it immediately before every MAC so the rendered meaning does
+        # not depend on an earlier instruction or the simulator's default. A
+        # stateful whole-program optimizer may safely coalesce equal writes.
+        return (
+            f"W CFR {_MAC_SOURCE_CFR} {instruction.operand_source.value}",
+            f"AiM MAC_ABK {instruction.operation_size} {channel_mask} "
+            f"{instruction.row}",
+        )
+
+    if isinstance(instruction, ElementwiseMultiply):
+        _require_zero_column(instruction, instruction.column)
+        return (
+            f"AiM EWMUL {instruction.operation_size} "
+            f"{render_aim_channel_mask(instruction.channels)} {instruction.row}",
+        )
+
+    if isinstance(instruction, ApplyActivation):
+        _require_simulator_register(instruction, instruction.accumulation_register)
+        channel_mask = render_aim_channel_mask(instruction.channels)
+        return (
+            f"W CFR {_ACTIVATION_FUNCTION_CFR} {instruction.activation_function_id}",
+            f"AiM AF {channel_mask}",
+        )
+
+    if isinstance(instruction, (CopyBankToGlobalBuffer, CopyGlobalBufferToBank)):
+        _require_zero_column(instruction, instruction.column)
+        return (
+            f"AiM {instruction.opcode.value} {instruction.operation_size} "
+            f"{render_aim_channel_mask(instruction.channels)} "
+            f"{instruction.bank} {instruction.row}",
+        )
+
+    if isinstance(instruction, WriteBias):
+        return (
+            f"AiM WR_BIAS {instruction.source.slot} "
+            f"{render_aim_channel_mask(instruction.channels)}",
+        )
+
+    if isinstance(instruction, (ReadMac, ReadActivation)):
+        _require_simulator_register(instruction, instruction.accumulation_register)
+        return (
+            f"AiM {instruction.opcode.value} {instruction.destination.slot} "
+            f"{render_aim_channel_mask(instruction.channels)}",
+        )
+
+    if isinstance(instruction, WriteGlobalBuffer):
+        _require_zero_column(instruction, instruction.column)
+        return (
+            f"AiM WR_GB {instruction.operation_size} "
+            f"{instruction.source.slot} "
+            f"{render_aim_channel_mask(instruction.channels)}",
+        )
+
     # Known CENT instructions report their assembly name. The base class and
     # unknown subclasses have no opcode, so report the Python type without
     # accidentally raising AttributeError while formatting this error.
@@ -202,233 +271,6 @@ def render_aim_instruction(instruction: CentInstruction) -> tuple[str, ...]:
     )
     raise AimSimulatorCompatibilityError(
         f"AiM simulator does not implement {instruction_name}"
-    )
-
-
-@render_aim_instruction.register(WriteSingleBank)
-def _render_aim_write_single_bank(
-        instruction: WriteSingleBank,
-) -> tuple[str, ...]:
-    """Encode one Shared-Buffer-to-bank transfer for AiM.
-
-    Args:
-        instruction: Single-bank write to encode.
-
-    Returns:
-        One AiM trace record per burst.
-
-    Raises:
-        AimSimulatorCompatibilityError: If the transfer column is not encodable.
-    """
-
-    return _render_single_bank_transfer(
-        instruction,
-        first_gpr=instruction.source.slot,
-    )
-
-
-@render_aim_instruction.register(ReadSingleBank)
-def _render_aim_read_single_bank(instruction: ReadSingleBank) -> tuple[str, ...]:
-    """Encode one bank-to-Shared-Buffer transfer for AiM.
-
-    Args:
-        instruction: Single-bank read to encode.
-
-    Returns:
-        One AiM trace record per burst.
-
-    Raises:
-        AimSimulatorCompatibilityError: If the transfer column is not encodable.
-    """
-
-    return _render_single_bank_transfer(
-        instruction,
-        first_gpr=instruction.destination.slot,
-    )
-
-
-@render_aim_instruction.register(WriteAllBanks)
-def _render_aim_write_all_banks(instruction: WriteAllBanks) -> tuple[str, ...]:
-    """Encode one all-bank write for AiM.
-
-    Args:
-        instruction: All-bank write to encode.
-
-    Returns:
-        One AiM trace record.
-
-    Raises:
-        AimSimulatorCompatibilityError: If its column or register is not
-            encodable by AiM.
-    """
-
-    _require_zero_column(instruction, instruction.column)
-    _require_simulator_register(instruction, instruction.accumulation_register)
-    channels = CentChannelSet(channels=(instruction.channel,))
-    return (
-        f"AiM WR_ABK {instruction.source.slot} "
-        f"{render_aim_channel_mask(channels)} {instruction.row}",
-    )
-
-
-@render_aim_instruction.register(MacAllBanks)
-def _render_aim_mac_all_banks(instruction: MacAllBanks) -> tuple[str, ...]:
-    """Encode one all-bank MAC and its explicit source configuration.
-
-    Args:
-        instruction: All-bank MAC to encode.
-
-    Returns:
-        CFR source selection followed by the AiM MAC record.
-
-    Raises:
-        AimSimulatorCompatibilityError: If its column or register is not
-            encodable by AiM.
-    """
-
-    _require_zero_column(instruction, instruction.column)
-    _require_simulator_register(instruction, instruction.accumulation_register)
-    channel_mask = render_aim_channel_mask(instruction.channels)
-    # CFR0 is persistent simulator state rather than a MAC_ABK operand. Reassert
-    # it immediately before every MAC so meaning does not depend on an earlier
-    # instruction or the simulator default.
-    return (
-        f"W CFR {_MAC_SOURCE_CFR} {instruction.operand_source.value}",
-        f"AiM MAC_ABK {instruction.operation_size} {channel_mask} {instruction.row}",
-    )
-
-
-@render_aim_instruction.register(ElementwiseMultiply)
-def _render_aim_elementwise_multiply(
-        instruction: ElementwiseMultiply,
-) -> tuple[str, ...]:
-    """Encode one near-bank elementwise multiplication for AiM.
-
-    Args:
-        instruction: Elementwise operation to encode.
-
-    Returns:
-        One AiM trace record.
-
-    Raises:
-        AimSimulatorCompatibilityError: If its column is not encodable by AiM.
-    """
-
-    _require_zero_column(instruction, instruction.column)
-    return (
-        f"AiM EWMUL {instruction.operation_size} "
-        f"{render_aim_channel_mask(instruction.channels)} {instruction.row}",
-    )
-
-
-@render_aim_instruction.register(ApplyActivation)
-def _render_aim_activation(instruction: ApplyActivation) -> tuple[str, ...]:
-    """Encode one activation and its explicit function configuration.
-
-    Args:
-        instruction: Activation operation to encode.
-
-    Returns:
-        CFR function selection followed by the AiM activation record.
-
-    Raises:
-        AimSimulatorCompatibilityError: If its register is not encodable by AiM.
-    """
-
-    _require_simulator_register(instruction, instruction.accumulation_register)
-    channel_mask = render_aim_channel_mask(instruction.channels)
-    return (
-        f"W CFR {_ACTIVATION_FUNCTION_CFR} {instruction.activation_function_id}",
-        f"AiM AF {channel_mask}",
-    )
-
-
-@render_aim_instruction.register(CopyBankToGlobalBuffer)
-@render_aim_instruction.register(CopyGlobalBufferToBank)
-def _render_aim_bank_global_buffer_copy(
-        instruction: CopyBankToGlobalBuffer | CopyGlobalBufferToBank,
-) -> tuple[str, ...]:
-    """Encode either direction of a bank and Global Buffer copy.
-
-    Args:
-        instruction: Copy operation to encode.
-
-    Returns:
-        One AiM trace record whose opcode preserves the transfer direction.
-
-    Raises:
-        AimSimulatorCompatibilityError: If its column is not encodable by AiM.
-    """
-
-    _require_zero_column(instruction, instruction.column)
-    return (
-        f"AiM {instruction.opcode.value} {instruction.operation_size} "
-        f"{render_aim_channel_mask(instruction.channels)} "
-        f"{instruction.bank} {instruction.row}",
-    )
-
-
-@render_aim_instruction.register(WriteBias)
-def _render_aim_write_bias(instruction: WriteBias) -> tuple[str, ...]:
-    """Encode one MAC-bias initialization for AiM.
-
-    Args:
-        instruction: Bias write to encode.
-
-    Returns:
-        One AiM trace record.
-    """
-
-    return (
-        f"AiM WR_BIAS {instruction.source.slot} "
-        f"{render_aim_channel_mask(instruction.channels)}",
-    )
-
-
-@render_aim_instruction.register(ReadMac)
-@render_aim_instruction.register(ReadActivation)
-def _render_aim_register_read(
-        instruction: ReadMac | ReadActivation,
-) -> tuple[str, ...]:
-    """Encode a MAC or activation-result register read for AiM.
-
-    Args:
-        instruction: Register read to encode.
-
-    Returns:
-        One AiM trace record whose opcode selects the register file.
-
-    Raises:
-        AimSimulatorCompatibilityError: If its register is not encodable by AiM.
-    """
-
-    _require_simulator_register(instruction, instruction.accumulation_register)
-    return (
-        f"AiM {instruction.opcode.value} {instruction.destination.slot} "
-        f"{render_aim_channel_mask(instruction.channels)}",
-    )
-
-
-@render_aim_instruction.register(WriteGlobalBuffer)
-def _render_aim_write_global_buffer(
-        instruction: WriteGlobalBuffer,
-) -> tuple[str, ...]:
-    """Encode one Shared-Buffer-to-Global-Buffer transfer for AiM.
-
-    Args:
-        instruction: Global Buffer write to encode.
-
-    Returns:
-        One AiM trace record.
-
-    Raises:
-        AimSimulatorCompatibilityError: If its column is not encodable by AiM.
-    """
-
-    _require_zero_column(instruction, instruction.column)
-    return (
-        f"AiM WR_GB {instruction.operation_size} {instruction.source.slot} "
-        f"{render_aim_channel_mask(instruction.channels)}",
     )
 
 
