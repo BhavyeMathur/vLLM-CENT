@@ -7,10 +7,11 @@ from .instructions import CentInstruction, validate_instruction
 
 __all__ = ["CentProgram"]
 
-# TODO(runtime): Instructions do not tell a loader what each address contains.
-# We need tensor locations, initial data, inputs, and output locations. When the
-# runtime materializes a logical vector, it must use the vector layout to write
-# every occupied lane and explicitly zero each partition's padding lanes.
+
+# A CentProgram deliberately contains instructions only. The runtime package's
+# CentExecutable pairs it with named physical inputs and outputs. Future logical
+# vector bindings must also write every occupied lane and explicitly zero each
+# partition's padding lanes; raw bindings do not infer that higher-level layout.
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

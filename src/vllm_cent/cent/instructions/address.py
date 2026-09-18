@@ -1,11 +1,13 @@
-"""Typed addresses for CENT's DRAM and Shared Buffer."""
+"""Typed addresses for CENT's independently addressed state regions."""
 
 from dataclasses import dataclass
 
 from ..utils import require_nonnegative
 
 __all__ = [
+    "CentBankRegisterAddress",
     "CentChannelSet",
+    "CentGlobalBufferAddress",
     "CentMemoryAddress",
     "CentSharedBufferAddress",
 ]
@@ -41,6 +43,65 @@ class CentMemoryAddress:
         # Upper bounds depend on the target and are checked in validation.py.
         for name in ("channel", "bank", "row", "column"):
             require_nonnegative(name, getattr(self, name))
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CentGlobalBufferAddress:
+    """Identify one scalar position in a channel's Global Buffer.
+
+    A Global Buffer is channel-local but is not part of a DRAM bank or row.
+    Its column is therefore governed by ``global_buffer_columns`` rather than
+    the width of a DRAM row.
+
+    Attributes:
+        channel: Zero-based physical channel number.
+        column: Zero-based scalar position in the channel's Global Buffer.
+    """
+
+    channel: int
+    column: int
+
+    def __post_init__(self) -> None:
+        """Reject coordinates that are invalid on every hardware target.
+
+        Raises:
+            ValueError: If either coordinate is negative.
+        """
+
+        # Upper bounds belong to the selected hardware target.
+        require_nonnegative("channel", self.channel)
+        require_nonnegative("column", self.column)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CentBankRegisterAddress:
+    """Identify one accumulator or activation-result register.
+
+    Accumulator and activation-result files use the same coordinates but are
+    distinct state regions. The owning state object decides which file an
+    address selects.
+
+    Attributes:
+        channel: Zero-based physical channel number.
+        bank: Zero-based bank number within ``channel``.
+        register: Zero-based result-register number within ``bank``.
+    """
+
+    channel: int
+    bank: int
+    register: int
+
+    def __post_init__(self) -> None:
+        """Reject coordinates that are invalid on every hardware target.
+
+        Raises:
+            ValueError: If any coordinate is negative.
+        """
+
+        # Upper bounds belong to the selected hardware target.
+        require_nonnegative("channel", self.channel)
+        require_nonnegative("bank", self.bank)
+        require_nonnegative("register", self.register)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

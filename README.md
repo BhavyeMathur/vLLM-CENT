@@ -2,11 +2,13 @@
 
 vLLM-CENT compiles model-specific operations into a typed CENT program. The
 first frontend lowers one batch-one Llama decode block; the generic `cent/`
-package contains no Llama or transformer definitions.
+package contains no Llama or transformer definitions. A small functional
+simulator executes the instruction subset whose value semantics are defined.
 
-This project does not execute a model and does not require an emulator. Its
-output is an ordered sequence of instructions for the architecture described
-in the [CENT paper](https://arxiv.org/abs/2502.07578).
+This project does not yet execute a complete model. Its compiler output is an
+ordered sequence of instructions for the architecture described in the
+[CENT paper](https://arxiv.org/abs/2502.07578); the functional simulator is a
+correctness target, while the AiM adapter remains a separate timing target.
 
 ## Paper-faithful instruction layer
 
@@ -62,15 +64,25 @@ the target types. `compiler.py` remains only a small family dispatcher.
 ## Current public interface
 
 - `LlamaModelSpec` describes one Llama block.
-- `CentHardwareSpec` describes DRAM geometry, the 64KB Shared Buffer as 2,048
-  256-bit slots by default, PU accumulation-register capacity, and the target
-  ABI's sigmoid `AFid`.
+- `CentHardwareSpec` describes DRAM geometry, explicit per-channel Global
+  Buffer capacity, the 64KB Shared Buffer as 2,048 256-bit slots by default,
+  PU accumulation-register capacity, and the target ABI's sigmoid `AFid`.
 - `CentBlockPlacementSpec` assigns physical channels to one block.
 - `DecodeStepSpec` provides current and reserved context lengths.
 - `CompileRequest` combines the source model, target, placement, and decode
   step.
 - `compile_transformer_block` returns a validated `CentProgram`.
 - `render_text_program` emits paper-ISA assembly.
+- `CentExecutable` attaches named raw scalars to reusable DRAM, Shared Buffer,
+  and Global Buffer regions. Inputs cannot overlap; read-only outputs may.
+- `execute_functionally` runs supported instructions with strict uninitialized
+  reads, transactional instruction commits, reference Python-float arithmetic,
+  and optional summary events containing physical read/write regions.
+
+The functional slice currently supports `WR_SBK`, `RD_SBK`, `WR_GB`,
+`COPY_BKGB`, `COPY_GBBK`, `EW_MUL`, and `ACC`. It rejects all other opcodes
+during whole-program preflight. This is intentionally not a claim that the
+current RMSNorm or Llama block lowering is numerically executable.
 
 The Llama frontend currently lowers RMSNorm, Q/K/V projections, rotary
 embedding data movement and multiplication, KV-cache updates, attention-score

@@ -81,6 +81,7 @@ def make_builder(
         num_banks=num_banks,
         dram_rows=128,
         dram_columns=dram_columns,
+        global_buffer_columns=dram_columns,
         burst_length=burst_length,
         accumulator_slots_per_bank=accumulator_slots,
         sigmoid_activation_function_id=3,

@@ -1,11 +1,12 @@
 """Public typed instruction interface for CENT programs."""
 
 from .address import (
+    CentBankRegisterAddress,
     CentChannelSet,
+    CentGlobalBufferAddress,
     CentMemoryAddress,
     CentSharedBufferAddress,
 )
-from .base import CentInstruction, CentOpcode
 from .arithmetic import (
     Accumulate,
     ApplyActivation,
@@ -16,6 +17,7 @@ from .arithmetic import (
     Reduction,
     RunRiscV,
 )
+from .base import CentInstruction, CentOpcode
 from .data_movement import (
     BroadcastCxl,
     CopyBankToGlobalBuffer,
@@ -41,7 +43,9 @@ __all__ = [
     "Accumulate",
     "ApplyActivation",
     "BroadcastCxl",
+    "CentBankRegisterAddress",
     "CentChannelSet",
+    "CentGlobalBufferAddress",
     "CentInstruction",
     "CentMemoryAddress",
     "CentOpcode",

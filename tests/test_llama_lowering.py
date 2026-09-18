@@ -49,6 +49,11 @@ from vllm_cent.models.llama.compiler import (
     _lower_feed_forward,
     _lower_self_attention,
 )
+from vllm_cent.models.llama.feed_forward import (
+    _SiluProductChunkPlan,
+    _SiluProductPlan,
+    _lower_silu_product,
+)
 from vllm_cent.models.llama.planning import (
     _LlamaBufferLayout,
     _LlamaCompileContext,
@@ -72,11 +77,6 @@ from vllm_cent.models.llama.planning import (
     _plan_shared_buffer,
     _row_counts,
     _validate_context,
-)
-from vllm_cent.models.llama.feed_forward import (
-    _SiluProductChunkPlan,
-    _SiluProductPlan,
-    _lower_silu_product,
 )
 
 
@@ -119,6 +119,7 @@ def make_request(
             num_banks=4,
             dram_rows=1_000,
             dram_columns=16,
+            global_buffer_columns=16,
             burst_length=4,
             accumulator_slots_per_bank=4,
             sigmoid_activation_function_id=0,

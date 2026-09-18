@@ -5,8 +5,8 @@ from dataclasses import dataclass
 # One CENT processing unit works with a group of four neighboring DRAM banks.
 BANKS_PER_PU = 4
 
-# TODO(architecture): We currently describe DRAM and the Shared Buffer. We need
-# to decide whether compilation also needs Global Buffer capacity, CXL topology,
+# TODO(architecture): We currently describe DRAM, the Global Buffer, and the
+# Shared Buffer. We need to decide whether compilation also needs CXL topology,
 # PNM-unit count, and instruction-buffer capacity.
 
 # TODO(architecture): The paper uses BF16 and moves 16 values in one 256-bit
@@ -31,8 +31,11 @@ class CentHardwareSpec:
         dram_rows: Number of rows in each DRAM bank.
         dram_columns: Number of scalar values in each DRAM row. A row must hold
             a whole number of bursts.
+        global_buffer_columns: Number of scalar positions in each channel's
+            Global Buffer. This is an explicit target property because Global
+            Buffer capacity is independent of DRAM row width.
         burst_length: Number of scalar values moved by one micro-operation. It
-            cannot be wider than a DRAM row.
+            cannot be wider than a DRAM row or Global Buffer.
         accumulator_slots_per_bank: Number of MAC result registers available to
             each bank. The paper calls an index into these registers ``Regid``.
         sigmoid_activation_function_id: Numeric ``AFid`` that this target uses
@@ -45,6 +48,7 @@ class CentHardwareSpec:
     num_banks: int
     dram_rows: int
     dram_columns: int
+    global_buffer_columns: int
     burst_length: int
     accumulator_slots_per_bank: int
     sigmoid_activation_function_id: int
@@ -55,7 +59,8 @@ class CentHardwareSpec:
 
         Raises:
             ValueError: If a dimension is outside its documented range or the
-                row width is not an integer number of bursts.
+                row width is not an integer number of bursts, or a burst does
+                not fit in the Global Buffer.
         """
 
         # CHmask has one bit for each of the paper's 32 possible channels.
@@ -71,10 +76,16 @@ class CentHardwareSpec:
             raise ValueError("dram_rows must be at least 1")
         if self.dram_columns < 1:
             raise ValueError("dram_columns must be at least 1")
+        if self.global_buffer_columns < 1:
+            raise ValueError("global_buffer_columns must be at least 1")
         if self.burst_length < 1 or self.burst_length > self.dram_columns:
             raise ValueError("burst_length must be between 1 and dram_columns")
         if self.dram_columns % self.burst_length != 0:
             raise ValueError("dram_columns must be divisible by burst_length")
+        # Global Buffer operations move at least one complete burst. No current
+        # instruction requires the total buffer capacity to be burst-aligned.
+        if self.burst_length > self.global_buffer_columns:
+            raise ValueError("burst_length cannot exceed global_buffer_columns")
         # Regid and Shared Buffer addresses need at least one valid destination.
         if self.accumulator_slots_per_bank < 1:
             raise ValueError("accumulator_slots_per_bank must be at least 1")

@@ -1,6 +1,7 @@
 """Check typed CENT instructions against one hardware target."""
 
-from ..hardware import CentHardwareSpec
+from functools import singledispatch
+
 from .address import (
     CentChannelSet,
     CentMemoryAddress,
@@ -30,6 +31,7 @@ from .data_movement import (
     WriteGlobalBuffer,
     WriteSingleBank,
 )
+from ..hardware import CentHardwareSpec
 
 __all__ = [
     "validate_address",
@@ -135,6 +137,32 @@ def _validate_operation_span(
         raise ValueError("instruction micro-operations cross a DRAM row")
 
 
+def _validate_global_buffer_span(
+        operation_size: int,
+        column: int,
+        hardware: CentHardwareSpec,
+) -> None:
+    """Check that a burst-sized operation span fits in a Global Buffer.
+
+    Args:
+        operation_size: Number of burst-sized operations, or ``OPsize``.
+        column: First scalar position in the Global Buffer, or ``CO``.
+        hardware: Device that defines burst width and Global Buffer capacity.
+
+    Raises:
+        ValueError: If the first column or complete span is outside the Global
+            Buffer.
+    """
+
+    # Global Buffer and DRAM columns share the ISA's CO spelling, but they are
+    # separate address spaces and can have different physical capacities.
+    if column >= hardware.global_buffer_columns:
+        raise ValueError("instruction column is outside the Global Buffer")
+    span_end = column + operation_size * hardware.burst_length
+    if span_end > hardware.global_buffer_columns:
+        raise ValueError("instruction exceeds the target Global Buffer")
+
+
 def _validate_shared_buffer_span(
     address: CentSharedBufferAddress,
     operation_size: int,
@@ -161,6 +189,7 @@ def _validate_shared_buffer_span(
         raise ValueError("instruction exceeds the target Shared Buffer")
 
 
+@singledispatch
 def validate_instruction(
     instruction: CentInstruction, hardware: CentHardwareSpec
 ) -> None:
@@ -175,138 +204,510 @@ def validate_instruction(
         ValueError: If an operand is incompatible with the target.
     """
 
-    # A single-bank transfer advances through DRAM bursts and Shared Buffer
-    # slots. A write reads Rs; a read writes Rd.
-    if isinstance(instruction, (WriteSingleBank, ReadSingleBank)):
-        validate_address(instruction.address, hardware)
-        _validate_operation_span(
-            instruction.operation_size, instruction.address.column, hardware
-        )
-        shared_address = (
-            instruction.source
-            if isinstance(instruction, WriteSingleBank)
-            else instruction.destination
-        )
-        _validate_shared_buffer_span(
-            shared_address, instruction.operation_size, hardware
-        )
-        return
+    raise TypeError(f"unsupported CENT instruction type: {type(instruction).__name__}")
 
-    # WR_ABK names one channel and broadcasts within that channel's banks.
-    if isinstance(instruction, WriteAllBanks):
-        if instruction.channel >= hardware.num_channels:
-            raise ValueError("instruction channel is outside the target")
-        _validate_row_column(instruction.row, instruction.column, hardware)
-        validate_shared_buffer_address(instruction.source, hardware)
-        _validate_accumulation_register(instruction.accumulation_register, hardware)
-        return
 
-    # Every instruction in this group contains a CHmask.
-    if isinstance(
-        instruction,
-        (
-            MacAllBanks,
-            ElementwiseMultiply,
-            ApplyActivation,
-            CopyBankToGlobalBuffer,
-            CopyGlobalBufferToBank,
-            WriteBias,
-            ReadActivation,
-            ReadMac,
-            WriteGlobalBuffer,
-        ),
-    ):
-        validate_channels(instruction.channels, hardware)
+@validate_instruction.register
+def _validate_write_single_bank(
+        instruction: WriteSingleBank,
+        hardware: CentHardwareSpec,
+) -> None:
+    """Validate one Shared-Buffer-to-DRAM transfer.
 
-    # These instructions start at RO/CO and advance by one burst per operation.
-    if isinstance(
-        instruction,
-        (
-            MacAllBanks,
-            ElementwiseMultiply,
-            CopyBankToGlobalBuffer,
-            CopyGlobalBufferToBank,
-        ),
-    ):
-        _validate_row_column(instruction.row, instruction.column, hardware)
-        _validate_operation_span(
-            instruction.operation_size, instruction.column, hardware
-        )
+    Args:
+        instruction: Single-bank write to validate.
+        hardware: Device on which the command will run.
 
-    if (
-        isinstance(instruction, (CopyBankToGlobalBuffer, CopyGlobalBufferToBank))
-        and instruction.bank >= hardware.num_banks
-    ):
-        raise ValueError("copy bank is outside the target channel")
+    Raises:
+        ValueError: If the DRAM address, row span, or Shared Buffer source span
+            is outside the target.
+    """
 
-    # Regid selects a MAC register, not a DRAM or Shared Buffer address.
-    if isinstance(
-        instruction,
-        (MacAllBanks, ApplyActivation, ReadActivation, ReadMac),
-    ):
-        _validate_accumulation_register(instruction.accumulation_register, hardware)
-
-    # Check the Shared Buffer fields and any spans implied by OPsize.
-    if isinstance(instruction, WriteBias):
-        validate_shared_buffer_address(instruction.source, hardware)
-    elif isinstance(instruction, (ReadActivation, ReadMac)):
-        validate_shared_buffer_address(instruction.destination, hardware)
-    elif isinstance(instruction, WriteGlobalBuffer):
-        # TODO(architecture): We check this Global Buffer span with the DRAM row
-        # width. We need a separate Global Buffer capacity in the hardware spec.
-
-        _validate_shared_buffer_span(
-            instruction.source, instruction.operation_size, hardware
-        )
-        _validate_operation_span(
-            instruction.operation_size, instruction.column, hardware
-        )
-    elif isinstance(instruction, (Exponent, Reduction, Accumulate, RunRiscV)):
-        # TODO(paper/ABI): We assume equal input and output slot counts. We need
-        # separate footprints for EXP, RED, ACC, and each RISC-V routine.
-
-        _validate_shared_buffer_span(
-            instruction.source, instruction.operation_size, hardware
-        )
-        _validate_shared_buffer_span(
-            instruction.destination, instruction.operation_size, hardware
-        )
-    elif isinstance(instruction, SendCxl):
-        # TODO(architecture): We incorrectly check remote Rd against the local
-        # device. We need the destination device's topology and buffer geometry.
-
-        validate_shared_buffer_address(instruction.source, hardware)
-        validate_shared_buffer_address(instruction.destination, hardware)
-    elif isinstance(instruction, BroadcastCxl):
-        # TODO(architecture): We need a CXL topology to check the 8-bit DVcount
-        # and the destination buffers on every receiving device.
-
-        validate_shared_buffer_address(instruction.source, hardware)
-        validate_shared_buffer_address(instruction.destination, hardware)
-
-    # Reject a new instruction type until its hardware checks are added above.
-    known_types = (
-        MacAllBanks,
-        ElementwiseMultiply,
-        ApplyActivation,
-        Exponent,
-        Reduction,
-        Accumulate,
-        RunRiscV,
-        SendCxl,
-        ReceiveCxl,
-        BroadcastCxl,
-        CopyBankToGlobalBuffer,
-        CopyGlobalBufferToBank,
-        WriteBias,
-        ReadActivation,
-        ReadMac,
-        WriteGlobalBuffer,
+    validate_address(instruction.address, hardware)
+    _validate_operation_span(
+        instruction.operation_size,
+        instruction.address.column,
+        hardware,
     )
-    if not isinstance(instruction, known_types):
-        raise TypeError(
-            f"unsupported CENT instruction type: {type(instruction).__name__}"
-        )
+    _validate_shared_buffer_span(
+        instruction.source,
+        instruction.operation_size,
+        hardware,
+    )
+
+
+@validate_instruction.register
+def _validate_read_single_bank(
+        instruction: ReadSingleBank,
+        hardware: CentHardwareSpec,
+) -> None:
+    """Validate one DRAM-to-Shared-Buffer transfer.
+
+    Args:
+        instruction: Single-bank read to validate.
+        hardware: Device on which the command will run.
+
+    Raises:
+        ValueError: If the DRAM address, row span, or Shared Buffer destination
+            span is outside the target.
+    """
+
+    validate_address(instruction.address, hardware)
+    _validate_operation_span(
+        instruction.operation_size,
+        instruction.address.column,
+        hardware,
+    )
+    _validate_shared_buffer_span(
+        instruction.destination,
+        instruction.operation_size,
+        hardware,
+    )
+
+
+@validate_instruction.register
+def _validate_write_all_banks(
+        instruction: WriteAllBanks,
+        hardware: CentHardwareSpec,
+) -> None:
+    """Validate one all-bank broadcast write.
+
+    Args:
+        instruction: All-bank write to validate.
+        hardware: Device on which the command will run.
+
+    Raises:
+        ValueError: If the channel, DRAM coordinate, Shared Buffer source, or
+            accumulation register is outside the target.
+    """
+
+    if instruction.channel >= hardware.num_channels:
+        raise ValueError("instruction channel is outside the target")
+    _validate_row_column(instruction.row, instruction.column, hardware)
+    validate_shared_buffer_address(instruction.source, hardware)
+    _validate_accumulation_register(instruction.accumulation_register, hardware)
+
+
+@validate_instruction.register
+def _validate_mac_all_banks(
+        instruction: MacAllBanks,
+        hardware: CentHardwareSpec,
+) -> None:
+    """Validate one near-bank multiply-accumulate command.
+
+    Args:
+        instruction: All-bank MAC to validate.
+        hardware: Device on which the command will run.
+
+    Raises:
+        ValueError: If a selected channel, DRAM span, or accumulation register
+            is outside the target.
+    """
+
+    validate_channels(instruction.channels, hardware)
+    _validate_row_column(instruction.row, instruction.column, hardware)
+    _validate_operation_span(
+        instruction.operation_size,
+        instruction.column,
+        hardware,
+    )
+    _validate_accumulation_register(instruction.accumulation_register, hardware)
+
+
+@validate_instruction.register
+def _validate_elementwise_multiply(
+        instruction: ElementwiseMultiply,
+        hardware: CentHardwareSpec,
+) -> None:
+    """Validate one near-bank elementwise multiplication.
+
+    Args:
+        instruction: Elementwise multiplication to validate.
+        hardware: Device on which the command will run.
+
+    Raises:
+        ValueError: If a selected channel or DRAM span is outside the target.
+    """
+
+    validate_channels(instruction.channels, hardware)
+    _validate_row_column(instruction.row, instruction.column, hardware)
+    _validate_operation_span(
+        instruction.operation_size,
+        instruction.column,
+        hardware,
+    )
+
+
+@validate_instruction.register
+def _validate_apply_activation(
+        instruction: ApplyActivation,
+        hardware: CentHardwareSpec,
+) -> None:
+    """Validate one near-bank activation command.
+
+    Args:
+        instruction: Activation command to validate.
+        hardware: Device on which the command will run.
+
+    Raises:
+        ValueError: If a selected channel or accumulation register is outside
+            the target.
+    """
+
+    validate_channels(instruction.channels, hardware)
+    _validate_accumulation_register(instruction.accumulation_register, hardware)
+
+
+def _validate_shared_buffer_input_output(
+        *,
+        source: CentSharedBufferAddress,
+        destination: CentSharedBufferAddress,
+        operation_size: int,
+        hardware: CentHardwareSpec,
+) -> None:
+    """Validate equal-size input and output spans for a PNM command.
+
+    Args:
+        source: First Shared Buffer input slot.
+        destination: First Shared Buffer output slot.
+        operation_size: Number of consecutive slots in each span.
+        hardware: Device on which the command will run.
+
+    Raises:
+        ValueError: If either complete span is outside the Shared Buffer.
+    """
+
+    # TODO(paper/ABI): We assume equal input and output slot counts. We need
+    # separate footprints for EXP, RED, ACC, and each RISC-V routine.
+    _validate_shared_buffer_span(source, operation_size, hardware)
+    _validate_shared_buffer_span(destination, operation_size, hardware)
+
+
+@validate_instruction.register
+def _validate_exponent(
+        instruction: Exponent,
+        hardware: CentHardwareSpec,
+) -> None:
+    """Validate the Shared Buffer spans used by one exponent command.
+
+    Args:
+        instruction: Exponent command to validate.
+        hardware: Device on which the command will run.
+
+    Raises:
+        ValueError: If its source or destination span is outside the target.
+    """
+
+    _validate_shared_buffer_input_output(
+        source=instruction.source,
+        destination=instruction.destination,
+        operation_size=instruction.operation_size,
+        hardware=hardware,
+    )
+
+
+@validate_instruction.register
+def _validate_reduction(
+        instruction: Reduction,
+        hardware: CentHardwareSpec,
+) -> None:
+    """Validate the Shared Buffer spans used by one reduction command.
+
+    Args:
+        instruction: Reduction command to validate.
+        hardware: Device on which the command will run.
+
+    Raises:
+        ValueError: If its source or destination span is outside the target.
+    """
+
+    _validate_shared_buffer_input_output(
+        source=instruction.source,
+        destination=instruction.destination,
+        operation_size=instruction.operation_size,
+        hardware=hardware,
+    )
+
+
+@validate_instruction.register
+def _validate_accumulate(
+        instruction: Accumulate,
+        hardware: CentHardwareSpec,
+) -> None:
+    """Validate the Shared Buffer spans used by one accumulation command.
+
+    Args:
+        instruction: Accumulation command to validate.
+        hardware: Device on which the command will run.
+
+    Raises:
+        ValueError: If its source or destination span is outside the target.
+    """
+
+    _validate_shared_buffer_input_output(
+        source=instruction.source,
+        destination=instruction.destination,
+        operation_size=instruction.operation_size,
+        hardware=hardware,
+    )
+
+
+@validate_instruction.register
+def _validate_run_risc_v(
+        instruction: RunRiscV,
+        hardware: CentHardwareSpec,
+) -> None:
+    """Validate the Shared Buffer spans used by one RISC-V command.
+
+    Args:
+        instruction: RISC-V command to validate.
+        hardware: Device on which the command will run.
+
+    Raises:
+        ValueError: If its source or destination span is outside the target.
+    """
+
+    _validate_shared_buffer_input_output(
+        source=instruction.source,
+        destination=instruction.destination,
+        operation_size=instruction.operation_size,
+        hardware=hardware,
+    )
+
+
+@validate_instruction.register
+def _validate_send_cxl(
+        instruction: SendCxl,
+        hardware: CentHardwareSpec,
+) -> None:
+    """Validate the locally checkable Shared Buffer operands of a CXL send.
+
+    Args:
+        instruction: Point-to-point CXL send to validate.
+        hardware: Device on which the command will run.
+
+    Raises:
+        ValueError: If a checked Shared Buffer address is outside the target.
+    """
+
+    # TODO(architecture): We incorrectly check remote Rd against the local
+    # device. We need the destination device's topology and buffer geometry.
+    validate_shared_buffer_address(instruction.source, hardware)
+    validate_shared_buffer_address(instruction.destination, hardware)
+
+
+@validate_instruction.register
+def _validate_receive_cxl(
+        instruction: ReceiveCxl,
+        hardware: CentHardwareSpec,
+) -> None:
+    """Accept the operand-free CXL receive command on any CENT target.
+
+    Args:
+        instruction: Operand-free CXL receive to validate.
+        hardware: Device on which the command will run.
+    """
+
+    # Referencing both arguments makes this intentionally operand-free contract
+    # visible to static analysis without inventing target checks.
+    del instruction, hardware
+
+
+@validate_instruction.register
+def _validate_broadcast_cxl(
+        instruction: BroadcastCxl,
+        hardware: CentHardwareSpec,
+) -> None:
+    """Validate locally checkable Shared Buffer operands of a CXL broadcast.
+
+    Args:
+        instruction: CXL broadcast to validate.
+        hardware: Device on which the command will run.
+
+    Raises:
+        ValueError: If a checked Shared Buffer address is outside the target.
+    """
+
+    # TODO(architecture): We need a CXL topology to check the 8-bit DVcount and
+    # the destination buffers on every receiving device.
+    validate_shared_buffer_address(instruction.source, hardware)
+    validate_shared_buffer_address(instruction.destination, hardware)
+
+
+def _validate_bank_global_buffer_copy(
+        *,
+        channels: CentChannelSet,
+        operation_size: int,
+        bank: int,
+        row: int,
+        column: int,
+        hardware: CentHardwareSpec,
+) -> None:
+    """Validate shared geometry for a bank/Global-Buffer copy.
+
+    Args:
+        channels: Channels participating in the copy.
+        operation_size: Number of burst-sized operations.
+        bank: Bank selected in every participating channel.
+        row: DRAM row containing the copied span.
+        column: First scalar column in DRAM and the Global Buffer.
+        hardware: Device on which the command will run.
+
+    Raises:
+        ValueError: If a channel, bank, DRAM span, or Global Buffer span is
+            outside the target.
+    """
+
+    validate_channels(channels, hardware)
+    _validate_row_column(row, column, hardware)
+    _validate_operation_span(operation_size, column, hardware)
+    if bank >= hardware.num_banks:
+        raise ValueError("copy bank is outside the target channel")
+    # CO selects both address spaces, whose capacities are independent.
+    _validate_global_buffer_span(operation_size, column, hardware)
+
+
+@validate_instruction.register
+def _validate_copy_bank_to_global_buffer(
+        instruction: CopyBankToGlobalBuffer,
+        hardware: CentHardwareSpec,
+) -> None:
+    """Validate one bank-to-Global-Buffer copy.
+
+    Args:
+        instruction: Bank-to-Global-Buffer copy to validate.
+        hardware: Device on which the command will run.
+
+    Raises:
+        ValueError: If a channel, bank, DRAM span, or Global Buffer span is
+            outside the target.
+    """
+
+    _validate_bank_global_buffer_copy(
+        channels=instruction.channels,
+        operation_size=instruction.operation_size,
+        bank=instruction.bank,
+        row=instruction.row,
+        column=instruction.column,
+        hardware=hardware,
+    )
+
+
+@validate_instruction.register
+def _validate_copy_global_buffer_to_bank(
+        instruction: CopyGlobalBufferToBank,
+        hardware: CentHardwareSpec,
+) -> None:
+    """Validate one Global-Buffer-to-bank copy.
+
+    Args:
+        instruction: Global-Buffer-to-bank copy to validate.
+        hardware: Device on which the command will run.
+
+    Raises:
+        ValueError: If a channel, bank, DRAM span, or Global Buffer span is
+            outside the target.
+    """
+
+    _validate_bank_global_buffer_copy(
+        channels=instruction.channels,
+        operation_size=instruction.operation_size,
+        bank=instruction.bank,
+        row=instruction.row,
+        column=instruction.column,
+        hardware=hardware,
+    )
+
+
+@validate_instruction.register
+def _validate_write_bias(
+        instruction: WriteBias,
+        hardware: CentHardwareSpec,
+) -> None:
+    """Validate one Shared-Buffer-to-bias-register command.
+
+    Args:
+        instruction: Bias write to validate.
+        hardware: Device on which the command will run.
+
+    Raises:
+        ValueError: If a selected channel or Shared Buffer source is outside
+            the target.
+    """
+
+    validate_channels(instruction.channels, hardware)
+    validate_shared_buffer_address(instruction.source, hardware)
+
+
+@validate_instruction.register
+def _validate_read_activation(
+        instruction: ReadActivation,
+        hardware: CentHardwareSpec,
+) -> None:
+    """Validate one activation-register read.
+
+    Args:
+        instruction: Activation-register read to validate.
+        hardware: Device on which the command will run.
+
+    Raises:
+        ValueError: If a channel, accumulation register, or Shared Buffer
+            destination is outside the target.
+    """
+
+    validate_channels(instruction.channels, hardware)
+    _validate_accumulation_register(instruction.accumulation_register, hardware)
+    validate_shared_buffer_address(instruction.destination, hardware)
+
+
+@validate_instruction.register
+def _validate_read_mac(
+        instruction: ReadMac,
+        hardware: CentHardwareSpec,
+) -> None:
+    """Validate one MAC-register read.
+
+    Args:
+        instruction: MAC-register read to validate.
+        hardware: Device on which the command will run.
+
+    Raises:
+        ValueError: If a channel, accumulation register, or Shared Buffer
+            destination is outside the target.
+    """
+
+    validate_channels(instruction.channels, hardware)
+    _validate_accumulation_register(instruction.accumulation_register, hardware)
+    validate_shared_buffer_address(instruction.destination, hardware)
+
+
+@validate_instruction.register
+def _validate_write_global_buffer(
+        instruction: WriteGlobalBuffer,
+        hardware: CentHardwareSpec,
+) -> None:
+    """Validate one Shared-Buffer-to-Global-Buffer write.
+
+    Args:
+        instruction: Global Buffer write to validate.
+        hardware: Device on which the command will run.
+
+    Raises:
+        ValueError: If a channel, Shared Buffer source span, or Global Buffer
+            destination span is outside the target.
+    """
+
+    validate_channels(instruction.channels, hardware)
+    _validate_shared_buffer_span(
+        instruction.source,
+        instruction.operation_size,
+        hardware,
+    )
+    _validate_global_buffer_span(
+        instruction.operation_size,
+        instruction.column,
+        hardware,
+    )
 
 
 def _validate_accumulation_register(register: int, hardware: CentHardwareSpec) -> None:

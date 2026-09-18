@@ -28,6 +28,11 @@ with an early prototype.
   requires a versioned wire format.
 - A `CentProgram` is typed intermediate representation, not a string trace.
   Rendering is a target-specific final step.
+- Instruction dataclasses remain pure data. Generic hardware validation and
+  each renderer dispatch externally through separate `singledispatch`
+  functions because they have independent behavior and support matrices. An
+  internal instruction catalog and completeness tests keep full-IR consumers
+  exhaustive while allowing target adapters to reject unsupported subsets.
 
 ## Package responsibilities
 
@@ -76,6 +81,51 @@ with an early prototype.
   a nearby source `TODO`.
 - AiM is a DRAM timing target, not a functional oracle. Numerical validation
   requires a functional executor or a trusted reference implementation.
+
+## Functional execution
+
+- A `CentProgram` remains pure instruction IR. Runtime values and named physical
+  bindings travel beside it in an immutable `CentExecutable` manifest.
+- The foundation manifest uses reusable `CentDramRegion`,
+  `CentSharedBufferRegion`, and `CentGlobalBufferRegion` values with separate
+  named input/output bindings. It does not claim logical tensor shape, packing,
+  scalar format, or padding. A later logical layer wraps these raw regions.
+- Binding names are unique within each direction and may repeat across input
+  and output for mutable state. Input regions cannot overlap; overlapping
+  output regions are valid read-only views.
+- `vllm_cent/runtime/` owns reusable host-to-device bindings;
+  `vllm_cent/simulator/` owns the Python correctness target. Model-family
+  lowering may produce bindings but may not inspect simulator state.
+- Generic Global Buffer and bank-register addresses belong to `cent/`, not the
+  simulator. Global Buffer capacity is an explicit scalar-count field on
+  `CentHardwareSpec`; it must never be inferred from DRAM row width.
+- The first numeric profile is deterministic reference math. It validates
+  compiler dataflow but makes no claim of BF16 or cycle accuracy.
+- Host materialization converts each value to its stored representation once.
+  Transfers move stored values unchanged, and arithmetic policies return their
+  stored result; state commit must not quantize either again.
+- Device memory begins uninitialized. Missing values are errors, not implicit
+  zeros. DRAM is sparse so small tests do not allocate model-sized arrays.
+- Execution is ordered and each instruction is atomic. Kernels prepare complete
+  immutable effects before one cross-region batch commit. Whole-program
+  preflight rejects unsupported semantics before instruction zero.
+- Simulator semantics remain outside the instruction IR. One simulator-owned
+  handler registration binds each supported concrete instruction class to both
+  its preflight check and effect kernel, preventing support and execution from
+  drifting apart. The registry preserves subclass dispatch.
+- Mutable state, numeric-policy implementations, preflight, state-level
+  execution, and prepared effects remain private simulator implementation APIs.
+  The supported public boundary is the manifest-facing request/result function
+  plus stable structured errors.
+- Summary events are produced only for committed instructions. They contain
+  typed physical source regions and destination regions from committed effects;
+  value-heavy tracing is deferred until truncation and lane policies exist.
+- The initial supported set is `WR_SBK`, `RD_SBK`, `WR_GB`, `COPY_BKGB`,
+  `COPY_GBBK`, `EW_MUL`, and `ACC`. Other opcodes remain explicit preflight
+  failures until their source-level contracts are defined and tested.
+- The complete architecture, failure model, instruction-readiness table, and
+  milestones are recorded in
+  [`FUNCTIONAL_SIMULATOR_DESIGN.md`](../FUNCTIONAL_SIMULATOR_DESIGN.md).
 
 ## Serving integration
 

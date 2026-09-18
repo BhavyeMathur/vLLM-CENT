@@ -7,7 +7,9 @@ from vllm_cent.cent import (
     Accumulate,
     ApplyActivation,
     BroadcastCxl,
+    CentBankRegisterAddress,
     CentChannelSet,
+    CentGlobalBufferAddress,
     CentHardwareSpec,
     CentInstruction,
     CentMemoryAddress,
@@ -34,10 +36,14 @@ from vllm_cent.cent import (
     render_instruction,
     render_text_program,
 )
+from vllm_cent.cent.instructions._catalog import _CENT_INSTRUCTION_TYPES
 from vllm_cent.cent.instructions.validation import (
     _validate_accumulation_register,
+    _validate_bank_global_buffer_copy,
+    _validate_global_buffer_span,
     _validate_operation_span,
     _validate_row_column,
+    _validate_shared_buffer_input_output,
     _validate_shared_buffer_span,
     validate_address,
     validate_channels,
@@ -45,6 +51,7 @@ from vllm_cent.cent.instructions.validation import (
     validate_shared_buffer_address,
 )
 from vllm_cent.cent.render import (
+    _render_single_bank_transfer,
     _shared_buffer_operands,
     render_channel_mask,
 )
@@ -56,7 +63,8 @@ def hardware() -> CentHardwareSpec:
 
     Returns:
         Two channels, four banks, eight rows, sixteen BF16 columns per row,
-        four BF16 values per micro-operation, and eight Shared Buffer slots.
+        twelve Global Buffer scalar positions, four BF16 values per
+        micro-operation, and eight Shared Buffer slots.
     """
 
     return CentHardwareSpec(
@@ -64,6 +72,7 @@ def hardware() -> CentHardwareSpec:
         num_banks=4,
         dram_rows=8,
         dram_columns=16,
+        global_buffer_columns=12,
         burst_length=4,
         accumulator_slots_per_bank=2,
         sigmoid_activation_function_id=0,
@@ -92,18 +101,37 @@ class PrimitiveValueTests(unittest.TestCase):
                     helper("field", invalid)
 
     def test_typed_addresses_preserve_paper_coordinates(self) -> None:
-        """Keep DRAM and Shared Buffer address fields unchanged."""
+        """Keep every generic CENT address coordinate unchanged."""
 
         dram = CentMemoryAddress(channel=1, bank=2, row=3, column=4)
+        global_buffer = CentGlobalBufferAddress(channel=1, column=6)
+        bank_register = CentBankRegisterAddress(
+            channel=1,
+            bank=2,
+            register=3,
+        )
         shared = CentSharedBufferAddress(slot=5)
 
         self.assertEqual(
             dram,
             CentMemoryAddress(channel=1, bank=2, row=3, column=4),
         )
+        self.assertEqual(
+            global_buffer,
+            CentGlobalBufferAddress(channel=1, column=6),
+        )
+        self.assertEqual(
+            bank_register,
+            CentBankRegisterAddress(channel=1, bank=2, register=3),
+        )
         self.assertEqual(shared, CentSharedBufferAddress(slot=5))
         for constructor in (
             lambda: CentMemoryAddress(channel=0, bank=0, row=0, column=-1),
+            lambda: CentGlobalBufferAddress(channel=-1, column=0),
+            lambda: CentGlobalBufferAddress(channel=0, column=-1),
+            lambda: CentBankRegisterAddress(channel=-1, bank=0, register=0),
+            lambda: CentBankRegisterAddress(channel=0, bank=-1, register=0),
+            lambda: CentBankRegisterAddress(channel=0, bank=0, register=-1),
             lambda: CentSharedBufferAddress(slot=-1),
         ):
             with self.assertRaises(ValueError):
@@ -299,6 +327,45 @@ class PaperInstructionTests(unittest.TestCase):
                 self.assertEqual(render_instruction(instruction), expected)
                 self.assertEqual(instruction.opcode.value, expected.split()[0])
 
+    def test_catalog_covers_every_core_instruction_dispatch(self) -> None:
+        """Keep the instruction inventory, validation, and rendering exhaustive."""
+
+        catalog_types = set(_CENT_INSTRUCTION_TYPES)
+        catalog_names = {
+            (instruction_type.__module__, instruction_type.__qualname__)
+            for instruction_type in catalog_types
+        }
+        implementation_names: set[tuple[str, str]] = set()
+        pending_types = list(CentInstruction.__subclasses__())
+        while pending_types:
+            instruction_type = pending_types.pop()
+            pending_types.extend(instruction_type.__subclasses__())
+            if instruction_type.__module__.startswith("vllm_cent.cent.instructions."):
+                implementation_names.add(
+                    (instruction_type.__module__, instruction_type.__qualname__)
+                )
+
+        # Every production instruction class appears exactly once in the
+        # catalog and owns one distinct opcode. Test-only subclasses are
+        # intentionally excluded by their module name.
+        self.assertEqual(len(_CENT_INSTRUCTION_TYPES), len(catalog_types))
+        self.assertSetEqual(catalog_names, implementation_names)
+        self.assertSetEqual(
+            {instruction_type.OPCODE for instruction_type in catalog_types},
+            set(CentOpcode),
+        )
+
+        # Generic validation and paper rendering cover the complete typed IR.
+        # The object registration is singledispatch's unsupported fallback.
+        self.assertSetEqual(
+            set(validate_instruction.registry) - {object},
+            catalog_types,
+        )
+        self.assertSetEqual(
+            set(render_instruction.registry) - {object},
+            catalog_types,
+        )
+
     def test_instruction_exposes_its_class_opcode(self) -> None:
         """Read an instruction's opcode from its concrete class constant."""
 
@@ -369,8 +436,10 @@ class HardwareValidationTests(unittest.TestCase):
             lambda: replace(target, num_banks=5),
             lambda: replace(target, dram_rows=0),
             lambda: replace(target, dram_columns=0),
+            lambda: replace(target, global_buffer_columns=0),
             lambda: replace(target, burst_length=0),
             lambda: replace(target, dram_columns=15),
+            lambda: replace(target, global_buffer_columns=3),
             lambda: replace(target, accumulator_slots_per_bank=0),
             lambda: replace(target, sigmoid_activation_function_id=-1),
             lambda: replace(target, shared_buffer_slots=0),
@@ -410,8 +479,23 @@ class HardwareValidationTests(unittest.TestCase):
         validate_shared_buffer_address(CentSharedBufferAddress(slot=7), target)
         _validate_row_column(7, 15, target)
         _validate_operation_span(1, 12, target)
+        _validate_global_buffer_span(1, 8, target)
         _validate_shared_buffer_span(CentSharedBufferAddress(slot=6), 2, target)
         _validate_accumulation_register(1, target)
+        _validate_shared_buffer_input_output(
+            source=CentSharedBufferAddress(slot=0),
+            destination=CentSharedBufferAddress(slot=6),
+            operation_size=2,
+            hardware=target,
+        )
+        _validate_bank_global_buffer_copy(
+            channels=CentChannelSet(channels=(0, 1)),
+            operation_size=2,
+            bank=3,
+            row=7,
+            column=4,
+            hardware=target,
+        )
 
         # Each invalid case moves one step past a limit. The two-operation
         # spans also overflow the DRAM row or Shared Buffer.
@@ -426,10 +510,25 @@ class HardwareValidationTests(unittest.TestCase):
             ),
             lambda: _validate_row_column(8, 0, target),
             lambda: _validate_operation_span(2, 12, target),
+            lambda: _validate_global_buffer_span(2, 8, target),
             lambda: _validate_shared_buffer_span(
                 CentSharedBufferAddress(slot=7), 2, target
             ),
             lambda: _validate_accumulation_register(2, target),
+            lambda: _validate_shared_buffer_input_output(
+                source=CentSharedBufferAddress(slot=0),
+                destination=CentSharedBufferAddress(slot=7),
+                operation_size=2,
+                hardware=target,
+            ),
+            lambda: _validate_bank_global_buffer_copy(
+                channels=CentChannelSet(channels=(0,)),
+                operation_size=1,
+                bank=4,
+                row=0,
+                column=0,
+                hardware=target,
+            ),
         )
         for call in invalid_calls:
             with self.subTest(call=call):
@@ -442,9 +541,10 @@ class HardwareValidationTests(unittest.TestCase):
         channels = CentChannelSet(channels=(0,))
         slot = CentSharedBufferAddress(slot=0)
         # Each otherwise-valid instruction violates the capacity associated
-        # with one operand: WR_SBK and WR_GB cross the 16-column row, WR_ABK
-        # selects nonexistent channel 2, RD_MAC selects nonexistent register 2,
-        # and EXP crosses the eight-slot Shared Buffer from slot 7.
+        # with one operand: WR_SBK crosses the 16-column row, WR_GB starts past
+        # the 12-column Global Buffer, WR_ABK selects nonexistent channel 2,
+        # RD_MAC selects nonexistent register 2, and EXP crosses the eight-slot
+        # Shared Buffer from slot 7.
         invalid = (
             WriteSingleBank(
                 address=CentMemoryAddress(
@@ -484,6 +584,90 @@ class HardwareValidationTests(unittest.TestCase):
             with self.subTest(instruction=instruction):
                 with self.assertRaises(ValueError):
                     validate_instruction(instruction, hardware())
+
+    def test_global_buffer_spans_use_their_own_capacity(self) -> None:
+        """Distinguish Global Buffer bounds from the DRAM row width."""
+
+        target = hardware()
+        channels = CentChannelSet(channels=(0,))
+        source = CentSharedBufferAddress(slot=0)
+
+        # Two four-scalar bursts starting at column 4 fit in the 12-column
+        # Global Buffer. The same span also fits in the 16-column DRAM row, so
+        # every instruction that touches both spaces is valid.
+        valid = (
+            WriteGlobalBuffer(
+                channels=channels,
+                operation_size=2,
+                column=4,
+                source=source,
+            ),
+            CopyBankToGlobalBuffer(
+                channels=channels,
+                operation_size=2,
+                bank=0,
+                row=0,
+                column=4,
+            ),
+            CopyGlobalBufferToBank(
+                channels=channels,
+                operation_size=2,
+                bank=0,
+                row=0,
+                column=4,
+            ),
+        )
+        for instruction in valid:
+            with self.subTest(instruction=type(instruction).__name__):
+                validate_instruction(instruction, target)
+
+        # Moving the same two bursts to column 8 still fits the 16-column DRAM
+        # row but ends at column 16, beyond the 12-column Global Buffer.
+        invalid = (
+            WriteGlobalBuffer(
+                channels=channels,
+                operation_size=2,
+                column=8,
+                source=source,
+            ),
+            CopyBankToGlobalBuffer(
+                channels=channels,
+                operation_size=2,
+                bank=0,
+                row=0,
+                column=8,
+            ),
+            CopyGlobalBufferToBank(
+                channels=channels,
+                operation_size=2,
+                bank=0,
+                row=0,
+                column=8,
+            ),
+        )
+        for instruction in invalid:
+            with self.subTest(instruction=type(instruction).__name__):
+                with self.assertRaisesRegex(ValueError, "Global Buffer"):
+                    validate_instruction(instruction, target)
+
+    def test_copy_still_checks_dram_row_span_separately(self) -> None:
+        """Reject a copy whose DRAM span overflows a narrower DRAM row."""
+
+        target = replace(
+            hardware(),
+            dram_columns=8,
+            global_buffer_columns=16,
+        )
+        instruction = CopyBankToGlobalBuffer(
+            channels=CentChannelSet(channels=(0,)),
+            operation_size=2,
+            bank=0,
+            row=0,
+            column=4,
+        )
+
+        with self.assertRaisesRegex(ValueError, "DRAM row"):
+            validate_instruction(instruction, target)
 
 
 class ProgramAndRenderingTests(unittest.TestCase):
@@ -530,11 +714,27 @@ class ProgramAndRenderingTests(unittest.TestCase):
         # Rs, hence two operations followed by slots 6 and 5.
         self.assertEqual(_shared_buffer_operands(instruction), "2 6 5")
 
+    def test_private_single_bank_renderer_uses_selected_buffer_role(self) -> None:
+        """Render shared transfer fields with the caller-selected buffer slot."""
+
+        instruction = WriteSingleBank(
+            address=CentMemoryAddress(channel=1, bank=2, row=3, column=4),
+            operation_size=2,
+            source=CentSharedBufferAddress(slot=5),
+        )
+
+        self.assertEqual(
+            _render_single_bank_transfer(instruction, buffer_slot=5),
+            "WR_SBK 1 2 2 3 4 5",
+        )
+
     def test_renderer_rejects_an_instruction_without_an_opcode(self) -> None:
-        """Report an unsupported base instruction with the documented error."""
+        """Reject an unsupported base instruction at both core dispatchers."""
 
         with self.assertRaisesRegex(TypeError, "CentInstruction"):
             render_instruction(CentInstruction())
+        with self.assertRaisesRegex(TypeError, "CentInstruction"):
+            validate_instruction(CentInstruction(), hardware())
 
 
 if __name__ == "__main__":
