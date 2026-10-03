@@ -1,12 +1,21 @@
-"""Tests for the semantic dialect: aloi.linear and aloi.rms_norm."""
+"""Tests for the semantic dialect: aloi.linear, aloi.rms_norm, aloi.all_reduce."""
 
 from __future__ import annotations
 
 import unittest
 
 from vllm_cent.ir.base import Value
-from vllm_cent.ir.semantic import LinearOp, RMSNormOp
-from vllm_cent.ir.types import DType, TensorRole, TensorType, packed_axis
+from vllm_cent.ir.semantic import AllReduceOp, LinearOp, RMSNormOp
+from vllm_cent.ir.types import (
+    DType,
+    Partial,
+    Placement,
+    Replicate,
+    Shard,
+    TensorRole,
+    TensorType,
+    packed_axis,
+)
 
 # Llama2-70B decode dimensions. One decode step processes one token of one
 # request, so activations are [batch=1, seq_len=1, features].
@@ -56,6 +65,96 @@ def _annotated(
 TOKEN_AXES = ("batch", "seq_len")
 HIDDEN = "hidden"
 Q_PROJ_OUT = packed_axis("q_head", "head_dim")
+
+# 8-way tensor parallelism splits the 64 query heads into 8 per rank, so every
+# q_head*head_dim dimension shrinks from 8192 to 8 x 128 = 1024 on each rank.
+TP = 8
+LOCAL_HEADS_WIDTH = HIDDEN_SIZE // TP
+
+
+def _placed(
+    shape: tuple[int, ...],
+    axes: tuple[str, ...],
+    placement: Placement,
+    global_shape: tuple[int, ...] | None = None,
+    role: TensorRole = TensorRole.ACTIVATION,
+) -> Value:
+    """Create an annotated fp16 value as one tensor-parallel rank sees it.
+
+    Args:
+        shape: Local shape.
+        axes: One axis name per dimension.
+        placement: Which part of the tensor the rank holds.
+        global_shape: Whole-tensor shape; required for a shard.
+        role: Tensor role.
+
+    Returns:
+        A new value.
+    """
+
+    return Value(
+        type=TensorType(
+            shape=shape,
+            dtype=DType.FP16,
+            role=role,
+            axes=axes,
+            global_shape=global_shape,
+            placement=placement,
+        )
+    )
+
+
+def _replicated_hidden() -> Value:
+    """Return the residual stream x: whole on every rank."""
+
+    return _placed((1, 1, HIDDEN_SIZE), (*TOKEN_AXES, HIDDEN), Replicate())
+
+
+def _sharded_heads() -> Value:
+    """Return an activation over q_head*head_dim, 8 heads per rank.
+
+    This is what q_proj produces, and what the attention output that feeds
+    o_proj looks like.
+    """
+
+    return _placed(
+        (1, 1, LOCAL_HEADS_WIDTH),
+        (*TOKEN_AXES, Q_PROJ_OUT),
+        Shard("q_head"),
+        global_shape=(1, 1, HIDDEN_SIZE),
+    )
+
+
+def _wq_shard() -> Value:
+    """Return Wq on one rank: its q_head rows (dim 0) are split."""
+
+    return _placed(
+        (LOCAL_HEADS_WIDTH, HIDDEN_SIZE),
+        (Q_PROJ_OUT, HIDDEN),
+        Shard("q_head"),
+        global_shape=(HIDDEN_SIZE, HIDDEN_SIZE),
+        role=TensorRole.WEIGHT,
+    )
+
+
+def _wo_shard() -> Value:
+    """Return Wo on one rank: its q_head columns (dim 1) are split."""
+
+    return _placed(
+        (HIDDEN_SIZE, LOCAL_HEADS_WIDTH),
+        (HIDDEN, Q_PROJ_OUT),
+        Shard("q_head"),
+        global_shape=(HIDDEN_SIZE, HIDDEN_SIZE),
+        role=TensorRole.WEIGHT,
+    )
+
+
+def _replicated_weight(axes: tuple[str, ...]) -> Value:
+    """Return a whole 8192 x 8192 weight with the given axes."""
+
+    return _placed(
+        (HIDDEN_SIZE, HIDDEN_SIZE), axes, Replicate(), role=TensorRole.WEIGHT
+    )
 
 
 class LinearOpTest(unittest.TestCase):
@@ -244,6 +343,88 @@ class LinearOpAxesTest(unittest.TestCase):
         self.assertIs(op.results[0].type.role, TensorRole.ACTIVATION)
 
 
+class LinearOpPlacementTest(unittest.TestCase):
+    """Which part of the result each tensor-parallel rank holds."""
+
+    def test_column_parallel_q_proj(self) -> None:
+        """Whole x times Wq's own heads gives this rank's heads of q.
+
+        Locally [1, 1, 8192] x [1024, 8192]^T = [1, 1, 1024]; the whole q is
+        [1, 1, 8192].
+        """
+
+        op = LinearOp(operands=(_replicated_hidden(), _wq_shard()))
+        self.assertEqual(op.results[0].type, _sharded_heads().type)
+
+    def test_row_parallel_o_proj(self) -> None:
+        """This rank's heads times Wo's matching columns is a partial sum.
+
+        Locally [1, 1, 1024] x [8192, 1024]^T = [1, 1, 8192]: the full output
+        shape, but summed over only 8 of the 64 heads.
+        """
+
+        op = LinearOp(operands=(_sharded_heads(), _wo_shard()))
+        self.assertEqual(
+            op.results[0].type,
+            TensorType(
+                shape=(1, 1, HIDDEN_SIZE),
+                dtype=DType.FP16,
+                axes=(*TOKEN_AXES, HIDDEN),
+                placement=Partial(),
+            ),
+        )
+
+    def test_unsupported_combinations(self) -> None:
+        """Combinations that would need communication before the matmul."""
+
+        partial_x = _placed(
+            (1, 1, HIDDEN_SIZE), (*TOKEN_AXES, HIDDEN), Partial()
+        )
+        batch_split_x = _placed(
+            (1, 1, HIDDEN_SIZE),
+            (*TOKEN_AXES, HIDDEN),
+            Shard("batch"),
+            global_shape=(TP, 1, HIDDEN_SIZE),
+        )
+        cases = {
+            # Wo split but its input whole: x would first need a local slice.
+            "replicated x, row-split weight": (_replicated_hidden(), _wo_shard()),
+            # Input split but Wo whole: x would first need an all_gather.
+            "split x, replicated weight": (
+                _sharded_heads(),
+                _replicated_weight((HIDDEN, Q_PROJ_OUT)),
+            ),
+            # A partial sum must be all_reduced before it is used.
+            "partial x": (partial_x, _replicated_weight((Q_PROJ_OUT, HIDDEN))),
+            # Splitting batch rows is data parallelism, not modeled yet.
+            "x split along batch": (
+                batch_split_x,
+                _replicated_weight((Q_PROJ_OUT, HIDDEN)),
+            ),
+        }
+        for name, operands in cases.items():
+            with self.subTest(case=name):
+                with self.assertRaisesRegex(ValueError, "unsupported placements"):
+                    LinearOp(operands=operands)
+
+    def test_same_axis_on_weight_output_is_not_row_parallel(self) -> None:
+        """Both split on q_head is not enough: it must be the weight's in dim.
+
+        This weight's q_head is its out dimension (dim 0), so the matmul does
+        not sum over the split axis and no rule applies.
+        """
+
+        other_heads = packed_axis("other_head", "head_dim")
+        weight_split_on_out = _placed(
+            (LOCAL_HEADS_WIDTH, LOCAL_HEADS_WIDTH),
+            (Q_PROJ_OUT, other_heads),
+            Shard("q_head"),
+            global_shape=(HIDDEN_SIZE, LOCAL_HEADS_WIDTH),
+        )
+        with self.assertRaisesRegex(ValueError, "unsupported placements"):
+            LinearOp(operands=(_sharded_heads(), weight_split_on_out))
+
+
 class RMSNormOpTest(unittest.TestCase):
     """Normalization over the last dimension, scaled by a learned weight."""
 
@@ -347,6 +528,84 @@ class RMSNormOpAxesTest(unittest.TestCase):
             op.results[0].type,
             TensorType(shape=(HIDDEN_SIZE,), dtype=DType.FP16, axes=(HIDDEN,)),
         )
+
+
+class RMSNormOpPlacementTest(unittest.TestCase):
+    """RMSNorm needs whole rows and a whole weight on every rank."""
+
+    def _gamma(self) -> Value:
+        """Return the replicated [8192] RMSNorm weight."""
+
+        return _placed((HIDDEN_SIZE,), (HIDDEN,), Replicate(), role=TensorRole.WEIGHT)
+
+    def test_rejects_split_weight(self) -> None:
+        """Each rank scales its rows by all 8192 weights."""
+
+        split_gamma = _placed(
+            (LOCAL_HEADS_WIDTH,),
+            (HIDDEN,),
+            Shard("hidden"),
+            global_shape=(HIDDEN_SIZE,),
+            role=TensorRole.WEIGHT,
+        )
+        with self.assertRaisesRegex(ValueError, "weight must be replicated"):
+            RMSNormOp(operands=(_replicated_hidden(), split_gamma), eps=1e-5)
+
+    def test_rejects_partial_x(self) -> None:
+        """The mean square of a partial sum is not that of the sum."""
+
+        partial_x = _placed((1, 1, HIDDEN_SIZE), (*TOKEN_AXES, HIDDEN), Partial())
+        with self.assertRaisesRegex(ValueError, "all_reduce it first"):
+            RMSNormOp(operands=(partial_x, self._gamma()), eps=1e-5)
+
+    def test_rejects_split_last_dimension(self) -> None:
+        """No rank would hold a whole row to normalize."""
+
+        split_x = _placed(
+            (1, 1, LOCAL_HEADS_WIDTH),
+            (*TOKEN_AXES, HIDDEN),
+            Shard("hidden"),
+            global_shape=(1, 1, HIDDEN_SIZE),
+        )
+        with self.assertRaisesRegex(ValueError, "needs the whole dimension"):
+            RMSNormOp(operands=(split_x, self._gamma()), eps=1e-5)
+
+    def test_split_leading_dimension_is_kept(self) -> None:
+        """Rows split along batch are normalized independently on each rank.
+
+        With 16 requests over 8 ranks, each rank normalizes 2 whole rows.
+        """
+
+        batch_split_x = _placed(
+            (2, 1, HIDDEN_SIZE),
+            (*TOKEN_AXES, HIDDEN),
+            Shard("batch"),
+            global_shape=(16, 1, HIDDEN_SIZE),
+        )
+        op = RMSNormOp(operands=(batch_split_x, self._gamma()), eps=1e-5)
+        self.assertEqual(op.results[0].type, batch_split_x.type)
+
+
+class AllReduceOpTest(unittest.TestCase):
+    """aloi.all_reduce turns a partial sum into the replicated total."""
+
+    def test_partial_becomes_replicated(self) -> None:
+        """Only the placement changes; shape, dtype and axes are kept."""
+
+        partial = _placed((1, 1, HIDDEN_SIZE), (*TOKEN_AXES, HIDDEN), Partial())
+        op = AllReduceOp(operands=(partial,))
+        self.assertEqual(op.results[0].type, _replicated_hidden().type)
+        self.assertIs(op.x, partial)
+        self.assertEqual(op.NAME, "aloi.all_reduce")
+        self.assertEqual(op.attributes(), {})
+
+    def test_rejects_operand_that_is_not_partial(self) -> None:
+        """Summing a whole tensor over 8 ranks would multiply it by 8."""
+
+        for operand in (_replicated_hidden(), _sharded_heads()):
+            with self.subTest(placement=operand.type.placement):
+                with self.assertRaisesRegex(ValueError, "partial sum"):
+                    AllReduceOp(operands=(operand,))
 
 
 if __name__ == "__main__":

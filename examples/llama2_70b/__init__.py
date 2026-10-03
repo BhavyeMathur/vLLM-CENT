@@ -9,6 +9,7 @@ from .model import (
     build_meta_block,
     example_inputs,
 )
+from .parallel_plan import make_parallel_plan
 
 __all__ = [
     "LLAMA2_70B",
@@ -18,5 +19,6 @@ __all__ = [
     "ToyRMSNorm",
     "build_meta_block",
     "example_inputs",
+    "make_parallel_plan",
     "semantic_annotations",
 ]

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import  dataclass, field, fields, replace
-from typing import ClassVar, Self, Iterable
+from typing import ClassVar, Self
+from collections.abc import Callable, Iterable, Sequence
 from abc import ABC, abstractmethod
 
 from .types import TensorType
@@ -147,7 +148,11 @@ class Module:
                 raise ValueError(f"function @{func.name}: {e}") from e
 
 
-def rebuild_function(func: Function, new_arguments: Iterable[Value]) -> Function:
+def rebuild_function(
+    func: Function,
+    new_arguments: Iterable[Value],
+    rewrite: Callable[[Operation], Sequence[Operation]] | None = None,
+) -> Function:
     """Rebuild ``func`` on top of new argument values.
 
     Argument i of ``func`` is replaced by ``new_arguments[i]``. Every op is
@@ -155,16 +160,25 @@ def rebuild_function(func: Function, new_arguments: Iterable[Value]) -> Function
     again. A change to an argument's type (a TP shard's smaller shape, new
     role or axes annotations) therefore flows through the whole function.
 
+    ``rewrite`` lets a pass replace each rebuilt op by a sequence of ops, for
+    example ``(o_proj, all_reduce)``. The last op of the sequence stands for
+    the original op: later ops that read the original op's results read the
+    last op's results instead.
+
     Args:
         func: Function to rebuild; it is not modified.
         new_arguments: One replacement value per argument of ``func``.
+        rewrite: Called with each rebuilt op; returns the ops to emit in its
+            place. None emits every rebuilt op unchanged.
 
     Returns:
         The rebuilt function, sharing no op or result with ``func``.
 
     Raises:
         ValueError: If the number of new arguments differs from ``func``'s,
-            or an op rejects the new operand types.
+            an op rejects the new operand types, ``rewrite`` emits no op, or
+            the last emitted op has a different number of results than the
+            original op.
     """
 
     new_operands = tuple(new_arguments)
@@ -186,11 +200,17 @@ def rebuild_function(func: Function, new_arguments: Iterable[Value]) -> Function
                 in op.operands),
         )
 
-        new_ops.append(new_op)
+        emitted = (new_op,) if rewrite is None else tuple(rewrite(new_op))
+        if not emitted:
+            raise ValueError(f"rewrite emitted no op in place of {op.NAME}")
+        new_ops.extend(emitted)
 
+        # The last emitted op stands for the original op, so downstream ops
+        # read its results. strict=True turns a result-count mismatch into a
+        # ValueError instead of silently dropping a result.
         for old_result, new_result in zip(
             op.results,
-            new_op.results,
+            emitted[-1].results,
             strict=True,
         ):
             new_map[old_result] = new_result

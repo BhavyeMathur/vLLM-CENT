@@ -18,11 +18,13 @@ from examples.llama2_70b import (
     LLAMA2_70B,
     build_meta_block,
     example_inputs,
+    make_parallel_plan,
     semantic_annotations,
 )
 from vllm_cent.frontend import custom_ops, export_model, import_exported_program
 from vllm_cent.frontend import importer
 from vllm_cent.ir import AnnotateRolesAndAxes, ClonePass, PassManager, print_module
+from vllm_cent.parallel import ApplyTensorParallel
 
 
 # A test-only op whose fake kernel claims one more output feature than the
@@ -354,6 +356,49 @@ class SemanticIrTest(unittest.TestCase):
             "{eps = 1e-05} : tensor<1x1x8192xfp16, axes=[batch, seq_len, hidden]>\n"
             "  %q_proj = aloi.linear(%input_layernorm, %q_proj.weight) "
             ": tensor<1x1x8192xfp16, axes=[batch, seq_len, q_head*head_dim]>\n"
+            "  return %q_proj\n"
+            "}\n"
+        )
+        self.assertEqual(print_module(module), expected)
+
+
+class TensorParallelTest(unittest.TestCase):
+    """Semantic IR followed by ApplyTensorParallel gives the 02_sharded stage."""
+
+    def test_llama_block_sharded_golden(self) -> None:
+        """tp=8 splits q_proj's 64 heads into 8 per rank.
+
+        Wq's rows shrink from 8192 to 8 heads x 128 = 1024, and so does
+        q_proj's output; both keep global_shape. x, the norm weight and the
+        norm output stay whole on every rank. No op sums over a split axis
+        yet, so there is no all_reduce.
+        """
+
+        program = export_model(
+            build_meta_block(LLAMA2_70B), example_inputs(LLAMA2_70B)
+        )
+        module = PassManager(
+            (
+                AnnotateRolesAndAxes(semantic_annotations()),
+                ApplyTensorParallel(make_parallel_plan(LLAMA2_70B, tp=8)),
+            )
+        ).run(import_exported_program(program, "toy_llama2_70b"))
+        expected = (
+            "module @toy_llama2_70b\n"
+            "\n"
+            "func @forward("
+            "%input_layernorm.weight: tensor<8192xfp16, role=weight, axes=[hidden]>, "
+            "%q_proj.weight: tensor<1024x8192xfp16, role=weight, "
+            "axes=[q_head*head_dim, hidden], global_shape=8192x8192, "
+            "placement=shard(q_head)>, "
+            "%x: tensor<1x1x8192xfp16, axes=[batch, seq_len, hidden]>) "
+            "-> (tensor<1x1x1024xfp16, axes=[batch, seq_len, q_head*head_dim], "
+            "global_shape=1x1x8192, placement=shard(q_head)>) {\n"
+            "  %input_layernorm = aloi.rms_norm(%x, %input_layernorm.weight) "
+            "{eps = 1e-05} : tensor<1x1x8192xfp16, axes=[batch, seq_len, hidden]>\n"
+            "  %q_proj = aloi.linear(%input_layernorm, %q_proj.weight) "
+            ": tensor<1x1x1024xfp16, axes=[batch, seq_len, q_head*head_dim], "
+            "global_shape=1x1x8192, placement=shard(q_head)>\n"
             "  return %q_proj\n"
             "}\n"
         )

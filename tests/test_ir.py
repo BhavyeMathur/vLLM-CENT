@@ -13,7 +13,17 @@ from vllm_cent.ir.base import (
     clone_function,
     rebuild_function,
 )
-from vllm_cent.ir.types import DType, TensorRole, TensorType, packed_axis
+from vllm_cent.ir.types import (
+    DType,
+    Partial,
+    Placement,
+    Replicate,
+    Shard,
+    TensorRole,
+    TensorType,
+    outermost_axis,
+    packed_axis,
+)
 
 # A small rank-2 tensor type shared by most tests. The exact shape does not
 # matter; it only has to be the same everywhere so test operations can pass
@@ -253,6 +263,150 @@ class PackedAxisTest(unittest.TestCase):
         for axes in (("", "head_dim"), ("q_head*head_dim", "x")):
             with self.subTest(axes=axes), self.assertRaises(ValueError):
                 packed_axis(*axes)
+
+
+class OutermostAxisTest(unittest.TestCase):
+    """The outermost axis is the one tensor parallelism can split."""
+
+    def test_packed_and_plain_names(self) -> None:
+        """A packed name yields its first factor; a plain name itself."""
+
+        self.assertEqual(outermost_axis("q_head*head_dim"), "q_head")
+        self.assertEqual(outermost_axis("hidden"), "hidden")
+
+
+class PlacementTest(unittest.TestCase):
+    """Placements are small immutable values compared by content."""
+
+    def test_equality_and_hashing(self) -> None:
+        """Equal placements are interchangeable, including as set members."""
+
+        self.assertEqual(Replicate(), Replicate())
+        self.assertEqual(Shard("q_head"), Shard("q_head"))
+        self.assertNotEqual(Shard("q_head"), Shard("kv_head"))
+        self.assertNotEqual(Partial(), Replicate())
+        self.assertEqual(
+            len({Replicate(), Replicate(), Partial(), Shard("q_head")}), 3
+        )
+
+    def test_unannotated_type_is_replicated(self) -> None:
+        """Before tensor parallelism every tensor is whole on every rank."""
+
+        self.assertEqual(VECTOR.placement, Replicate())
+
+
+# Wq of Llama2-70B under 8-way tensor parallelism: the 8192 output features
+# are 64 heads x 128; each rank keeps 64 / 8 = 8 heads, i.e. 1024 rows.
+Q_PROJ_AXES = ("q_head*head_dim", "hidden")
+Q_HEAD_SHARD = Shard("q_head")
+
+
+def _wq_shard(
+    shape: tuple[int, ...] = (1024, 8192),
+    global_shape: tuple[int, ...] | None = (8192, 8192),
+    placement: Placement = Q_HEAD_SHARD,
+    axes: tuple[str, ...] = Q_PROJ_AXES,
+) -> TensorType:
+    """Build Wq's type on one rank, with any field overridable.
+
+    Args:
+        shape: Local shape.
+        global_shape: Whole-tensor shape.
+        placement: Placement.
+        axes: Axis names.
+
+    Returns:
+        The tensor type.
+    """
+
+    return TensorType(
+        shape=shape,
+        dtype=DType.FP16,
+        axes=axes,
+        global_shape=global_shape,
+        placement=placement,
+    )
+
+
+class ShardedTensorTypeTest(unittest.TestCase):
+    """A sharded type keeps its global shape; nothing else may have one."""
+
+    def test_valid_shard(self) -> None:
+        """Only the q_head dimension is smaller than the global shape."""
+
+        wq = _wq_shard()
+        self.assertEqual(wq.placement, Shard("q_head"))
+        self.assertEqual(wq.full_shape, (8192, 8192))
+
+    def test_global_shape_list_is_stored_as_tuple(self) -> None:
+        """Like shape, global_shape becomes hashable."""
+
+        wq = _wq_shard(global_shape=[8192, 8192])  # type: ignore[arg-type]
+        self.assertEqual(wq.global_shape, (8192, 8192))
+
+    def test_shard_requires_global_shape(self) -> None:
+        """Without it, the whole tensor's size would be lost."""
+
+        with self.assertRaises(ValueError):
+            _wq_shard(global_shape=None)
+
+    def test_only_shard_has_global_shape(self) -> None:
+        """A replicated or partial tensor already has its whole shape."""
+
+        for placement in (Replicate(), Partial()):
+            with self.subTest(placement=placement), self.assertRaises(ValueError):
+                _wq_shard(shape=(8192, 8192), placement=placement)
+
+    def test_only_sharded_dimension_may_shrink(self) -> None:
+        """Splitting q_head must leave the hidden dimension whole."""
+
+        with self.assertRaises(ValueError):
+            _wq_shard(shape=(1024, 4096))
+
+    def test_shard_axis_must_name_a_dimension(self) -> None:
+        """The sharded axis has to be one of the tensor's axes."""
+
+        cases = {
+            "unknown axis": ("kv_head*head_dim", "hidden"),
+            "no axes at all": (),
+        }
+        for name, axes in cases.items():
+            with self.subTest(case=name), self.assertRaises(ValueError):
+                _wq_shard(axes=axes)
+
+    def test_full_shape_of_unsharded_type_is_its_shape(self) -> None:
+        """Replicated and partial tensors are whole on every rank."""
+
+        self.assertEqual(VECTOR.full_shape, VECTOR.shape)
+        partial = TensorType(shape=(1, 4), dtype=DType.FP16, placement=Partial())
+        self.assertEqual(partial.full_shape, (1, 4))
+
+
+class DimOfTest(unittest.TestCase):
+    """dim_of finds the dimension an axis can split."""
+
+    def test_plain_and_packed_axes(self) -> None:
+        """A plain name matches itself; a packed one its outermost factor."""
+
+        wq = TensorType(shape=(8192, 8192), dtype=DType.FP16, axes=Q_PROJ_AXES)
+        self.assertEqual(wq.dim_of("q_head"), 0)
+        self.assertEqual(wq.dim_of("hidden"), 1)
+
+    def test_inner_factor_is_not_splittable(self) -> None:
+        """head_dim is interleaved inside every head, so it is not found."""
+
+        wq = TensorType(shape=(8192, 8192), dtype=DType.FP16, axes=Q_PROJ_AXES)
+        with self.assertRaisesRegex(ValueError, "not the outermost axis"):
+            wq.dim_of("head_dim")
+
+    def test_axis_on_two_dimensions_is_ambiguous(self) -> None:
+        """One axis must identify exactly one dimension."""
+
+        scores = TensorType(
+            shape=(64, 64), dtype=DType.FP16, axes=("q_head", "q_head*head_dim")
+        )
+        with self.assertRaisesRegex(ValueError, "must name exactly one"):
+            scores.dim_of("q_head")
 
 
 # ---------------------------------------------------------------------------
@@ -737,6 +891,113 @@ class RebuildFunctionTest(unittest.TestCase):
         wider = Value(type=TensorType(shape=(1, 8), dtype=DType.FP16), name="rhs")
         with self.assertRaises(ValueError):
             rebuild_function(original, (Value(type=VECTOR, name="lhs"), wider))
+
+
+@dataclass(frozen=True, eq=False)
+class _Sink(Operation):
+    """One operand and no result."""
+
+    NAME = "test.sink"
+    NUM_OPERANDS = 1
+
+    def infer_result_types(self) -> tuple[TensorType, ...]:
+        """Produce nothing."""
+
+        return ()
+
+
+def _scale_then_identity() -> Function:
+    """Build ``x -> scale -> identity``.
+
+    Returns:
+        A function returning the identity's result.
+    """
+
+    x = Value(type=VECTOR, name="x")
+    scale = _Scale(operands=(x,), factor=3.0)
+    identity = _Identity(operands=(scale.results[0],))
+    return Function(
+        name="main",
+        operands=(x,),
+        operations=(scale, identity),
+        results=(identity.results[0],),
+    )
+
+
+def _fresh_arguments(function: Function) -> list[Value]:
+    """Copy every argument of ``function``.
+
+    Args:
+        function: Function whose arguments are copied.
+
+    Returns:
+        New values with the same types and names.
+    """
+
+    return [Value(type=arg.type, name=arg.name) for arg in function.operands]
+
+
+class RebuildFunctionRewriteTest(unittest.TestCase):
+    """The rewrite hook replaces each op by a sequence of ops."""
+
+    def test_inserted_op_is_read_by_downstream_ops(self) -> None:
+        """Emitting (scale, extra) makes identity read extra's result."""
+
+        def follow_scale(op: Operation) -> tuple[Operation, ...]:
+            """Insert one identity op after every scale op."""
+
+            if isinstance(op, _Scale):
+                return (op, _Identity(operands=(op.results[0],), name_hint="extra"))
+            return (op,)
+
+        original = _scale_then_identity()
+        rebuilt = rebuild_function(
+            original, _fresh_arguments(original), rewrite=follow_scale
+        )
+
+        rebuilt.verify()
+        scale, extra, identity = rebuilt.operations
+        self.assertIsInstance(scale, _Scale)
+        self.assertEqual(extra.name_hint, "extra")
+        self.assertIs(extra.operands[0], scale.results[0])
+        self.assertIs(identity.operands[0], extra.results[0])
+        self.assertIs(rebuilt.results[0], identity.results[0])
+
+    def test_last_emitted_op_replaces_a_returned_value(self) -> None:
+        """A rewrite of the last op also redirects the function's return."""
+
+        def follow_identity(op: Operation) -> tuple[Operation, ...]:
+            """Insert a scale op after every identity op."""
+
+            if isinstance(op, _Identity):
+                return (op, _Scale(operands=(op.results[0],)))
+            return (op,)
+
+        original = _scale_then_identity()
+        rebuilt = rebuild_function(
+            original, _fresh_arguments(original), rewrite=follow_identity
+        )
+        self.assertEqual(len(rebuilt.operations), 3)
+        self.assertIs(rebuilt.results[0], rebuilt.operations[-1].results[0])
+
+    def test_rejects_empty_rewrite(self) -> None:
+        """Dropping an op would leave its users without an operand."""
+
+        original = _scale_then_identity()
+        with self.assertRaises(ValueError):
+            rebuild_function(original, _fresh_arguments(original), rewrite=lambda op: ())
+
+    def test_rejects_result_count_mismatch(self) -> None:
+        """The last op must have as many results as the op it replaces."""
+
+        def end_with_sink(op: Operation) -> tuple[Operation, ...]:
+            """Follow every op with an op that has no result."""
+
+            return (op, _Sink(operands=(op.results[0],)))
+
+        original = _scale_then_identity()
+        with self.assertRaises(ValueError):
+            rebuild_function(original, _fresh_arguments(original), rewrite=end_with_sink)
 
 
 if __name__ == "__main__":

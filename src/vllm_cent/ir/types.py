@@ -119,6 +119,27 @@ def packed_axis(*axes: str) -> str:
             raise ValueError(f"cannot pack axis {axis!r}")
     return _PACKED_AXIS_SEPARATOR.join(axes)
 
+def outermost_axis(axis_name: str) -> str:
+    """Extract the outermost dimension for sharding
+    
+    If the outermost axis is a packed axis, e.g. "q_head*head_dim", get only the first dimension.
+    """
+    return axis_name.split(_PACKED_AXIS_SEPARATOR)[0]
+
+@dataclass(frozen=True, slots=True)
+class Replicate:
+    """Every rank holds the whole tensor."""
+
+@dataclass(frozen=True, slots=True)
+class Shard:
+    """Every rank holds 1/tp of the tensor along one semantic axis."""
+    axis: str
+
+@dataclass(frozen=True, slots=True)
+class Partial:
+    """Every rank holds a full-shape partial sum; the value is the sum over ranks."""
+
+Placement = Replicate | Shard | Partial
 
 @dataclass(frozen = True)
 class TensorType:
@@ -138,11 +159,14 @@ class TensorType:
     role: TensorRole = TensorRole.ACTIVATION
     axes: tuple[str, ...] = ()
     global_shape: tuple[int, ...] | None = None
+    placement: Placement = Replicate()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "shape", tuple(int(dim) for dim in self.shape))
         object.__setattr__(self, "dtype", DType.normalize(self.dtype))
         object.__setattr__(self, "axes", tuple(self.axes))
+        if self.global_shape is not None:
+            object.__setattr__(self, "global_shape", tuple(self.global_shape))
 
         if any(dim < 0 for dim in self.shape):
             raise ValueError(f"tensor dimensions must be non-negative: {self.shape}")
@@ -151,6 +175,53 @@ class TensorType:
         if self.global_shape is not None and len(self.global_shape) != len(self.shape):
             raise ValueError("global and local tensor ranks differ")
 
+        if isinstance(self.placement, Shard):
+            if self.global_shape is None:
+                raise ValueError(
+                    f"{self.placement} needs a global_shape to remember the "
+                    f"whole tensor's size; local shape is {self.shape}"
+                )
+            sharded_dim = self.dim_of(self.placement.axis)
+            # strict=True: the rank check above already made both lengths
+            # equal; strict states that assumption in the code.
+            for dim, (local, whole) in enumerate(
+                zip(self.shape, self.global_shape, strict=True)
+            ):
+                if dim != sharded_dim and local != whole:
+                    raise ValueError(
+                        f"{self.placement} splits only dimension {sharded_dim} "
+                        f"({self.axes[sharded_dim]!r}), but dimension {dim} "
+                        f"({self.axes[dim]!r}) is {local} locally and {whole} "
+                        "globally"
+                    )
+        elif self.global_shape is not None:
+            raise ValueError(
+                f"only a sharded tensor has a global_shape; placement is "
+                f"{self.placement}, global_shape is {self.global_shape}"
+            )
+
     @property
     def rank(self) -> int:
         return len(self.shape)
+
+    def dim_of(self, axis: str) -> int:
+        """Return the dimension that `axis` splits: named `axis`, or packed with `axis` outermost."""
+        matches = [d for d, name in enumerate(self.axes) if outermost_axis(name) == axis]
+        if not matches:
+            # Inner factors of a packed name do not count: head_dim inside
+            # q_head*head_dim is interleaved and cannot be split contiguously.
+            raise ValueError(
+                f"axis {axis!r} is not the outermost axis of any dimension "
+                f"of axes {self.axes}"
+            )
+        if len(matches) > 1:
+            raise ValueError(
+                f"axis {axis!r} names dimensions {matches} of axes "
+                f"{self.axes}; it must name exactly one"
+            )
+        return matches[0]
+
+    @property
+    def full_shape(self) -> tuple[int, ...]:
+        """The whole tensor's shape: global_shape when sharded, otherwise shape."""
+        return self.shape if self.global_shape is None else self.global_shape

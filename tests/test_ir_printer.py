@@ -9,7 +9,7 @@ from enum import IntEnum
 from vllm_cent.ir.base import Function, Module, Operation, Value, clone_function
 from vllm_cent.ir.printer import format_type, print_function, print_module
 from vllm_cent.ir.semantic import LinearOp, RMSNormOp
-from vllm_cent.ir.types import DType, TensorRole, TensorType
+from vllm_cent.ir.types import DType, Partial, Replicate, Shard, TensorRole, TensorType
 
 
 def _type(*shape: int, **annotations: object) -> TensorType:
@@ -174,17 +174,38 @@ class FormatTypeTest(unittest.TestCase):
             "tensor<1024x8192xfp16, role=weight, axes=[kv_head*head_dim, hidden]>",
         )
 
-    def test_axes_and_global_shape(self) -> None:
-        """A TP shard shows its global shape after the axes.
+    def test_axes_global_shape_and_placement(self) -> None:
+        """A TP shard shows its global shape and placement after the axes.
 
         With 8-way TP, each rank holds 8192 / 8 = 1024 of the hidden values.
         """
 
-        shard = _type(1, 1024, axes=("batch", "hidden_size"), global_shape=(1, 8192))
+        shard = _type(
+            1,
+            1024,
+            axes=("batch", "hidden_size"),
+            global_shape=(1, 8192),
+            placement=Shard("hidden_size"),
+        )
         self.assertEqual(
             format_type(shard),
-            "tensor<1x1024xfp16, axes=[batch, hidden_size], global_shape=1x8192>",
+            "tensor<1x1024xfp16, axes=[batch, hidden_size], global_shape=1x8192, "
+            "placement=shard(hidden_size)>",
         )
+
+    def test_partial_placement(self) -> None:
+        """A partial sum has its whole shape, so it prints no global shape."""
+
+        partial = _type(1, 8192, axes=("batch", "hidden"), placement=Partial())
+        self.assertEqual(
+            format_type(partial),
+            "tensor<1x8192xfp16, axes=[batch, hidden], placement=partial>",
+        )
+
+    def test_replicated_placement_is_omitted(self) -> None:
+        """Replicate is the default placement and is not printed."""
+
+        self.assertEqual(format_type(_type(4, placement=Replicate())), VECTOR_TEXT)
 
 
 class PrintFunctionTest(unittest.TestCase):

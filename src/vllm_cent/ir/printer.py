@@ -22,7 +22,7 @@ import json
 from enum import Enum
 
 from .base import Function, Module, Operation, Value
-from .types import TensorRole, TensorType
+from .types import Partial, Shard, TensorRole, TensorType
 
 __all__ = ["format_type", "print_function", "print_module"]
 
@@ -58,6 +58,10 @@ def format_type(tensor_type: TensorType) -> str:
     if tensor_type.global_shape is not None:
         global_shape = "x".join(str(dim) for dim in tensor_type.global_shape)
         annotations.append(f"global_shape={global_shape}")
+    if isinstance(tensor_type.placement, Shard):
+        annotations.append(f"placement=shard({tensor_type.placement.axis})")
+    elif isinstance(tensor_type.placement, Partial):
+        annotations.append("placement=partial")
 
     return f"tensor<{', '.join([shape_and_dtype, *annotations])}>"
 
