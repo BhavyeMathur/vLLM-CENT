@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import StrEnum, IntEnum, auto
+from enum import StrEnum, auto
 from typing import assert_never
 
 class DType(StrEnum):
@@ -73,16 +73,52 @@ class DType(StrEnum):
             raise ValueError(f"Unsupported dtype: {dtype!r}") from e
 
 class TensorRole(StrEnum):
+    """What kind of tensor a value is, independent of the model.
+
+    The role says how a tensor lives on the device, not which tensor it is.
+    Which tensor it is (query vs. key, q_proj vs. o_proj) is told by its axes:
+    tensor parallelism shards along a named axis, wherever that axis sits.
+
+    Members:
+        ACTIVATION: Computed during the forward pass and consumed by later
+            ops. Every op result is an activation; so is the model input.
+        WEIGHT: A parameter loaded once and kept resident on the device.
+    """
+
     ACTIVATION = auto()
-    Q_WEIGHT = auto()
-    K_WEIGHT = auto()
-    V_WEIGHT = auto()
-    QUERY = auto()
-    KEY = auto()
-    VALUE = auto()
-    K_CACHE = auto()
-    V_CACHE = auto()
-    O_WEIGHT = auto()
+    WEIGHT = auto()
+
+
+# Joins the names of semantic axes that share one flat dimension.
+_PACKED_AXIS_SEPARATOR = "*"
+
+
+def packed_axis(*axes: str) -> str:
+    """Name one flat dimension that packs several semantic axes.
+
+    The first axis is the outermost. For example, q_proj's output dimension
+    holds 64 heads of 128 elements, head after head, so its axis is
+    ``packed_axis("q_head", "head_dim") == "q_head*head_dim"``. Sharding along
+    ``q_head`` then splits that dimension into whole heads.
+
+    Args:
+        *axes: Axis names, outermost first.
+
+    Returns:
+        The packed axis name.
+
+    Raises:
+        ValueError: If fewer than two axes are given, or an axis is empty or
+            already packed.
+    """
+
+    if len(axes) < 2:
+        raise ValueError(f"a packed axis combines at least two axes, got {axes}")
+    for axis in axes:
+        if not axis or _PACKED_AXIS_SEPARATOR in axis:
+            raise ValueError(f"cannot pack axis {axis!r}")
+    return _PACKED_AXIS_SEPARATOR.join(axes)
+
 
 @dataclass(frozen = True)
 class TensorType:
@@ -90,6 +126,11 @@ class TensorType:
 
     ''shape'' is the current tensor shape after sharding
     ''global shape'' is the shape of the whole tensor before sharding, set only after parallel plan is applied
+
+    ''axes'' names the meaning of each dimension, e.g. ("batch", "seq_len",
+    "hidden"). It is empty until AnnotateRolesAndAxes runs; after that every
+    dimension has a name. A dimension that packs several axes uses a name
+    made by packed_axis(), e.g. "q_head*head_dim".
     """
 
     shape: tuple[int, ...]

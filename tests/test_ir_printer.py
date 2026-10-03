@@ -166,12 +166,12 @@ class FormatTypeTest(unittest.TestCase):
         weight = _type(
             1024,
             8192,
-            role=TensorRole.K_WEIGHT,
-            axes=("out_features", "in_features"),
+            role=TensorRole.WEIGHT,
+            axes=("kv_head*head_dim", "hidden"),
         )
         self.assertEqual(
             format_type(weight),
-            "tensor<1024x8192xfp16, role=k_weight, axes=[out_features, in_features]>",
+            "tensor<1024x8192xfp16, role=weight, axes=[kv_head*head_dim, hidden]>",
         )
 
     def test_axes_and_global_shape(self) -> None:

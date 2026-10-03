@@ -5,8 +5,15 @@ from __future__ import annotations
 import unittest
 from dataclasses import dataclass
 
-from vllm_cent.ir.base import Function, Module, Operation, Value, clone_function
-from vllm_cent.ir.types import DType, TensorRole, TensorType
+from vllm_cent.ir.base import (
+    Function,
+    Module,
+    Operation,
+    Value,
+    clone_function,
+    rebuild_function,
+)
+from vllm_cent.ir.types import DType, TensorRole, TensorType, packed_axis
 
 # A small rank-2 tensor type shared by most tests. The exact shape does not
 # matter; it only has to be the same everywhere so test operations can pass
@@ -222,6 +229,30 @@ class TensorTypeTest(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             TensorType(shape=(1, 4), dtype=DType.FP16, global_shape=(32,))
+
+
+class PackedAxisTest(unittest.TestCase):
+    """Names for one flat dimension that holds several semantic axes."""
+
+    def test_joins_axes_outermost_first(self) -> None:
+        """q_proj's output is 64 heads of 128 elements, head after head."""
+
+        self.assertEqual(packed_axis("q_head", "head_dim"), "q_head*head_dim")
+        self.assertEqual(packed_axis("a", "b", "c"), "a*b*c")
+
+    def test_rejects_fewer_than_two_axes(self) -> None:
+        """A single axis is not packed; use its plain name."""
+
+        for axes in ((), ("hidden",)):
+            with self.subTest(axes=axes), self.assertRaises(ValueError):
+                packed_axis(*axes)
+
+    def test_rejects_empty_or_already_packed_axis(self) -> None:
+        """Nesting would make the outermost factor ambiguous."""
+
+        for axes in (("", "head_dim"), ("q_head*head_dim", "x")):
+            with self.subTest(axes=axes), self.assertRaises(ValueError):
+                packed_axis(*axes)
 
 
 # ---------------------------------------------------------------------------
@@ -645,7 +676,67 @@ class CloneFunctionTest(unittest.TestCase):
         )
         (cloned_scale,) = clone_function(original).operations
         self.assertIsInstance(cloned_scale, _Scale)
-        self.assertEqual(cloned_scale.factor, 3.0)
+        self.assertEqual(cloned_scale.attributes(), {"factor": 3.0})
+
+
+class RebuildFunctionTest(unittest.TestCase):
+    """Rebuilding on new arguments re-runs every op's type inference."""
+
+    def test_new_argument_type_flows_to_every_result(self) -> None:
+        """Annotating the argument changes every downstream result type."""
+
+        original, *_ = _chain()
+        annotated_type = TensorType(
+            shape=(1, 4), dtype=DType.FP16, axes=("batch", "hidden")
+        )
+        new_x = Value(type=annotated_type, name="x")
+        rebuilt = rebuild_function(original, (new_x,))
+
+        rebuilt.verify()
+        self.assertIs(rebuilt.operands[0], new_x)
+        first, second = rebuilt.operations
+        self.assertIs(first.operands[0], new_x)
+        # _Identity passes its operand type through, so both results and the
+        # return carry the new axes.
+        self.assertEqual(first.results[0].type, annotated_type)
+        self.assertEqual(second.results[0].type, annotated_type)
+        self.assertIs(rebuilt.results[0], second.results[0])
+
+    def test_original_is_unchanged(self) -> None:
+        """The input function keeps its own values and types."""
+
+        original, x, first, second = _chain()
+        rebuild_function(
+            original, (Value(type=TensorType(shape=(1, 8), dtype=DType.FP16)),)
+        )
+        self.assertEqual(original.operands, (x,))
+        self.assertEqual(original.operations, (first, second))
+        self.assertEqual(second.results[0].type, VECTOR)
+
+    def test_rejects_wrong_number_of_arguments(self) -> None:
+        """Arguments are replaced by position, so the counts must agree."""
+
+        original, *_ = _chain()
+        for replacements in ((), (Value(type=VECTOR), Value(type=VECTOR))):
+            with self.subTest(count=len(replacements)):
+                with self.assertRaises(ValueError):
+                    rebuild_function(original, replacements)
+
+    def test_op_can_reject_new_operand_types(self) -> None:
+        """test.add requires equal operand types, so a mismatched pair fails."""
+
+        lhs = Value(type=VECTOR, name="lhs")
+        rhs = Value(type=VECTOR, name="rhs")
+        add = _Add(operands=(lhs, rhs))
+        original = Function(
+            name="main",
+            operands=(lhs, rhs),
+            operations=(add,),
+            results=(add.results[0],),
+        )
+        wider = Value(type=TensorType(shape=(1, 8), dtype=DType.FP16), name="rhs")
+        with self.assertRaises(ValueError):
+            rebuild_function(original, (Value(type=VECTOR, name="lhs"), wider))
 
 
 if __name__ == "__main__":

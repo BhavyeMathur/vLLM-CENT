@@ -35,7 +35,7 @@ def format_type(tensor_type: TensorType) -> str:
     Annotations are appended only when they differ from their defaults, in a
     fixed order: role, axes, global shape. An unannotated M0 dump therefore
     stays short, while later stages show the full semantic information, e.g.
-    ``tensor<1024x8192xfp16, role=k_weight, axes=[out_features, in_features]>``.
+    ``tensor<1024x8192xfp16, role=weight, axes=[kv_head*head_dim, hidden]>``.
 
     Args:
         tensor_type: Type to format.

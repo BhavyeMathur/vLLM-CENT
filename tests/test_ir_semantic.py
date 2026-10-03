@@ -6,7 +6,7 @@ import unittest
 
 from vllm_cent.ir.base import Value
 from vllm_cent.ir.semantic import LinearOp, RMSNormOp
-from vllm_cent.ir.types import DType, TensorType
+from vllm_cent.ir.types import DType, TensorRole, TensorType, packed_axis
 
 # Llama2-70B decode dimensions. One decode step processes one token of one
 # request, so activations are [batch=1, seq_len=1, features].
@@ -28,6 +28,34 @@ def _value(*shape: int, dtype: DType = DType.FP16, name: str | None = None) -> V
     """
 
     return Value(type=TensorType(shape=shape, dtype=dtype), name=name)
+
+
+def _annotated(
+    shape: tuple[int, ...],
+    axes: tuple[str, ...],
+    role: TensorRole = TensorRole.ACTIVATION,
+) -> Value:
+    """Create an fp16 value with semantic annotations.
+
+    Args:
+        shape: Tensor dimensions.
+        axes: One axis name per dimension.
+        role: Tensor role.
+
+    Returns:
+        A new value.
+    """
+
+    return Value(
+        type=TensorType(shape=shape, dtype=DType.FP16, role=role, axes=axes)
+    )
+
+
+# Axis names as AnnotateRolesAndAxes would attach them for Llama2-70B. The
+# query projection's output packs 64 heads x 128 elements into one 8192 dim.
+TOKEN_AXES = ("batch", "seq_len")
+HIDDEN = "hidden"
+Q_PROJ_OUT = packed_axis("q_head", "head_dim")
 
 
 class LinearOpTest(unittest.TestCase):
@@ -136,6 +164,86 @@ class LinearOpTest(unittest.TestCase):
         self.assertEqual(shard.results[0].type.shape, (1, 1, HIDDEN_SIZE // 8))
 
 
+class LinearOpAxesTest(unittest.TestCase):
+    """The result keeps x's leading axes and takes the weight's output axis."""
+
+    def test_q_proj_produces_packed_head_axis(self) -> None:
+        """hidden -> q_head*head_dim, contracting over hidden."""
+
+        op = LinearOp(
+            operands=(
+                _annotated((1, 1, HIDDEN_SIZE), (*TOKEN_AXES, HIDDEN)),
+                _annotated(
+                    (HIDDEN_SIZE, HIDDEN_SIZE), (Q_PROJ_OUT, HIDDEN), TensorRole.WEIGHT
+                ),
+            )
+        )
+        self.assertEqual(
+            op.results[0].type,
+            TensorType(
+                shape=(1, 1, HIDDEN_SIZE),
+                dtype=DType.FP16,
+                axes=(*TOKEN_AXES, Q_PROJ_OUT),
+            ),
+        )
+
+    def test_o_proj_contracts_over_packed_head_axis(self) -> None:
+        """o_proj's weight has the head axis second: it sums over the heads.
+
+        This is why TP sharding q_head splits o_proj's contraction and needs
+        an all-reduce, while it splits q_proj's output and needs none.
+        """
+
+        op = LinearOp(
+            operands=(
+                _annotated((1, 1, HIDDEN_SIZE), (*TOKEN_AXES, Q_PROJ_OUT)),
+                _annotated(
+                    (HIDDEN_SIZE, HIDDEN_SIZE), (HIDDEN, Q_PROJ_OUT), TensorRole.WEIGHT
+                ),
+            )
+        )
+        self.assertEqual(op.results[0].type.axes, (*TOKEN_AXES, HIDDEN))
+
+    def test_rejects_contraction_axis_mismatch(self) -> None:
+        """Feeding the hidden vector to o_proj: sizes match, meanings do not.
+
+        Both hidden and q_head*head_dim are 8192 wide, so only the axis names
+        can catch this.
+        """
+
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            LinearOp(
+                operands=(
+                    _annotated((1, 1, HIDDEN_SIZE), (*TOKEN_AXES, HIDDEN)),
+                    _annotated(
+                        (HIDDEN_SIZE, HIDDEN_SIZE),
+                        (HIDDEN, Q_PROJ_OUT),
+                        TensorRole.WEIGHT,
+                    ),
+                )
+            )
+
+    def test_unannotated_operand_gives_unannotated_result(self) -> None:
+        """Without both operands' axes the output axis is unknown."""
+
+        annotated_x = _annotated((1, 1, HIDDEN_SIZE), (*TOKEN_AXES, HIDDEN))
+        op = LinearOp(operands=(annotated_x, _value(KV_WIDTH, HIDDEN_SIZE)))
+        self.assertEqual(op.results[0].type.axes, ())
+
+    def test_result_is_activation(self) -> None:
+        """A linear output is computed, never a resident weight."""
+
+        op = LinearOp(
+            operands=(
+                _annotated((1, HIDDEN_SIZE), ("batch", HIDDEN)),
+                _annotated(
+                    (KV_WIDTH, HIDDEN_SIZE), ("kv_out", HIDDEN), TensorRole.WEIGHT
+                ),
+            )
+        )
+        self.assertIs(op.results[0].type.role, TensorRole.ACTIVATION)
+
+
 class RMSNormOpTest(unittest.TestCase):
     """Normalization over the last dimension, scaled by a learned weight."""
 
@@ -201,6 +309,44 @@ class RMSNormOpTest(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             RMSNormOp(operands=(_value(), _value(HIDDEN_SIZE)), eps=1e-5)
+
+
+class RMSNormOpAxesTest(unittest.TestCase):
+    """The result has x's axes; the weight is indexed by x's last axis."""
+
+    def test_result_keeps_x_axes(self) -> None:
+        """Normalizing does not change what any dimension means."""
+
+        x = _annotated((1, 1, HIDDEN_SIZE), (*TOKEN_AXES, HIDDEN))
+        weight = _annotated((HIDDEN_SIZE,), (HIDDEN,), TensorRole.WEIGHT)
+        op = RMSNormOp(operands=(x, weight), eps=1e-5)
+        self.assertEqual(op.results[0].type, x.type)
+
+    def test_unannotated_weight_still_propagates_x_axes(self) -> None:
+        """The result's axes come from x alone."""
+
+        x = _annotated((1, 1, HIDDEN_SIZE), (*TOKEN_AXES, HIDDEN))
+        op = RMSNormOp(operands=(x, _value(HIDDEN_SIZE)), eps=1e-5)
+        self.assertEqual(op.results[0].type.axes, (*TOKEN_AXES, HIDDEN))
+
+    def test_rejects_weight_axis_mismatch(self) -> None:
+        """A weight over a different axis cannot scale x's last dimension."""
+
+        x = _annotated((1, 1, HIDDEN_SIZE), (*TOKEN_AXES, HIDDEN))
+        weight = _annotated((HIDDEN_SIZE,), (Q_PROJ_OUT,), TensorRole.WEIGHT)
+        with self.assertRaisesRegex(ValueError, "do not match"):
+            RMSNormOp(operands=(x, weight), eps=1e-5)
+
+    def test_result_is_activation_even_for_weight_input(self) -> None:
+        """Copying x's type must not copy a WEIGHT role into the result."""
+
+        x = _annotated((HIDDEN_SIZE,), (HIDDEN,), TensorRole.WEIGHT)
+        weight = _annotated((HIDDEN_SIZE,), (HIDDEN,), TensorRole.WEIGHT)
+        op = RMSNormOp(operands=(x, weight), eps=1e-5)
+        self.assertEqual(
+            op.results[0].type,
+            TensorType(shape=(HIDDEN_SIZE,), dtype=DType.FP16, axes=(HIDDEN,)),
+        )
 
 
 if __name__ == "__main__":

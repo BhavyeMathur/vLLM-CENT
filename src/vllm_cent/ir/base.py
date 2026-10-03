@@ -147,18 +147,35 @@ class Module:
                 raise ValueError(f"function @{func.name}: {e}") from e
 
 
-def clone_function(func: Function) -> Function:
-    # Maps every old value (argument or op result) to its copy.
-    new_map: dict[Value, Value] = {}
-    new_operands: list[Value] = []
-    for operand in func.operands:
-        new_operand = Value(
-            type = operand.type,
-            name = operand.name,
+def rebuild_function(func: Function, new_arguments: Iterable[Value]) -> Function:
+    """Rebuild ``func`` on top of new argument values.
+
+    Argument i of ``func`` is replaced by ``new_arguments[i]``. Every op is
+    then reconstructed with ``with_operands``, which runs type inference
+    again. A change to an argument's type (a TP shard's smaller shape, new
+    role or axes annotations) therefore flows through the whole function.
+
+    Args:
+        func: Function to rebuild; it is not modified.
+        new_arguments: One replacement value per argument of ``func``.
+
+    Returns:
+        The rebuilt function, sharing no op or result with ``func``.
+
+    Raises:
+        ValueError: If the number of new arguments differs from ``func``'s,
+            or an op rejects the new operand types.
+    """
+
+    new_operands = tuple(new_arguments)
+    if len(new_operands) != len(func.operands):
+        raise ValueError(
+            f"function {func.name} has {len(func.operands)} arguments, "
+            f"got {len(new_operands)} replacements"
         )
 
-        new_map[operand] = new_operand
-        new_operands.append(new_operand)
+    # Maps every old value (argument or op result) to its replacement.
+    new_map: dict[Value, Value] = dict(zip(func.operands, new_operands, strict=True))
 
     new_ops: list[Operation] = []
     for op in func.operations:
@@ -180,10 +197,26 @@ def clone_function(func: Function) -> Function:
 
     return Function(
         name = func.name,
-        operands = tuple(new_operands),
+        operands = new_operands,
         operations = tuple(new_ops),
         # The returns are chosen by the original function, not by the ops:
         # look up the copy of each returned value instead of returning every
         # op result.
         results = tuple(new_map[value] for value in func.results),
+    )
+
+
+def clone_function(func: Function) -> Function:
+    """Copy ``func`` with fresh values; types and names stay the same.
+
+    Args:
+        func: Function to copy; it is not modified.
+
+    Returns:
+        A structurally identical function sharing no value with ``func``.
+    """
+
+    return rebuild_function(
+        func,
+        (Value(type = operand.type, name = operand.name) for operand in func.operands),
     )

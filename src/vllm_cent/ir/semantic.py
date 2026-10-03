@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
-from .types import TensorType
+from .types import TensorRole, TensorType
 from .base import Value, Operation
 
 @dataclass(frozen = True, eq = False, slots=True)
@@ -39,8 +39,34 @@ class LinearOp(Operation):
             TensorType(
                 shape = self.x.type.shape[:-1] + (self.out_features,),
                 dtype = self.operands[0].type.dtype,
+                axes = self._result_axes(),
             ),
         )
+
+    def _result_axes(self) -> tuple[str, ...]:
+        """Propagate axis names: x's leading axes, then weight's output axis.
+
+        The last axis of x is summed over against the weight's in_features
+        axis, so the two must name the same thing. Equal sizes are not enough:
+        hidden and q_head*head_dim are both 8192 in Llama2-70B, but
+        multiplying one by the other is a model bug.
+
+        Returns:
+            The result's axes, or () while either operand is unannotated.
+        """
+
+        x_axes = self.x.type.axes
+        weight_axes = self.weight.type.axes
+        if not x_axes or not weight_axes:
+            return ()
+
+        out_axis, in_axis = weight_axes
+        if in_axis != x_axes[-1]:
+            raise ValueError(
+                f"{self.NAME}: x's last axis {x_axes[-1]!r} does not match "
+                f"weight's in_features axis {in_axis!r}"
+            )
+        return (*x_axes[:-1], out_axis)
 
     @property
     def x(self) -> Value:
@@ -74,7 +100,7 @@ class RMSNormOp(Operation):
         return self.operands[1]
 
     def infer_result_types(self) -> tuple[TensorType, ...]:
-        """RMSNorm does not alter the operand type."""
+        """RMSNorm keeps x's shape, dtype and axes; the result is an activation."""
 
         if (self.eps is not None) and self.eps <= 0:
             raise ValueError(
@@ -109,6 +135,18 @@ class RMSNormOp(Operation):
                 f"and {self.x.type.shape[-1]}"
             )
 
-        return (self.x.type,)
+        # The weight scales each element of x's last dimension, so once both
+        # are annotated it must be indexed by that same axis.
+        x_axes = self.x.type.axes
+        weight_axes = self.weight.type.axes
+        if x_axes and weight_axes and weight_axes != (x_axes[-1],):
+            raise ValueError(
+                f"{self.NAME}: weight axes {weight_axes} do not match "
+                f"x's last axis {x_axes[-1]!r}"
+            )
+
+        # Copy x's type but reset the role: whatever x is, the normalized
+        # tensor is computed during the forward pass, i.e. an activation.
+        return (replace(self.x.type, role = TensorRole.ACTIVATION),)
 
     

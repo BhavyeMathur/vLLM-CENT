@@ -14,10 +14,15 @@ import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
 from torch.export import Dim
 
-from examples.llama2_70b import LLAMA2_70B, build_meta_block, example_inputs
+from examples.llama2_70b import (
+    LLAMA2_70B,
+    build_meta_block,
+    example_inputs,
+    semantic_annotations,
+)
 from vllm_cent.frontend import custom_ops, export_model, import_exported_program
 from vllm_cent.frontend import importer
-from vllm_cent.ir import ClonePass, PassManager, print_module
+from vllm_cent.ir import AnnotateRolesAndAxes, ClonePass, PassManager, print_module
 
 
 # A test-only op whose fake kernel claims one more output feature than the
@@ -317,6 +322,42 @@ class ImporterTest(unittest.TestCase):
                 ValueError, r"infers tensor<1x4xfp32>, but PyTorch says tensor<1x5xfp32>"
             ):
                 _import(model, _meta_input(1, 16))
+
+
+class SemanticIrTest(unittest.TestCase):
+    """Import followed by AnnotateRolesAndAxes gives the 01_semantic stage."""
+
+    def test_llama_block_semantic_golden(self) -> None:
+        """Every tensor carries axes; weights also carry role=weight.
+
+        The model annotates only the three arguments. rms_norm keeps x's
+        [batch, seq_len, hidden]; q_proj contracts over hidden and produces
+        the packed head axis q_head*head_dim (64 heads x 128 = 8192).
+        """
+
+        program = export_model(
+            build_meta_block(LLAMA2_70B), example_inputs(LLAMA2_70B)
+        )
+        module = PassManager(
+            (AnnotateRolesAndAxes(semantic_annotations()),)
+        ).run(import_exported_program(program, "toy_llama2_70b"))
+        expected = (
+            "module @toy_llama2_70b\n"
+            "\n"
+            "func @forward("
+            "%input_layernorm.weight: tensor<8192xfp16, role=weight, axes=[hidden]>, "
+            "%q_proj.weight: tensor<8192x8192xfp16, role=weight, "
+            "axes=[q_head*head_dim, hidden]>, "
+            "%x: tensor<1x1x8192xfp16, axes=[batch, seq_len, hidden]>) "
+            "-> (tensor<1x1x8192xfp16, axes=[batch, seq_len, q_head*head_dim]>) {\n"
+            "  %input_layernorm = aloi.rms_norm(%x, %input_layernorm.weight) "
+            "{eps = 1e-05} : tensor<1x1x8192xfp16, axes=[batch, seq_len, hidden]>\n"
+            "  %q_proj = aloi.linear(%input_layernorm, %q_proj.weight) "
+            ": tensor<1x1x8192xfp16, axes=[batch, seq_len, q_head*head_dim]>\n"
+            "  return %q_proj\n"
+            "}\n"
+        )
+        self.assertEqual(print_module(module), expected)
 
 
 if __name__ == "__main__":
