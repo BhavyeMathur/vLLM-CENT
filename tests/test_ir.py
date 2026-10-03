@@ -507,6 +507,36 @@ class ModuleTest(unittest.TestCase):
         module = Module(name="block", functions=[function])  # type: ignore[arg-type]
         self.assertIsInstance(module.functions, tuple)
 
+    def test_verify_accepts_valid_functions(self) -> None:
+        """A module of valid functions verifies without error."""
+
+        function, *_ = _chain()
+        Module(name="block", functions=(function,)).verify()
+
+    def test_verify_names_the_invalid_function(self) -> None:
+        """Function errors gain the function's name as context."""
+
+        _, x, first, _ = _chain()
+        broken = Function(
+            name="broken",
+            operands=(x,),
+            operations=(first,),
+            results=(Value(type=VECTOR, name="stranger"),),
+        )
+        valid, *_ = _chain()
+        module = Module(name="block", functions=(valid, broken))
+        with self.assertRaisesRegex(ValueError, "@broken"):
+            module.verify()
+
+    def test_verify_rejects_duplicate_function_names(self) -> None:
+        """get_function looks up by name, so names must be unique."""
+
+        first, *_ = _chain()
+        second, *_ = _chain()
+        module = Module(name="block", functions=(first, second))
+        with self.assertRaisesRegex(ValueError, "main"):
+            module.verify()
+
 
 # ---------------------------------------------------------------------------
 # base.py: clone_function

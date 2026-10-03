@@ -25,7 +25,6 @@ class Operation(ABC):
     operands: tuple[Value, ...]
     results: tuple[Value, ...] = field(init = False)
 
-
     def __post_init__(self) -> None:
         # Convert before anything else: a generator has no len(), and a list
         # could still be changed by the caller after construction.
@@ -127,10 +126,26 @@ class Module:
         object.__setattr__(self, "functions", tuple(self.functions))
 
     def get_function(self, name: str = "main") -> Function:
-        for function in self.functions:
-            if function.name == name:
-                return function
+        for func in self.functions:
+            if func.name == name:
+                return func
         raise KeyError(f"function not found: {name}")
+
+    def verify(self) -> None:
+        # get_function() looks functions up by name, so a repeated name would
+        # make the lookup silently return only the first one.
+        names: set[str] = set()
+        for func in self.functions:
+            if func.name in names:
+                raise ValueError(f"module @{self.name} defines function @{func.name} twice")
+            names.add(func.name)
+
+        for func in self.functions:
+            try:
+                func.verify()
+            except ValueError as e:
+                raise ValueError(f"function @{func.name}: {e}") from e
+
 
 def clone_function(func: Function) -> Function:
     # Maps every old value (argument or op result) to its copy.
