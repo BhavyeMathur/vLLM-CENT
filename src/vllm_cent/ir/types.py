@@ -35,17 +35,35 @@ class DType(StrEnum):
 
     @classmethod
     def normalize(cls, dtype: object) -> DType:
-        """Return stable ALOI spelling for a dtype-like object"""
+        """Return stable ALOI spelling for a dtype-like object
+
+        Accepts a ``DType``, its value (``"fp16"``), a ``torch.dtype``, or the
+        torch name with or without the ``torch.`` prefix (``"torch.float16"``,
+        ``"half"``). Matching goes through ``str()``, so this module never
+        imports torch.
+        """
 
         text = str(dtype).lower().replace("torch.", "")
+        # Keys are torch dtype names (str(torch.float16) == "torch.float16")
+        # and torch's short aliases (torch.half is torch.float16). The torch
+        # names int64, int32 and int8 already equal ALOI values, so they need
+        # no entry.
+        #
+        # Look-alike torch dtypes are deliberately missing, so they raise:
+        # - float8_e4m3fnuz / float8_e5m2fnuz use a different encoding (no
+        #   negative zero or infinity, different exponent bias).
+        # - float4_e2m1fn_x2 packs two fp4 values into one element, so its
+        #   shape counts pairs, not fp4 values; it is not DType.FP4.
         aliases = {
             "long": "int64",
+            "int": "int32",
             "float32": "fp32",
             "float": "fp32",
-            "int": "int32",
             "float16": "fp16",
             "half": "fp16",
             "bfloat16": "bf16",
+            "float8_e4m3fn": "fp8_e4m3",
+            "float8_e5m2": "fp8_e5m2",
         }
 
         text = aliases.get(text, text)

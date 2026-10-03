@@ -125,6 +125,12 @@ class DTypeTest(unittest.TestCase):
             "torch.bfloat16": DType.BF16,
             "float32": DType.FP32,
             "torch.int64": DType.INT64,
+            "long": DType.INT64,
+            "int": DType.INT32,
+            "torch.int8": DType.INT8,
+            # str() of the torch fp8 dtypes; their names differ from ALOI's.
+            "torch.float8_e4m3fn": DType.FP8_E4M3,
+            "torch.float8_e5m2": DType.FP8_E5M2,
             DType.FP8_E4M3: DType.FP8_E4M3,
         }
         for spelling, dtype in cases.items():
@@ -136,6 +142,22 @@ class DTypeTest(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             DType.normalize("complex64")
+
+    def test_normalize_rejects_look_alike_torch_dtypes(self) -> None:
+        """Torch dtypes that only resemble an ALOI dtype are not mapped.
+
+        The fnuz fp8 formats encode values differently from fp8_e4m3/e5m2,
+        and float4_e2m1fn_x2 stores two fp4 values per element.
+        """
+
+        for spelling in (
+            "torch.float8_e4m3fnuz",
+            "torch.float8_e5m2fnuz",
+            "torch.float4_e2m1fn_x2",
+        ):
+            with self.subTest(spelling=spelling):
+                with self.assertRaises(ValueError):
+                    DType.normalize(spelling)
 
 
 class TensorTypeTest(unittest.TestCase):
