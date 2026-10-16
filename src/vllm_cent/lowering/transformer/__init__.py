@@ -1,4 +1,4 @@
-"""Reusable lowering for transformer-family operations."""
+"""Expose attention plans and partial command emitters shared by transformers."""
 
 from .attention import (
     AttentionOutputPlan,

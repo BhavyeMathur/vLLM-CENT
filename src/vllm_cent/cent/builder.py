@@ -3,7 +3,7 @@
 from collections.abc import Iterable, Iterator
 from typing import TypeAlias
 
-from .hardware import BANKS_PER_PU, CentBlockPlacementSpec, CentHardwareSpec
+from .hardware import BANKS_PER_GROUP, CentBlockPlacementSpec, CentHardwareSpec
 from .instructions import (
     CentChannelSet,
     CentInstruction,
@@ -36,14 +36,16 @@ def _single_bank_transfers(
     """Split one transfer into instructions that do not cross DRAM rows.
 
     ``OPsize`` lets one instruction move several bursts from the same row. A
-    transfer that reaches another row needs another instruction.
+    transfer that reaches another row needs another instruction. The Shared
+    Buffer addresses keep advancing across each row split.
 
     Args:
         instruction_type: Direction of the transfer: write to or read from DRAM.
         channel: DRAM channel number, called ``CHid`` in the paper.
         bank: Bank number within the channel, called ``BK``.
         row: First DRAM row, called ``RO``.
-        column: First scalar position in the row, called ``CO``.
+        column: First scalar position in the row under the current Python
+            convention, not a verified hardware column encoding.
         value_count: Number of scalar values to move.
         shared_buffer: First staging slot. It is ``Rs`` for a DRAM write and
             ``Rd`` for a DRAM read.
@@ -56,6 +58,12 @@ def _single_bank_transfers(
 
     Raises:
         ValueError: If a size is invalid or ``column`` is not burst-aligned.
+
+    Examples:
+        With ``row_width=8`` and ``burst_length=2``, copying ``value_count=6``
+        values from ``column=6`` emits one burst in the starting row and two
+        bursts in the next row. The second instruction starts one Shared Buffer
+        slot after the first.
     """
 
     for name, value in (
@@ -123,7 +131,12 @@ def _single_bank_transfers(
 
 
 class CentProgramBuilder:
-    """Collect validated instructions for one device and block placement.
+    """Build one device program while checking addresses and transfer sizes.
+
+    Call ``append`` for a fully specified instruction or a transfer helper to
+    split data across rows and banks. ``finish`` returns an immutable program
+    and prevents further appends. Checks establish structural validity only;
+    they do not prove that input data has been loaded or a result is correct.
 
     Args:
         hardware: Limits of the CENT device that will run the program.
@@ -133,7 +146,7 @@ class CentProgramBuilder:
         hardware: Device that will run the program.
         placement: Channel allocation for one model block.
         instructions: Commands collected so far, in execution order.
-        _finished: Whether :meth:`finish` has frozen the command list.
+        _finished: Whether ``finish`` has frozen the command list.
     """
 
     # TODO(placement): We currently copy work to channel groups starting at
@@ -150,7 +163,8 @@ class CentProgramBuilder:
             placement: Number of channels assigned to one model block.
 
         Raises:
-            ValueError: If the placement cannot tile the target channels.
+            ValueError: If a block needs more channels than the device has,
+                or equal block copies cannot divide the channels evenly.
         """
 
         if placement.channels_per_block > hardware.num_channels:
@@ -194,7 +208,7 @@ class CentProgramBuilder:
             Channels belonging to every complete copy of the matrix layout.
 
         Raises:
-            ValueError: If it is outside its valid range.
+            ValueError: If ``utilized_banks`` is outside 1 through ``total_banks``.
         """
 
         # TODO(placement): Keep matrix copies inside their block channel regions.
@@ -223,7 +237,8 @@ class CentProgramBuilder:
             Validated channel selection used as ``CHmask``.
 
         Raises:
-            ValueError: If a selected channel does not exist.
+            ValueError: If the selection is empty, repeats a channel, or names
+                a channel outside this device.
         """
 
         selection = CentChannelSet(channels=tuple(channels))
@@ -242,6 +257,10 @@ class CentProgramBuilder:
 
         Raises:
             ValueError: If it is outside the block allocation.
+
+        Examples:
+            With ``num_banks=4``, logical banks zero through three belong to channel
+            zero. ``bank_index(5)`` returns ``(1, 1)``: channel one, bank one.
         """
 
         if not 0 <= logical_bank < self.total_banks:
@@ -265,7 +284,7 @@ class CentProgramBuilder:
         self._append_all((instruction,))
 
     def _append_all(self, instructions: Iterable[CentInstruction]) -> None:
-        """Validate and append one instruction batch atomically.
+        """Append a batch only after every instruction passes validation.
 
         Args:
             instructions: Commands to append in their execution order.
@@ -306,7 +325,8 @@ class CentProgramBuilder:
             bank: Bank number within the channel, called ``BK``.
             row: First DRAM row, called ``RO``.
             value_count: Number of scalar values to move.
-            column: First scalar position in the DRAM row, called ``CO``.
+            column: First scalar position in the DRAM row under the current Python
+                convention; see ``CentMemoryAddress`` for the hardware-unit caveat.
             shared_buffer: First staging slot, called ``Rs`` for a write and
                 ``Rd`` for a read. The default is slot zero.
 
@@ -345,6 +365,10 @@ class CentProgramBuilder:
     ) -> None:
         """Transfer vector pieces through one bank in each neighboring pair.
 
+        Every piece transfers ``size_per_bank`` values, so the caller must supply
+        padding when the last logical piece is shorter. Each block copy uses the
+        same pieces in another channel region.
+
         Args:
             instruction_type: Transfer direction: write to or read from DRAM.
             value_count: Number of vector values to divide among banks.
@@ -352,10 +376,16 @@ class CentProgramBuilder:
             row: First DRAM row used by every selected bank.
             size_per_bank: Number of vector values assigned to each bank.
             shared_buffer: First staging slot used by the first vector piece.
+                Later pieces advance by the rounded slot count per bank.
                 The default is slot zero.
 
         Raises:
             ValueError: If the group or size is invalid.
+
+        Examples:
+            For ``value_count=8`` and ``size_per_bank=4``, piece ``[0:4]`` uses the
+            first pair and piece ``[4:8]`` uses the second pair. ``bank_group=1``
+            selects banks one and three within a channel that has at least four banks.
         """
 
         require_positive("value_count", value_count)
@@ -389,6 +419,7 @@ class CentProgramBuilder:
         slots_per_partition = ceil_div(size_per_bank, self.hardware.burst_length)
         instructions: list[WriteSingleBank | ReadSingleBank] = []
         for partition in range(partitions):
+            # Two banks per pair: advance to the pair, then select its member.
             channel, bank = self.bank_index(partition * 2 + bank_group)
             buffer = CentSharedBufferAddress(
                 slot=(first_buffer.slot + partition * slots_per_partition)
@@ -424,18 +455,29 @@ class CentProgramBuilder:
     ) -> None:
         """Transfer vector pieces through one bank in each four-bank group.
 
+        The Shared Buffer holds the pieces consecutively, rounded separately to
+        whole slots. A second channel-region copy reuses those same slots.
+
         Args:
             instruction_type: Transfer direction: write to or read from DRAM.
             channels_required: Number of channels occupied by one copied layout.
-            utilized_banks: Number of four-bank groups that contain data.
+            utilized_banks: Number of vector pieces, each assigned to one
+                selected bank in a distinct four-bank group.
             bank_group: Position selected within every group, from zero to three.
             row: First DRAM row used by every selected bank.
             size_per_bank: Number of vector values assigned to each selected bank.
             shared_buffer: First staging slot used by the first vector piece.
+                Later pieces advance by the rounded slot count per bank.
                 The default is slot zero.
 
         Raises:
             ValueError: If a channel, group, or size value is invalid.
+
+        Examples:
+            For ``utilized_banks=2`` and ``bank_group=2``, the selected flat bank
+            indices are two and six. With four banks per channel, ``bank_index``
+            maps them to ``(0, 2)`` and ``(1, 2)``. This needs at least two channels
+            assigned to the block.
         """
 
         require_positive("channels_required", channels_required)
@@ -447,7 +489,7 @@ class CentProgramBuilder:
             raise ValueError(
                 "channels_required must equal placement.channels_per_block"
             )
-        if bank_group not in range(BANKS_PER_PU):
+        if bank_group not in range(BANKS_PER_GROUP):
             raise ValueError("bank_group must be between 0 and 3")
 
         # bank_group selects the same position from each four-bank group.
@@ -456,7 +498,9 @@ class CentProgramBuilder:
         slots_per_partition = ceil_div(size_per_bank, self.hardware.burst_length)
         instructions: list[WriteSingleBank | ReadSingleBank] = []
         for partition in range(utilized_banks):
-            channel, bank = self.bank_index(partition * BANKS_PER_PU + bank_group)
+            # Skip complete groups, then select the same bank position in each.
+            # For position 2, partitions 0 and 1 use flat banks 2 and 6.
+            channel, bank = self.bank_index(partition * BANKS_PER_GROUP + bank_group)
             buffer = CentSharedBufferAddress(
                 slot=(first_buffer.slot + partition * slots_per_partition)
             )

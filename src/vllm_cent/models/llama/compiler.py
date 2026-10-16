@@ -1,4 +1,10 @@
-"""Combine the steps that compile one Llama transformer block."""
+"""Connect planned Llama operations in block execution order.
+
+Self-attention runs first, followed by the feed-forward network; each has a
+residual addition that preserves the incoming vector. This legacy compiler
+emits structurally checked commands. The TODOs identify missing input loading,
+normalization, rotation, softmax, and result-packing work needed for execution.
+"""
 
 from ...cent import CentProgram, CentProgramBuilder
 from ...lowering import (
@@ -26,11 +32,12 @@ def _lower_self_attention(
     builder: CentProgramBuilder,
     plan: _LlamaCompilePlan,
 ) -> None:
-    """Lower Llama's normalized self-attention and first residual.
+    """Emit the planned attention sequence and add back the original block input.
 
     Args:
         builder: Program builder that receives the instructions.
-        plan: Checked Llama dimensions and memory bindings.
+        plan: Model sizes, reserved memory, and connected operation plans;
+            each stage uses these placements rather than allocating new space.
     """
 
     operations = plan.self_attention
@@ -99,11 +106,12 @@ def _lower_feed_forward(
     builder: CentProgramBuilder,
     plan: _LlamaCompilePlan,
 ) -> None:
-    """Lower Llama's normalized gated FFN and final residual.
+    """Emit the feed-forward sequence and add back its saved input.
 
     Args:
         builder: Program builder that receives the instructions.
-        plan: Checked Llama dimensions and memory bindings.
+        plan: Model sizes, reserved memory, and connected operation plans;
+            each stage uses these placements rather than allocating new space.
     """
 
     operations = plan.feed_forward

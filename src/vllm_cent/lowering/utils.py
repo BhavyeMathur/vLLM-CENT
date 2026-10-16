@@ -12,19 +12,26 @@ def _row_operation_sizes(
     row_width: int,
     burst_length: int,
 ) -> tuple[int, ...]:
-    """Split a value count into row-local ``OPsize`` values.
+    """Count the memory bursts to process in each DRAM row.
+
+    ``OPsize`` is the instruction field that counts bursts.
 
     Args:
         value_count: Scalar values processed by the complete operation.
         row_width: Scalar values stored in one DRAM row.
-        burst_length: Scalar values processed by one micro-operation.
+        burst_length: Scalar values moved or processed in one burst, which is
+            one unit of an instruction's ``operation_size`` field.
 
     Returns:
-        Operation count for each consecutive DRAM row. The final count includes
+        Burst count for each consecutive DRAM row. The final count includes
         a partly occupied burst when the values do not fill it completely.
 
     Raises:
         ValueError: If a size is invalid or a row cannot contain whole bursts.
+
+    Examples:
+        With ten values, eight values per row, and two values per burst,
+        return ``(4, 1)``: four bursts in the first row and one in the next.
     """
 
     require_positive("value_count", value_count)

@@ -1,4 +1,4 @@
-"""Public state facade for one simulated CENT device."""
+"""Read and write memory and registers for one simulated CENT device."""
 
 from dataclasses import dataclass, field
 from typing import assert_never
@@ -12,6 +12,7 @@ from vllm_cent.cent import (
 )
 from vllm_cent.cent.instructions import validate_address
 from .effects import (
+    AccumulatorWriteEffect,
     CentWriteEffect,
     DramWriteEffect,
     GlobalBufferWriteEffect,
@@ -31,19 +32,22 @@ __all__ = ["CentDeviceState"]
 
 @dataclass(slots=True, kw_only=True)
 class CentDeviceState:
-    """Coordinate the independent storage regions of one functional device.
+    """Provide the memory operations used by simulator kernels and input loading.
 
-    Focused internal components own sparse DRAM, dense buffer, and register-file
-    mechanics. This facade preserves typed CENT addresses, numeric conversion,
-    structured errors, and atomic commits that span more than one region.
+    DRAM (dynamic random-access memory), the Shared Buffer, per-channel Global
+    Buffers, and registers have separate storage. This class translates typed
+    addresses into storage indices and converts host numbers using ``numeric``.
+    It also applies an instruction's proposed writes together: either all
+    destination checks pass and the writes become visible, or none do.
 
     Attributes:
         hardware: Geometry of the device represented by this state.
         numeric: Scalar conversion and arithmetic policy used by writes and
             instruction kernels.
         device_id: Zero-based identifier included in structured failures.
-        _dram: Sparse, initialization-aware DRAM storage.
-        _shared_buffer: Shared Buffer lanes in slot-major scalar order.
+        _dram: DRAM rows allocated on write, with unwritten scalars marked.
+        _shared_buffer: Shared Buffer scalars, ordered by slot and then by
+            lane within each slot.
         _global_buffers: One scalar buffer for each physical channel.
         _accumulators: Initialized near-bank accumulation registers.
         _activation_results: Initialized activation-result registers.
@@ -70,7 +74,7 @@ class CentDeviceState:
 
         self._dram = _SparseDram(hardware=self.hardware, device_id=self.device_id)
         shared_lane_count = (
-                self.hardware.shared_buffer_slots * self.hardware.burst_length
+            self.hardware.shared_buffer_slots * self.hardware.burst_length
         )
         self._shared_buffer = _LinearBuffer(capacity=shared_lane_count)
         self._global_buffers = tuple(
@@ -91,11 +95,11 @@ class CentDeviceState:
         )
 
     def write_dram(
-            self,
-            address: CentMemoryAddress,
-            values: tuple[float, ...],
+        self,
+        address: CentMemoryAddress,
+        values: tuple[float, ...],
     ) -> None:
-        """Write consecutive host values within one sparse DRAM row.
+        """Write host values to consecutive columns of one DRAM row.
 
         Args:
             address: Physical location of the first value.
@@ -117,10 +121,10 @@ class CentDeviceState:
         self.commit_effects((DramWriteEffect(address=address, values=stored_values),))
 
     def read_dram(
-            self,
-            address: CentMemoryAddress,
-            *,
-            value_count: int,
+        self,
+        address: CentMemoryAddress,
+        *,
+        value_count: int,
     ) -> tuple[float, ...]:
         """Read consecutive initialized values from one DRAM row.
 
@@ -139,25 +143,30 @@ class CentDeviceState:
         return self._dram.read(address, value_count=value_count)
 
     def write_shared_buffer(
-            self,
-            address: CentSharedBufferAddress,
-            values: tuple[float, ...],
+        self,
+        address: CentSharedBufferAddress,
+        values: tuple[float, ...],
     ) -> None:
         """Write consecutive host lane values at a Shared Buffer slot.
 
         Args:
             address: First Shared Buffer slot to write.
-            values: Nonempty lane values in slot-major order. The final value
-                may end inside a slot.
+            values: Numbers filling each slot before continuing to the next.
 
         Raises:
             ValueError: If the slot, count, span, or conversion is invalid.
+
+        Examples:
+            With ``hardware.burst_length=4``, six values fill one slot and half the
+            next. The remaining two lanes are left as they were.
         """
 
         if address.slot >= self.hardware.shared_buffer_slots:
             raise ValueError("Shared Buffer address is outside the target")
         if not values:
             raise ValueError("a Shared Buffer write cannot be empty")
+        # Storage uses scalar indices, while this address counts whole slots.
+        # For four lanes per slot, slot 2 starts at scalar index 8.
         start_lane = address.slot * self.hardware.burst_length
         if start_lane + len(values) > self._shared_buffer.capacity:
             raise ValueError("Shared Buffer write exceeds the target")
@@ -168,10 +177,10 @@ class CentDeviceState:
         )
 
     def read_shared_buffer(
-            self,
-            address: CentSharedBufferAddress,
-            *,
-            slot_count: int,
+        self,
+        address: CentSharedBufferAddress,
+        *,
+        slot_count: int,
     ) -> tuple[float, ...]:
         """Read complete consecutive initialized Shared Buffer slots.
 
@@ -180,7 +189,7 @@ class CentDeviceState:
             slot_count: Number of complete slots to read.
 
         Returns:
-            Lane values in slot-major order.
+            All lanes of the first slot, followed by all lanes of each next slot.
 
         Raises:
             ValueError: If the slot, count, or complete span is invalid.
@@ -198,10 +207,10 @@ class CentDeviceState:
         return self.read_shared_buffer_values(address, value_count=value_count)
 
     def read_shared_buffer_values(
-            self,
-            address: CentSharedBufferAddress,
-            *,
-            value_count: int,
+        self,
+        address: CentSharedBufferAddress,
+        *,
+        value_count: int,
     ) -> tuple[float, ...]:
         """Read an exact scalar count starting at a Shared Buffer slot.
 
@@ -210,7 +219,8 @@ class CentDeviceState:
             value_count: Number of consecutive lane values to read.
 
         Returns:
-            Exactly ``value_count`` initialized lanes in slot-major order.
+            Exactly ``value_count`` initialized scalars, ordered by slot and
+            then by lane within that slot.
 
         Raises:
             ValueError: If the slot, count, or complete span is invalid.
@@ -222,12 +232,16 @@ class CentDeviceState:
         if value_count < 1:
             raise ValueError("value_count must be at least 1")
 
+        # Storage uses scalar indices, while this address counts whole slots.
+        # For four lanes per slot, slot 2 starts at scalar index 8.
         start_lane = address.slot * self.hardware.burst_length
         if start_lane + value_count > self._shared_buffer.capacity:
             raise ValueError("Shared Buffer read exceeds the target")
         try:
             return self._shared_buffer.read(start_lane, value_count=value_count)
         except _UninitializedScalarError as error:
+            # Public Shared Buffer errors identify a slot, so map the missing
+            # scalar back to its containing slot (index 9 is slot 2 at width 4).
             missing_slot = error.index // self.hardware.burst_length
             raise CentUninitializedReadError(
                 "Shared Buffer source lane is uninitialized",
@@ -236,9 +250,9 @@ class CentDeviceState:
             ) from error
 
     def write_global_buffer(
-            self,
-            address: CentGlobalBufferAddress,
-            values: tuple[float, ...],
+        self,
+        address: CentGlobalBufferAddress,
+        values: tuple[float, ...],
     ) -> None:
         """Write consecutive host values to one channel's Global Buffer.
 
@@ -265,10 +279,10 @@ class CentDeviceState:
         )
 
     def read_global_buffer(
-            self,
-            address: CentGlobalBufferAddress,
-            *,
-            value_count: int,
+        self,
+        address: CentGlobalBufferAddress,
+        *,
+        value_count: int,
     ) -> tuple[float, ...]:
         """Read consecutive initialized values from one Global Buffer.
 
@@ -309,9 +323,9 @@ class CentDeviceState:
             ) from error
 
     def write_accumulator(
-            self,
-            address: CentBankRegisterAddress,
-            value: float,
+        self,
+        address: CentBankRegisterAddress,
+        value: float,
     ) -> None:
         """Write one near-bank accumulation register.
 
@@ -349,9 +363,9 @@ class CentDeviceState:
         return self._accumulators.read(address)
 
     def write_activation_result(
-            self,
-            address: CentBankRegisterAddress,
-            value: float,
+        self,
+        address: CentBankRegisterAddress,
+        value: float,
     ) -> None:
         """Write one near-bank activation-result register.
 
@@ -389,30 +403,44 @@ class CentDeviceState:
         return self._activation_results.read(address)
 
     def commit_effects(self, effects: tuple[CentWriteEffect, ...]) -> None:
-        """Atomically commit already-represented instruction results.
+        """Apply all proposed writes, or leave memory unchanged if any check fails.
 
-        Each touched component is cloned at most once. Global Buffers are
-        cloned independently by channel, and sparse DRAM copies only rows that
-        receive writes. Prepared components replace live state only after every
-        effect succeeds.
+        Writes first go to private copies. Only after all succeed do those
+        copies replace live storage.
+        Each buffer is copied at most once per call; DRAM copies its row lookup
+        table and replaces only rows receiving writes. Values are already
+        converted, so committing does not apply numeric conversion again.
 
         Args:
-            effects: Complete ordered write set for one logical instruction.
+            effects: Proposed writes for one instruction, applied in tuple order.
+                Later writes replace earlier values where destinations overlap.
 
         Raises:
             ValueError: If the tuple is empty, an effect contains no values, or
                 a destination span is outside the target.
+
+        Examples:
+            A valid write to channel 0 followed by an out-of-bounds write to
+            channel 1 changes neither channel.
         """
 
         if not effects:
             raise ValueError("an instruction commit must contain at least one effect")
 
+        # Start with references to live storage. Copy a component only on its
+        # first write, and direct all subsequent writes to that private copy.
+        prepared_accumulators = self._accumulators
         prepared_dram = self._dram
         prepared_shared_buffer = self._shared_buffer
         prepared_global_buffers: list[_LinearBuffer] | None = None
         copied_global_channels: set[int] = set()
 
         for effect in effects:
+            if isinstance(effect, AccumulatorWriteEffect):
+                if prepared_accumulators is self._accumulators:
+                    prepared_accumulators = self._accumulators.clone()
+                prepared_accumulators.write(effect.address, effect.value)
+                continue
             if not effect.values:
                 raise ValueError("a write effect cannot be empty")
 
@@ -428,6 +456,12 @@ class CentDeviceState:
                 start_lane = effect.address.slot * self.hardware.burst_length
                 if start_lane + len(effect.values) > self._shared_buffer.capacity:
                     raise ValueError("Shared Buffer write exceeds the target")
+                # TODO(simulator performance): Copying the complete buffer
+                # preserves all-or-nothing writes, but costs time proportional
+                # to its capacity even for one slot. A future storage change
+                # should copy only touched chunks while retaining the existing
+                # failed-commit and overlapping-write behavior.
+                #
                 if prepared_shared_buffer is self._shared_buffer:
                     prepared_shared_buffer = self._shared_buffer.clone()
                 prepared_shared_buffer.write(start_lane, effect.values)
@@ -445,6 +479,8 @@ class CentDeviceState:
 
                 if prepared_global_buffers is None:
                     prepared_global_buffers = list(self._global_buffers)
+                # Copy only the channel being changed. Reuse its private copy
+                # for later effects so earlier writes in this commit survive.
                 if channel not in copied_global_channels:
                     prepared_global_buffers[channel] = self._global_buffers[
                         channel
@@ -458,20 +494,22 @@ class CentDeviceState:
 
             assert_never(effect)  # pragma: no cover - closed union guard
 
-        # Replacing component references is the only live-state mutation.
+        # No live storage was modified above. Publish the prepared copies only
+        # now, after every write has succeeded.
+        self._accumulators = prepared_accumulators
         self._dram = prepared_dram
         self._shared_buffer = prepared_shared_buffer
         if prepared_global_buffers is not None:
             self._global_buffers = tuple(prepared_global_buffers)
 
     def _store_host_values(self, values: tuple[float, ...]) -> tuple[float, ...]:
-        """Convert every host scalar before starting an atomic commit.
+        """Convert all host values before applying any memory writes.
 
         Args:
             values: Host scalar values entering simulated device state.
 
         Returns:
-            Complete converted values ready for an atomic state commit.
+            Converted numbers in input order, ready to be written together.
 
         Raises:
             ValueError: If the configured numeric policy rejects a value.

@@ -1,6 +1,7 @@
-"""End-to-end tests for the public functional-execution boundary."""
+"""Check complete runs from named host inputs to outputs and instruction traces."""
 
 import unittest
+from unittest.mock import patch
 
 import vllm_cent.simulator as simulator
 from vllm_cent import (
@@ -44,7 +45,7 @@ from vllm_cent.simulator.api import (
     _materialize_input,
     _numeric_semantics,
 )
-from vllm_cent.simulator.execution import execute_program
+from vllm_cent.simulator.execution import _execute_preflighted_program, execute_program
 from vllm_cent.simulator.numeric import ReferenceMathSemantics
 from vllm_cent.simulator.state import CentDeviceState
 
@@ -53,7 +54,9 @@ def make_hardware() -> CentHardwareSpec:
     """Create the tiny target used by public execution tests.
 
     Returns:
-        Two-channel target with two values in each burst.
+        Two channels with four banks each. Every burst and Shared Buffer
+        slot holds two values, so operation_size=2 moves four values. Eight
+        Shared Buffer slots provide 16 scalar positions.
     """
 
     return CentHardwareSpec(
@@ -70,10 +73,67 @@ def make_hardware() -> CentHardwareSpec:
 
 
 class FunctionalExecutionTests(unittest.TestCase):
-    """Exercise materialization, execution, extraction, and tracing together."""
+    """Check input loading, program execution, output reads, and traces together."""
+
+    def test_trace_selection_controls_retained_values(self) -> None:
+        """Discard overwritten values without changing computation or trace order."""
+
+        address = CentSharedBufferAddress(slot=0)
+        program = CentProgram(
+            hardware=make_hardware(),
+            instructions=(
+                Accumulate(source=address, destination=address, operation_size=1),
+            )
+            * 3,
+        )
+        region = CentSharedBufferRegion(address=address, scalar_count=2)
+        executable = CentExecutable(
+            program=program,
+            manifest=CentExecutionManifest(
+                inputs=(CentInputBinding(name="x", region=region),),
+                outputs=(CentOutputBinding(name="out", region=region),),
+            ),
+        )
+        for trace_level in CentTraceLevel:
+            keep_history = trace_level is CentTraceLevel.SUMMARY
+            with self.subTest(trace_level=trace_level):
+                # Each instruction doubles the same two lanes. Only the final
+                # [8, 16] needs to survive when the caller disables tracing.
+                state = CentDeviceState(hardware=program.hardware)
+                state.write_shared_buffer(address, (1.0, 2.0))
+                summary = _execute_preflighted_program(
+                    program, state, retain_effects=keep_history
+                )
+                self.assertEqual(summary.executed_instruction_count, 3)
+                self.assertEqual(
+                    len(summary.committed_effects), 3 if keep_history else 0
+                )
+                self.assertEqual(
+                    state.read_shared_buffer_values(address, value_count=2), (8.0, 16.0)
+                )
+                with patch(
+                    "vllm_cent.simulator.api._execute_preflighted_program",
+                    wraps=_execute_preflighted_program,
+                ) as execute:
+                    result = execute_functionally(
+                        CentExecutionRequest(
+                            executable=executable,
+                            inputs=(CentNamedScalars(name="x", values=(1.0, 2.0)),),
+                            configuration=CentSimulatorConfiguration(
+                                trace_level=trace_level
+                            ),
+                        )
+                    )
+                self.assertEqual(
+                    execute.call_args.kwargs, {"retain_effects": keep_history}
+                )
+                self.assertEqual(
+                    result.outputs, (CentNamedScalars(name="out", values=(8.0, 16.0)),)
+                )
+                self.assertEqual(len(result.events), 3 if keep_history else 0)
 
     def test_executes_the_complete_supported_dataflow_slice(self) -> None:
-        """Run every currently supported instruction through the public API."""
+        """Run copies, multiplication, and addition using named input bindings."""
 
         hardware = make_hardware()
         channel_zero = CentChannelSet(channels=(0,))
@@ -210,6 +270,11 @@ class FunctionalExecutionTests(unittest.TestCase):
             )
         )
 
+        # Each operation covers two bursts of two values, hence four scalars
+        # in each trace range. Banks 0 and 1 multiply into bank 2; bank 3 gets
+        # a copy before the Shared Buffer addition changes the returned sum.
+        # Products are (2*10, 3*20, 4*30, 5*40); adding left gives
+        # (22, 63, 124, 205). Channel 1 receives an unchanged copy of left.
         scalar_count = 4
         self.assertEqual(
             result,
@@ -445,6 +510,8 @@ class FunctionalExecutionTests(unittest.TestCase):
                         ),
                     ),
                 ),
+                # Two input copies, multiply, two bank/buffer copies, a
+                # channel-1 broadcast and copy, read-back, then addition.
                 executed_instruction_count=9,
             ),
         )
@@ -560,6 +627,8 @@ class FunctionalExecutionTests(unittest.TestCase):
             )
         )
 
+        # Copy the original Global Buffer values to bank 1 before replacing
+        # that buffer with bank 0. Reversing the copies would lose (9, 10).
         self.assertEqual(
             result.outputs,
             (
@@ -579,8 +648,8 @@ class FunctionalExecutionTests(unittest.TestCase):
         )
         for device_id, instruction_index in ((-1, 0), (0, -1)):
             with self.subTest(
-                    device_id=device_id,
-                    instruction_index=instruction_index,
+                device_id=device_id,
+                instruction_index=instruction_index,
             ):
                 with self.assertRaises(ValueError):
                     CentExecutionEvent(
@@ -592,7 +661,7 @@ class FunctionalExecutionTests(unittest.TestCase):
                     )
 
     def test_unsupported_instruction_fails_during_preflight(self) -> None:
-        """Never guess semantics for an opcode outside the supported slice."""
+        """Reject exponentiation during support checks, before trying to run it."""
 
         executable = CentExecutable(
             program=CentProgram(
@@ -628,24 +697,24 @@ class FunctionalExecutionTests(unittest.TestCase):
 
 
 class FunctionalApiHelperTests(unittest.TestCase):
-    """Directly exercise nontrivial private API boundary helpers."""
+    """Check input loading, output reads, numeric selection, and trace helpers."""
 
     def test_package_keeps_state_level_execution_private(self) -> None:
-        """Expose only the manifest-facing simulator API and stable errors."""
+        """Expose requests with named inputs, without exposing mutable device state."""
 
         for internal_name in (
-                "CentDeviceState",
-                "CentExecutionSummary",
-                "CentNumericSemantics",
-                "ReferenceMathSemantics",
-                "execute_program",
-                "preflight_program",
+            "CentDeviceState",
+            "CentExecutionSummary",
+            "CentNumericSemantics",
+            "ReferenceMathSemantics",
+            "execute_program",
+            "preflight_program",
         ):
             with self.subTest(internal_name=internal_name):
                 self.assertFalse(hasattr(simulator, internal_name))
 
     def test_materialization_and_extraction_cover_every_region_type(self) -> None:
-        """Move named host scalars through each raw physical region."""
+        """Write and read the same named values in all three supported memory spaces."""
 
         state = CentDeviceState(hardware=make_hardware())
         regions = (
@@ -680,7 +749,7 @@ class FunctionalApiHelperTests(unittest.TestCase):
                 )
 
     def test_numeric_and_event_helpers_return_the_selected_contract(self) -> None:
-        """Construct reference math and trace one exact committed effect."""
+        """Select Python float arithmetic and trace the range actually written."""
 
         self.assertIsInstance(
             _numeric_semantics(CentNumericProfile.REFERENCE_MATH),

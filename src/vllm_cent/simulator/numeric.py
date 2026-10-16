@@ -1,4 +1,4 @@
-"""Numeric policies used by functional instruction kernels."""
+"""Choose how host numbers are stored and how simulated arithmetic behaves."""
 
 from dataclasses import dataclass
 from typing import Protocol
@@ -7,7 +7,12 @@ __all__ = ["CentNumericSemantics", "ReferenceMathSemantics"]
 
 
 class CentNumericSemantics(Protocol):
-    """Define scalar conversion and arithmetic for one simulator profile."""
+    """Define conversion, addition, and multiplication for one numeric policy.
+
+    Host writes call ``store``. Arithmetic methods return values already in
+    the stored representation; copying or committing those values must not
+    apply conversion a second time.
+    """
 
     def store(self, value: float) -> float:
         """Convert a host value to the profile's stored representation.
@@ -25,8 +30,8 @@ class CentNumericSemantics(Protocol):
         """Add two stored values using the profile's arithmetic.
 
         Args:
-            left: Left operand.
-            right: Right operand.
+            left: First stored number used in the calculation.
+            right: Second stored number used in the calculation.
 
         Returns:
             Stored representation of the sum.
@@ -38,8 +43,8 @@ class CentNumericSemantics(Protocol):
         """Multiply two stored values using the profile's arithmetic.
 
         Args:
-            left: Left operand.
-            right: Right operand.
+            left: First stored number used in the calculation.
+            right: Second stored number used in the calculation.
 
         Returns:
             Stored representation of the product.
@@ -50,46 +55,47 @@ class CentNumericSemantics(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class ReferenceMathSemantics:
-    """Use Python float operations to validate compiler-level dataflow.
+    """Use Python ``float`` values to check how compiled instructions move and combine values.
 
-    This profile intentionally makes no claim about CENT BF16 rounding or
-    accelerator special-value behavior.
+    This is a reference computation, not a model of CENT rounding. BF16
+    (bfloat16) is a 16-bit floating-point format; its rounding and the
+    accelerator's treatment of values such as infinity are not modeled here.
     """
 
     def store(self, value: float) -> float:
-        """Store one value as a Python float without hardware quantization.
+        """Store one value as a Python ``float`` without hardware quantization.
 
         Args:
             value: Host scalar being written to simulated state.
 
         Returns:
-            Python float preserving signed zero and supported special values.
+            Python ``float`` preserving signed zero and supported special values.
         """
 
         return float(value)
 
     def add(self, left: float, right: float) -> float:
-        """Add two values with Python float arithmetic.
+        """Add two values with Python ``float`` arithmetic.
 
         Args:
-            left: Left operand.
-            right: Right operand.
+            left: First stored number used in the calculation.
+            right: Second stored number used in the calculation.
 
         Returns:
-            Python float sum.
+            Python ``float`` sum.
         """
 
         return self.store(left + right)
 
     def multiply(self, left: float, right: float) -> float:
-        """Multiply two values with Python float arithmetic.
+        """Multiply two values with Python ``float`` arithmetic.
 
         Args:
-            left: Left operand.
-            right: Right operand.
+            left: First stored number used in the calculation.
+            right: Second stored number used in the calculation.
 
         Returns:
-            Python float product.
+            Python ``float`` product.
         """
 
         return self.store(left * right)

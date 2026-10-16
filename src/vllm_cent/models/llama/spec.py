@@ -8,13 +8,17 @@ __all__ = ["LlamaModelSpec"]
 
 # TODO(model): Add the Llama settings needed for numerical correctness.
 #
-# RMSNorm epsilon and RoPE theta/scaling are known missing inputs. Data type,
-# activation choice, and optional projection biases still need design decisions.
+# The semantic feed-forward builder takes RMSNorm epsilon explicitly and uses
+# SiLU. The older structural compiler still lacks that epsilon input. RoPE
+# theta/scaling, model dtype, and optional projection biases remain unspecified.
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class LlamaModelSpec(ModelSpec):
-    """Model sizes that determine the shape of one Llama block.
+    """Specify the vector widths and attention-head counts of one Llama block.
+
+    These sizes describe architecture only; this object contains no weights
+    or runtime token values.
 
     Attributes:
         hidden_size: Values in each input and output vector. It must divide
@@ -24,6 +28,11 @@ class LlamaModelSpec(ModelSpec):
         num_kv_heads: Distinct key and value heads. Several query heads may
             share one KV head.
         intermediate_size: Values produced inside the feed-forward layer.
+
+    Examples:
+        For ``hidden_size=128`` and eight query heads, each head contains 16
+        values. With two key/value heads, four query heads share each cached
+        key/value head.
     """
 
     hidden_size: int

@@ -1,4 +1,9 @@
-"""Reusable operations lowered into CENT instructions."""
+"""Expose plans and instruction emitters that are independent of model family.
+
+A plan fixes memory locations and layouts; a lowerer emits commands for that
+plan. Some mathematical operations remain partial, as documented by their
+individual lowerers.
+"""
 
 from .bindings import (
     CentDramRowRange,

@@ -34,7 +34,9 @@ def require_positive(name: str, value: int) -> None:
 
 
 def ceil_div(dividend: int, divisor: int) -> int:
-    """Divide two integers and round up to the next whole number.
+    """Count how many fixed-size groups are needed to hold all items.
+
+    A partially filled group still counts toward the total.
 
     Args:
         dividend: Number of items to divide.
@@ -45,6 +47,10 @@ def ceil_div(dividend: int, divisor: int) -> int:
 
     Raises:
         ValueError: If either argument is less than 1.
+
+    Examples:
+        ``ceil_div(6, 4)`` returns ``2``: six values need two four-value bursts,
+        with two unused lanes in the last burst.
     """
 
     if dividend < 1 or divisor < 1:

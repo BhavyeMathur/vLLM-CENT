@@ -1,11 +1,13 @@
-"""Typed addresses for CENT's DRAM and Shared Buffer."""
+"""Name locations in DRAM, device buffers, and bank result registers."""
 
 from dataclasses import dataclass
 
 from ..utils import require_nonnegative
 
 __all__ = [
+    "CentBankRegisterAddress",
     "CentChannelSet",
+    "CentGlobalBufferAddress",
     "CentMemoryAddress",
     "CentSharedBufferAddress",
 ]
@@ -15,15 +17,24 @@ __all__ = [
 class CentMemoryAddress:
     """Identify the first DRAM value used by an instruction.
 
-    The paper writes these four fields as ``CHid BK RO CO``. When ``OPsize`` is
-    greater than one, later micro-operations move forward from ``column`` by one
-    burst at a time.
+    The fields correspond to the paper's ``CHid BK RO CO`` labels. This Python
+    API currently measures ``column`` in scalar values. A bank and row select
+    the storage containing those values.
+
+    This scalar convention is not a verified encoding of hardware ``CO``. AiM
+    sources describe burst-column addresses; a unit migration must update
+    callers and renderers together.
 
     Attributes:
         channel: Zero-based physical channel number, or ``CHid``.
         bank: Zero-based bank number within ``channel``, or ``BK``.
         row: Zero-based row number within ``bank``, or ``RO``.
-        column: Zero-based scalar position within ``row``, or ``CO``.
+        column: Zero-based scalar position within ``row`` in this Python API.
+
+    Examples:
+        With ``burst_length=4``, a transfer at ``column=8`` reads scalar values
+        ``[8:12]``. With ``operation_size=2``, it reads ``[8:16]``. Both transfers
+        use the same bank and row and must fit within that row.
     """
 
     channel: int
@@ -109,3 +120,59 @@ class CentSharedBufferAddress:
 
         # The target-specific upper bound is checked when building a program.
         require_nonnegative("slot", self.slot)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CentGlobalBufferAddress:
+    """Identify a scalar column in one channel's Global Buffer.
+
+    These runtime coordinates describe storage, not an additional ISA operand.
+    Target-specific bounds are checked when binding or accessing storage.
+
+    Attributes:
+        channel: Channel whose Global Buffer contains the value.
+        column: Scalar offset from the start of that buffer, not a byte offset.
+    """
+
+    channel: int
+    column: int
+
+    def __post_init__(self) -> None:
+        """Reject negative storage coordinates.
+
+        Raises:
+            ValueError: If the channel or column is negative.
+        """
+        require_nonnegative("channel", self.channel)
+        require_nonnegative("column", self.column)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CentBankRegisterAddress:
+    """Identify one bank's accumulator or activation-result register.
+
+    The register file selected by the caller determines which value is accessed.
+    These coordinates alone do not specify instruction packing or precision.
+
+    Attributes:
+        channel: Channel containing the bank.
+        bank: Bank within that channel.
+        register: Index within the accumulator or activation-result register set.
+
+    Examples:
+        ``CentBankRegisterAddress(channel=1, bank=2, register=0)`` selects register
+        zero in bank two of channel one. It does not select Shared Buffer slot zero.
+    """
+
+    channel: int
+    bank: int
+    register: int
+
+    def __post_init__(self) -> None:
+        """Reject negative register coordinates.
+
+        Raises:
+            ValueError: If the channel, bank, or register index is negative.
+        """
+        for name in ("channel", "bank", "register"):
+            require_nonnegative(name, getattr(self, name))

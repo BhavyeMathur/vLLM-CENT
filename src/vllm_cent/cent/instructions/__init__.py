@@ -1,7 +1,13 @@
-"""Public typed instruction interface for CENT programs."""
+"""Public command and address types used to construct CENT programs.
+
+Each instruction carries named operands. Constructors check target-independent
+rules; validation functions check the limits of a particular hardware target.
+"""
 
 from .address import (
+    CentBankRegisterAddress,
     CentChannelSet,
+    CentGlobalBufferAddress,
     CentMemoryAddress,
     CentSharedBufferAddress,
 )
@@ -41,7 +47,9 @@ __all__ = [
     "Accumulate",
     "ApplyActivation",
     "BroadcastCxl",
+    "CentBankRegisterAddress",
     "CentChannelSet",
+    "CentGlobalBufferAddress",
     "CentInstruction",
     "CentMemoryAddress",
     "CentOpcode",

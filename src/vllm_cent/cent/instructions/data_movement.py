@@ -27,7 +27,7 @@ __all__ = [
 ]
 
 
-# CXL device-to-device transfers -------------------------------------------
+# Compute Express Link (CXL) device-to-device transfers ---------------------
 #
 # Rs is a slot on the sender and Rd is a slot on the receiver. DVid or DVcount
 # tells CXL where to send the data.
@@ -141,12 +141,19 @@ class WriteSingleBank(CentInstruction):
 
     This is ``WR_SBK CHid OPsize BK RO CO Rs`` in the paper. ``address`` names
     the first DRAM burst and ``source`` names the first Shared Buffer slot.
+    The caller supplies every transferred value, including any padding; this
+    instruction does not create padding.
 
     Attributes:
         address: Channel, bank, row, and column of the first DRAM burst.
         operation_size: Number of bursts to copy, or ``OPsize``.
         source: First Shared Buffer slot to read, or ``Rs``.
         OPCODE: Fixed ``WR_SBK`` instruction name.
+
+    Examples:
+        With ``burst_length=4``, ``operation_size=2``, and ``address.column=0``,
+        two Shared Buffer slots are copied into scalar values ``[0:8]`` of the
+        selected DRAM row. The caller must supply all eight values.
     """
 
     address: CentMemoryAddress
@@ -211,7 +218,8 @@ class WriteAllBanks(CentInstruction):
     Attributes:
         channel: Physical channel number, or ``CHid``.
         row: Destination DRAM row, or ``RO``.
-        column: Destination position within the row, or ``CO``.
+        column: Destination scalar position under the current Python convention.
+            The hardware ``CO`` unit remains a separate address contract.
         source: Shared Buffer slot containing the values, or ``Rs``.
         accumulation_register: Register number shown as ``Regid`` in Table 3.
         OPCODE: Fixed ``WR_ABK`` instruction name.
@@ -241,7 +249,8 @@ class WriteAllBanks(CentInstruction):
 # Global Buffer and DRAM-bank transfers ------------------------------------
 #
 # Each channel has a Global Buffer used by nearby processing units. CHmask
-# chooses the channels. These copy instructions contain no bank number.
+# chooses the channels. The paper omits a bank operand, but the Python types
+# below carry one because the AiM timing trace needs an explicit bank.
 
 # TODO(ISA): Reconcile the paper and AiM copy-instruction operands.
 #
@@ -270,7 +279,8 @@ class CopyBankToGlobalBuffer(CentInstruction):
         operation_size: Number of bursts to copy, or ``OPsize``.
         bank: Source bank within every selected channel.
         row: First source DRAM row, or ``RO``.
-        column: First position in that row, or ``CO``.
+        column: First scalar position in the DRAM row and Global Buffer under
+            the local functional contract. The AiM trace only accepts zero.
         OPCODE: Fixed ``COPY_BKGB`` instruction name.
     """
 
@@ -307,7 +317,8 @@ class CopyGlobalBufferToBank(CentInstruction):
         operation_size: Number of bursts to copy, or ``OPsize``.
         bank: Destination bank within every selected channel.
         row: First destination DRAM row, or ``RO``.
-        column: First position in that row, or ``CO``.
+        column: First scalar position in the DRAM row and Global Buffer under
+            the local functional contract. The AiM trace only accepts zero.
         OPCODE: Fixed ``COPY_GBBK`` instruction name.
     """
 
@@ -338,11 +349,12 @@ class CopyGlobalBufferToBank(CentInstruction):
 
 # TODO(ISA): Define where RD_MAC stores results from several channels.
 #
-# One channel produces a 256-bit result containing values from its 16 banks.
-# RD_MAC still provides only one Rd when CHmask selects several channels. Confirm
-# whether those channel results use consecutive slots, channel-local slots, or
-# another layout. Also confirm whether WR_BIAS broadcasts one Rs or reads a
-# different slot for each channel.
+# The Shared Buffer uses 256-bit slots, and a channel has 16 banks in the paper.
+# That does not establish the width or order of RD_MAC results. Confirm result
+# precision, bank ordering, and the number of slots written per channel. RD_MAC
+# provides only one Rd for several channels, so their relative slot positions
+# also need a contract. Confirm whether WR_BIAS broadcasts one Rs or reads a
+# different slot for each channel; see docs/research/sk-hynix-aim.md.
 
 
 # TODO(ISA): Define which accumulator WR_BIAS initializes.
@@ -409,8 +421,10 @@ class ReadActivation(CentInstruction):
     """Copy activation-function results into the Shared Buffer.
 
     AiM calls this target-specific operation ``RD_AF GPR_0 channel_mask``.
-    ``destination`` names the corresponding 256-bit Shared Buffer/GPR slot in
-    the compiler IR. The target trace has no register operand, so its adapter
+    ``destination`` is a Shared Buffer slot in this compiler. The timing-trace
+    adapter places that number in the general-purpose-register (GPR) field;
+    this does not prove the two storage structures have the same value layout.
+    The target trace has no register operand, so its adapter
     can represent only accumulator register zero.
 
     Attributes:
@@ -451,7 +465,8 @@ class WriteGlobalBuffer(CentInstruction):
         channels: Physical channels whose Global Buffers are written, or
             ``CHmask``.
         operation_size: Number of bursts to copy, or ``OPsize``.
-        column: First Global Buffer position, or ``CO``.
+        column: First scalar position in each Global Buffer under the current
+            Python convention; the AiM trace can represent only column zero.
         source: First Shared Buffer slot to read, or ``Rs``.
         OPCODE: Fixed ``WR_GB`` instruction name.
     """

@@ -1,9 +1,16 @@
-"""Build CENT instructions for the elementwise part of Llama's FFN."""
+"""Emit multiplication stages of Llama's feed-forward network (FFN).
+
+The intended gate is ``SiLU(gate) * up``, where ``SiLU(x) = x * sigmoid(x)``.
+Projections and sigmoid are produced elsewhere. This module plans their
+multiplications, but the transfers that put the distinct inputs into the
+workspace remain unfinished. The separate ``graphs`` module builds the complete
+semantic feed-forward calculation for the reference execution pipeline.
+"""
 
 from dataclasses import dataclass
 
 from ...cent import (
-    BANKS_PER_PU,
+    BANKS_PER_GROUP,
     CentChannelSet,
     CentProgramBuilder,
     CopyBankToGlobalBuffer,
@@ -22,13 +29,18 @@ __all__: list[str] = []
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class _SiluProductChunkPlan:
-    """Describe one section of the expanded feed-forward vector.
+    """Describe the portion of the expanded vector processed in one pass.
+
+    Each four-bank processing unit (PU) handles one piece that must fit in a
+    DRAM row. A large feed-forward vector is divided into multiple chunks so
+    each pass can reuse the same Shared Buffer workspace.
 
     Attributes:
         row: First DRAM row used by every selected bank.
         value_count: Feed-forward values represented by this section.
-        partition_count: Four-bank PU groups used by the section.
-        values_per_partition: Padded values stored in each selected PU group.
+        partition_count: Four-bank groups used by the section.
+        values_per_partition: Scalar-value capacity assigned to each selected
+            bank group; transfers round this up to complete bursts.
     """
 
     row: int
@@ -56,7 +68,11 @@ class _SiluProductChunkPlan:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class _SiluProductPlan:
-    """Bind the layout and storage used by the SiLU product lowerer.
+    """Choose the workspaces used to multiply the gate and up-projection values.
+
+    Chunks name separate DRAM work areas, but reuse one Shared Buffer span.
+    Bank position 2 of each processing unit holds the multiplication result;
+    ``result_banks`` lists those physical bank numbers within a channel.
 
     Attributes:
         chunks: Planned sections of the expanded feed-forward vector.
@@ -88,7 +104,7 @@ class _SiluProductPlan:
             raise ValueError("result_banks cannot contain duplicates")
         for bank in self.result_banks:
             require_nonnegative("result_bank", bank)
-            if bank % BANKS_PER_PU != ElementwiseMultiply.RESULT_BANK:
+            if bank % BANKS_PER_GROUP != ElementwiseMultiply.RESULT_BANK:
                 raise ValueError("each result bank must hold an EW_MUL result")
 
 
@@ -96,11 +112,16 @@ def _lower_silu_product(
     builder: CentProgramBuilder,
     plan: _SiluProductPlan,
 ) -> None:
-    """Emit a planned SiLU gate and feed-forward projection product.
+    """Emit the multiplication commands intended to form ``gate*sigmoid(gate)*up``.
+
+    Distinct inputs have not yet been connected to the reused workspace. Until
+    the repacking and staging TODO below is resolved, this sequence is a
+    structural description, not a complete numerical SiLU product.
 
     Args:
         builder: Program builder that receives the FFN instructions.
-        plan: Checked chunk layout, addresses, and channel selection.
+        plan: Vector pieces handled by each pass, their DRAM work rows, the
+            reused buffer span, and channels/banks carrying multiplication results.
 
     Raises:
         ValueError: If the plan is incompatible with the target hardware.
@@ -113,7 +134,7 @@ def _lower_silu_product(
     # bank-group layout used below. The paper does not define that conversion.
     # Each repacker must write all occupied slots and zero every padding lane.
 
-    # TODO(ISA): Define how unused PU groups are disabled.
+    # TODO(ISA): Define how unused bank groups are disabled.
     #
     # A chunk can occupy fewer groups than the selected channels contain, but
     # EW_MUL still runs every group. The final copy must not treat an inactive
@@ -123,7 +144,7 @@ def _lower_silu_product(
         raise ValueError("channels_per_copy must divide num_channels")
     maximum_partitions = builder.total_banks // 4
     if any(chunk.partition_count > maximum_partitions for chunk in plan.chunks):
-        raise ValueError("chunk partition_count exceeds available PU groups")
+        raise ValueError("chunk partition_count exceeds available bank groups")
     if any(bank >= builder.hardware.num_banks for bank in plan.result_banks):
         raise ValueError("result bank is outside the target hardware")
     if any(

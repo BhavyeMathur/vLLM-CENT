@@ -23,7 +23,8 @@ def make_builder(*, num_channels: int = 1) -> CentProgramBuilder:
         num_channels: Number of physical channels.
 
     Returns:
-        Builder with four banks, sixteen columns, and four-value bursts.
+        Empty builder with four banks per channel, sixteen scalar values per
+        row, and four-value bursts. Each block copy occupies one channel.
     """
 
     return CentProgramBuilder(
@@ -265,7 +266,7 @@ class CentProgramBuilderTests(unittest.TestCase):
             builder.emit_single_bank_transfer(WriteSingleBank, 0, 0, 64, 1)
 
     def test_neighbor_transfer_replicates_banks_and_buffer_partitions(self) -> None:
-        """Repeat alternating-bank partitions across block copies."""
+        """Copy each vector piece through odd banks in every block copy."""
 
         builder = make_builder(num_channels=2)
         builder.emit_neighbor_bank_transfer(WriteSingleBank, 8, 1, 6, 4)
@@ -366,7 +367,7 @@ class CentProgramBuilderTests(unittest.TestCase):
         builder = make_builder(num_channels=2)
         builder.emit_bank_group_transfer(ReadSingleBank, 1, 1, 2, 9, 5)
 
-        # Bank group 2 selects bank 2 out of each four-bank PU. The one-channel
+        # Bank group 2 selects bank 2 out of each four-bank group. The one-channel
         # block is copied onto both physical channels. Five requested values
         # require OPsize 2, and both copies write the same logical Rd slot 0.
         self.assertEqual(

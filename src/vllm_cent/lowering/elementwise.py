@@ -10,11 +10,16 @@ __all__ = ["CentAccumulatePlan", "lower_accumulate"]
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CentAccumulatePlan:
-    """Bind an elementwise addition to two Shared Buffer vectors.
+    """Describe an in-place addition, ``destination += source``.
+
+    Both vectors must already contain their inputs. The destination is
+    overwritten, so the caller must preserve its old contents separately if
+    another operation still needs them.
 
     Attributes:
-        destination: Zero-padded first input and destination vector.
-        source: Zero-padded second input vector.
+        destination: Initialized first input; these same slots receive the sum.
+        source: Initialized second input with the same logical size and padding
+            positions as the destination.
     """
 
     destination: CentSharedBufferVector
@@ -39,7 +44,8 @@ def lower_accumulate(
 
     Args:
         builder: Program builder that receives the ACC instruction.
-        plan: Vector size and Shared Buffer bindings for the addition.
+        plan: Locations of both input vectors and their common layout; the
+            destination binding also identifies where the sum will be written.
 
     Raises:
         ValueError: If the vector's burst width differs from the target.

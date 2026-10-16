@@ -1,9 +1,16 @@
-"""Lower transformers decode attention into CENT instructions."""
+"""Emit the implemented attention stages for one newly decoded token.
+
+A query asks which earlier tokens matter; keys describe those tokens, and
+values carry the information to combine. The key/value (KV) cache retains keys
+and values from previous steps. Multiple query heads can share one KV head.
+The plans below describe storage and command order. Rotation, softmax, and
+several result-packing steps remain incomplete, as documented at each lowerer.
+"""
 
 from dataclasses import dataclass, fields
 
 from ...cent import (
-    BANKS_PER_PU,
+    BANKS_PER_GROUP,
     CentChannelSet,
     CentProgramBuilder,
     CentMemoryAddress,
@@ -49,7 +56,7 @@ __all__ = [
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class TransformerAttentionSpec:
-    """Describe one transformer decode-attention operation.
+    """Describe the head sizes and token range for one attention step.
 
     Attributes:
         hidden_size: Values in the query projection.
@@ -57,9 +64,16 @@ class TransformerAttentionSpec:
         num_kv_heads: Distinct key and value heads.
         head_size: Values in one attention head.
         kv_width: Values in all distinct key or value heads.
-        repeat_count: Query heads that share one key/value head.
-        sequence_length: Tokens visible to the current decode step.
+        repeat_count: Number of query heads sharing each key/value head; used
+            to repeat score and output calculations without duplicating KV data.
+        sequence_length: Number of visible tokens, including the new token
+            whose key and value will be appended to the cache.
         max_sequence_length: Token positions reserved in the KV cache.
+
+    Examples:
+        For eight query heads sharing two key/value heads, ``repeat_count`` is
+        four: four queries reuse each cached key/value head. If each head has
+        sixteen values, the query width is 128 and the key/value width is 32.
     """
 
     hidden_size: int
@@ -92,7 +106,11 @@ class TransformerAttentionSpec:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class TransformerAttentionRows:
-    """DRAM regions used by transformer attention lowering.
+    """Locate attention workspaces and persistent cached tokens in DRAM.
+
+    Each range supplies row numbers; the stage-specific plans decide which
+    channels and banks use those rows. Keys and values use different layouts
+    because later matrix multiplications traverse them in different directions.
 
     Attributes:
         query: Rows used while rotating the query.
@@ -111,7 +129,11 @@ class TransformerAttentionRows:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class TransformerAttentionBuffers:
-    """Shared Buffer regions passed between attention stages.
+    """Reserve Shared Buffer slots for the inputs and outputs of attention.
+
+    These are raw spans of storage, not guarantees of initialized vectors.
+    In particular, accumulator results still need a defined packing step before
+    a later stage can assume which lane contains which head or token.
 
     Attributes:
         query: Slots containing Q and then its rotated form.
@@ -130,18 +152,25 @@ class TransformerAttentionBuffers:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class RotaryEmbeddingPlan:
-    """Describe the physical layout used by rotary embedding lowering.
+    """Choose the bank groups and workspaces for query/key position encoding.
+
+    Rotary position embedding (RoPE) rotates pairs of values using the token's
+    position. The current lowerer emits multiplication only; it does not yet
+    supply the sine/cosine operands or combine signed products. Each processing
+    unit (PU) uses a group of four DRAM banks.
 
     Attributes:
-        spec: Logical transformer dimensions and decode lengths.
+        spec: Head counts, values per head, current token count, and reserved
+            cache length; these determine how much work each loop emits.
         rows: DRAM regions containing the query and key workspaces.
         buffers: Shared Buffer regions containing query and key values.
         channels: Physical channels that execute both multiply operations.
-        query_values_per_partition: Query values assigned to each used PU group.
-        query_partition_count: PU groups containing query values.
-        key_values_per_partition: Key values assigned to each used PU group.
-        key_partition_count: PU groups containing key values.
-        transfer_channels_required: Channels occupied by one copied vector layout.
+        query_values_per_partition: Query values assigned to each used bank group.
+        query_partition_count: bank groups containing query values.
+        key_values_per_partition: Key values assigned to each used bank group.
+        key_partition_count: bank groups containing key values.
+        transfer_channels_required: Number of channels holding one complete
+            query/key layout; transfers repeat this layout in other channel regions.
     """
 
     spec: TransformerAttentionSpec
@@ -157,23 +186,37 @@ class RotaryEmbeddingPlan:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class KvCacheUpdatePlan:
-    """Describe key and value placement for one KV-cache update.
+    """Locate the new token's key and value within the persistent caches.
+
+    Keys cycle through banks before moving to the next row group. Values
+    instead place token positions along row columns so later dot products can
+    read one value dimension across many tokens.
 
     Attributes:
-        spec: Logical transformer dimensions and decode lengths.
+        spec: Head counts, values per head, current token count, and reserved
+            cache length; these determine how much work each loop emits.
         rows: DRAM regions assigned to the key and value caches.
         buffers: Shared Buffer regions containing the new key and value.
         sequence_index: Zero-based cache position of the new token.
-        key_logical_bank: Block-local bank receiving the new key.
-        key_row_group: Token row group receiving the new key.
+        key_logical_bank: Bank index counting across this block's channels;
+            the builder converts it into a channel number and bank number.
+        key_row_group: Which round through the assigned banks contains this
+            token; multiplying by ``key_rows_per_token`` gives its first row offset.
         key_rows_per_token: Consecutive rows occupied by one key.
-        key_replica_channel_offsets: Channel offsets of every key-cache replica.
+        key_replica_channel_offsets: Channel offsets added to the key's channel
+            to write the same key into each repeated block region.
         value_channels: Channels receiving distinct value-cache heads.
         value_rows_per_dimension: Rows reserved for one head dimension.
         value_sequence_row: Row offset containing this token position.
         value_heads_per_channel: KV-head slots assigned to each channel.
-        value_dimension_iterations: Bank-wide writes needed for one head.
+        value_dimension_iterations: Number of groups of head values, with one
+            value per bank in each group.
         accumulation_register: Scratch register selected by ``WR_ABK``.
+
+    Examples:
+        With four assigned banks, tokens 0 through 3 use the first key row group
+        and token 4 begins the next. A 16-value head spread across eight banks
+        requires ``value_dimension_iterations=2``.
     """
 
     spec: TransformerAttentionSpec
@@ -194,16 +237,23 @@ class KvCacheUpdatePlan:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ScoreGemvPlan:
-    """Describe query-by-key-cache matrix multiplication.
+    """Plan the dot products that compare a query with cached keys.
+
+    One query head produces one score per visible token. Cached tokens are
+    distributed among banks, letting those banks compare different keys with
+    the same query. Buffer offsets and final score packing remain unresolved.
 
     Attributes:
-        spec: Logical transformer dimensions and decode lengths.
+        spec: Head counts, values per head, current token count, and reserved
+            cache length; these determine how much work each loop emits.
         rows: DRAM regions containing cached keys.
         buffers: Shared Buffer regions carrying queries and scores.
         rows_per_key: DRAM rows occupied by one cached key.
         operation_size: Bursts multiplied for one attention head.
         heads_per_row: Key heads packed into one DRAM row.
-        sequence_channels: Channel selection for each token-bank group.
+        sequence_channels: Channels selected for each successive group of
+            cached tokens, including repeated block copies. The final group
+            can use fewer channels when the context does not fill every bank.
         accumulation_register: Register used for each score dot product.
     """
 
@@ -219,17 +269,24 @@ class ScoreGemvPlan:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ScoreTransferPlan:
-    """Describe one direction of attention-score movement.
+    """Choose how to copy a head's scores between a buffer and DRAM banks.
+
+    A score row contains consecutive token positions. Several heads may use
+    separate row ranges in the same bank. The bank position selects an operand
+    or result of the four-bank elementwise multiplier.
 
     Attributes:
-        spec: Logical transformer dimensions and decode lengths.
+        spec: Head counts, values per head, current token count, and reserved
+            cache length; these determine how much work each loop emits.
         rows: DRAM region containing attention scores.
         buffers: Shared Buffer region staging one score row.
-        instruction_type: Transfer direction between the buffer and DRAM.
-        bank_group: Bank position used within every four-bank PU group.
+        instruction_type: ``WriteSingleBank`` for buffer-to-DRAM movement, or
+            ``ReadSingleBank`` for DRAM-to-buffer movement.
+        bank_group: Bank position used within every four-bank group.
         rows_per_score: DRAM rows occupied by one head's scores.
         heads_per_bank: Head slots assigned to each selected bank position.
-        logical_banks: Block-local banks participating in the transfer.
+        logical_banks: Bank indices counting across the block's channels;
+            every selected bank uses the specified position within its PU.
         replica_channel_offsets: Channel offsets of repeated score layouts.
     """
 
@@ -246,7 +303,10 @@ class ScoreTransferPlan:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class SoftmaxPassPlan:
-    """Describe transfers surrounding one partial softmax multiply pass.
+    """Describe the two operand copies and result copy around a multiplication.
+
+    This is one building block of softmax, not a complete conversion of scores
+    to probabilities. Both operand values must exist before their transfers.
 
     Attributes:
         left_input: Transfer placing the first operand in DRAM.
@@ -261,10 +321,15 @@ class SoftmaxPassPlan:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class SoftmaxPlan:
-    """Describe the currently supported multiply passes of softmax.
+    """Plan the score multiplications currently emitted on the softmax path.
+
+    Full softmax would exponentiate scores and divide each by their sum. Those
+    exponentiation, summation, and reciprocal steps are missing; these passes
+    only reserve and move operands around elementwise multiplications.
 
     Attributes:
-        spec: Logical transformer dimensions and decode lengths.
+        spec: Head counts, values per head, current token count, and reserved
+            cache length; these determine how much work each loop emits.
         rows: DRAM region containing attention scores.
         buffers: Shared Buffer region staging attention scores.
         channels: Physical channels executing score multiplication.
@@ -313,18 +378,28 @@ class SoftmaxPlan:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class AttentionOutputPlan:
-    """Describe score-by-value-cache matrix multiplication.
+    """Plan weighted sums of cached values across visible tokens.
+
+    Different banks calculate different output dimensions. The emitted path
+    still lacks complete initialization and buffer offsets, as tracked in the
+    lowerer.
 
     Attributes:
-        spec: Logical transformer dimensions and decode lengths.
+        spec: Head counts, values per head, current token count, and reserved
+            cache length; these determine how much work each loop emits.
         rows: DRAM region containing cached values.
         buffers: Shared Buffer regions carrying scores and outputs.
         channels: Physical channels executing the multiplication.
         rows_per_sequence: Score rows consumed for the current sequence.
         rows_per_dimension: Reserved value-cache rows per head dimension.
         heads_per_channel: KV-head slots assigned to each channel.
-        dimension_iterations: Bank-wide result groups for each attention head.
+        dimension_iterations: Groups of output dimensions processed per head,
+            with one dimension per bank in each group.
         accumulation_register: Register used for each output dot product.
+
+    Examples:
+        For a single output dimension, weights ``[p0, p1]`` and cached values
+        ``[v0, v1]`` should produce ``p0*v0 + p1*v1``.
     """
 
     spec: TransformerAttentionSpec
@@ -340,7 +415,7 @@ class AttentionOutputPlan:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class TransformerAttentionPlan:
-    """Compose every planned stage of transformer decode attention.
+    """Collect the ordered storage plans for one token's attention calculation.
 
     Attributes:
         rotary_embedding: Physical plan for query and key rotation.
@@ -389,7 +464,8 @@ def lower_rotary_embedding(
 
     Args:
         builder: Program builder that receives the new instructions.
-        plan: Checked dimensions, bindings, channels, and PU partitions.
+        plan: Query/key sizes, workspace rows and buffer slots, and the
+            four-bank groups that receive each piece of the vectors.
 
     Raises:
         ValueError: If a planned partition or memory region is invalid.
@@ -401,10 +477,10 @@ def lower_rotary_embedding(
     # and K into pairs, load sine and cosine for this token, and add the signed
     # products. It is still unknown which steps run on RISC-V cores.
 
-    # TODO(ISA): Define how unused PU groups are disabled.
+    # TODO(ISA): Define how unused bank groups are disabled.
     #
     # The transfer plan may use only part of a channel, while EW_MUL runs every
-    # PU group selected by CHmask. Results from unused groups are not read here,
+    # bank group selected by CHmask. Results from unused groups are not read here,
     # but they still consume work and may matter to a future stateful target.
 
     # One CENT processing unit (PU) works with a group of four DRAM banks.
@@ -420,10 +496,10 @@ def lower_rotary_embedding(
         ("transfer_channels_required", plan.transfer_channels_required),
     ):
         require_positive(name, value)
-    if plan.query_partition_count > builder.total_banks // BANKS_PER_PU:
-        raise ValueError("query partitions exceed available PU groups")
-    if plan.key_partition_count > builder.total_banks // BANKS_PER_PU:
-        raise ValueError("key partitions exceed available PU groups")
+    if plan.query_partition_count > builder.total_banks // BANKS_PER_GROUP:
+        raise ValueError("query partitions exceed available bank groups")
+    if plan.key_partition_count > builder.total_banks // BANKS_PER_GROUP:
+        raise ValueError("key partitions exceed available bank groups")
     if plan.transfer_channels_required != builder.placement.channels_per_block:
         raise ValueError("transfer_channels_required must match the block placement")
     builder.channel_set(plan.channels.channels)
@@ -540,7 +616,8 @@ def lower_kv_cache_update(
 
     Args:
         builder: Program builder that receives the cache-write instructions.
-        plan: Checked cache geometry, memory bindings, and channel placement.
+        plan: New token index and the exact bank, row, column grouping, and
+            source-buffer layout used to update its key and value.
 
     Raises:
         ValueError: If the planned cache geometry or memory is invalid.
@@ -630,8 +707,8 @@ def lower_kv_cache_update(
     _require_shared_buffer_capacity("key", buffers.key, key_slots)
 
     # Consecutive tokens go to consecutive banks. After every assigned bank has
-    # one token, storage continues in the next row group. ``copies`` repeats the
-    # key in each equal-sized channel region.
+    # one token, storage continues in the next row group. Replica channel offsets
+    # repeat the key in each equal-sized channel region.
     channel, bank = builder.bank_index(plan.key_logical_bank)
 
     # A key shorter than a DRAM row still needs one row and one write.
@@ -699,11 +776,16 @@ def lower_score_gemv(
     builder: CentProgramBuilder,
     plan: ScoreGemvPlan,
 ) -> None:
-    """Multiply each query head by the stored keys to produce scores.
+    """Emit the current query/key dot-product command sequence.
+
+    The intended result is one score per query head and visible token. This
+    sequence still reuses base buffer addresses between heads; it does not
+    yet establish a complete packed score tensor.
 
     Args:
         builder: Program builder that receives the score instructions.
-        plan: Checked key layout, channel schedule, and buffer bindings.
+        plan: Cached-key row layout, channels holding each group of tokens,
+            query source, and raw score destination.
 
     Raises:
         ValueError: If the planned geometry or a memory region is invalid.
@@ -764,7 +846,7 @@ def lower_score_gemv(
     )
 
     # Several key heads can share one DRAM row. ``heads_per_row`` says how many
-    # fit, and ``mac_size`` says how many bursts make up one head.
+    # fit, and ``operation_size`` counts the bursts that make up one head.
     _require_shared_buffer_capacity("query", buffers.query, plan.operation_size)
     _require_shared_buffer_capacity("scores", buffers.scores, 1)
 
@@ -864,7 +946,7 @@ def _validate_score_transfer(
     for logical_bank in plan.logical_banks:
         if not 0 <= logical_bank < builder.total_banks:
             raise ValueError("logical score bank is outside the block allocation")
-        if logical_bank % BANKS_PER_PU != plan.bank_group:
+        if logical_bank % BANKS_PER_GROUP != plan.bank_group:
             raise ValueError("logical score bank does not match bank_group")
 
     physical_channels = tuple(
@@ -918,7 +1000,7 @@ def _lower_score_transfer(
             for column in range(0, row_size, hardware.burst_length):
                 for logical_bank in plan.logical_banks:
                     head = (
-                        logical_bank // BANKS_PER_PU
+                        logical_bank // BANKS_PER_GROUP
                     ) * plan.heads_per_bank + head_slot
                     if head >= spec.num_attention_heads:
                         break
@@ -969,7 +1051,8 @@ def lower_softmax(
 
     Args:
         builder: Program builder that receives the softmax instructions.
-        plan: Checked score layout, multiply passes, and channel placement.
+        plan: Score rows and buffer slots, operand/result transfers for each
+            multiplication, and the channels on which those passes execute.
 
     Raises:
         ValueError: If the planned score geometry or buffer is invalid.
@@ -1047,11 +1130,16 @@ def lower_attention_output(
     builder: CentProgramBuilder,
     plan: AttentionOutputPlan,
 ) -> None:
-    """Multiply softmax scores by cached values to form attention output.
+    """Emit the current command sequence for combining cached values with scores.
+
+    Scores should already be softmax weights. Correct per-head source offsets,
+    partial-sum initialization, and packed output positions remain unfinished;
+    this function alone does not produce a complete numerical attention result.
 
     Args:
         builder: Program builder that receives the output instructions.
-        plan: Checked value-cache geometry, channels, and buffer bindings.
+        plan: Value-cache rows, channels, score source, and raw output slots;
+            its dimension counts determine the sequence of dot products.
 
     Raises:
         ValueError: If the planned geometry or a buffer is invalid.

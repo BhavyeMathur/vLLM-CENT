@@ -1,4 +1,4 @@
-"""Stable failures raised by the CENT functional simulator."""
+"""Report simulator failures with the device, instruction, and memory location."""
 
 from typing import TypeAlias
 
@@ -20,10 +20,10 @@ __all__ = [
 ]
 
 CentSimulationLocation: TypeAlias = (
-        CentMemoryAddress
-        | CentSharedBufferAddress
-        | CentGlobalBufferAddress
-        | CentBankRegisterAddress
+    CentMemoryAddress
+    | CentSharedBufferAddress
+    | CentGlobalBufferAddress
+    | CentBankRegisterAddress
 )
 
 
@@ -36,7 +36,7 @@ class CentSimulationError(Exception):
         instruction_index: Zero-based program position, when an instruction was
             active.
         instruction: Typed instruction associated with the failure, when any.
-        location: Typed state location associated with the failure, when any.
+        location: Memory or register address where the failure occurred, if known.
     """
 
     reason: str
@@ -46,13 +46,13 @@ class CentSimulationError(Exception):
     location: CentSimulationLocation | None
 
     def __init__(
-            self,
-            reason: str,
-            *,
-            device_id: int = 0,
-            instruction_index: int | None = None,
-            instruction: CentInstruction | None = None,
-            location: CentSimulationLocation | None = None,
+        self,
+        reason: str,
+        *,
+        device_id: int = 0,
+        instruction_index: int | None = None,
+        instruction: CentInstruction | None = None,
+        location: CentSimulationLocation | None = None,
     ) -> None:
         """Create one structured simulator failure.
 
@@ -89,7 +89,7 @@ class CentSimulationError(Exception):
 
 
 class CentUnsupportedSemanticsError(CentSimulationError):
-    """Report an instruction or configuration without defined semantics."""
+    """Report an instruction or configuration the simulator cannot interpret."""
 
 
 class CentManifestError(CentSimulationError):
@@ -97,8 +97,8 @@ class CentManifestError(CentSimulationError):
 
 
 class CentUninitializedReadError(CentSimulationError):
-    """Report a read whose complete source has not been initialized."""
+    """Report a read that includes at least one scalar never written before."""
 
 
 class CentExecutionFault(CentSimulationError):  # noqa: N818
-    """Report a dynamic execution constraint that the program violates."""
+    """Report arithmetic or destination validation that fails while running."""

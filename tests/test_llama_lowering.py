@@ -1,4 +1,8 @@
-"""Tests for Llama planning and transformer-operation lowering."""
+"""Check Llama layout choices and the commands emitted from those choices.
+
+The small targets make bank indices and row counts hand-checkable. These tests
+verify instruction structure; unsupported numerical stages remain unsupported.
+"""
 
 import unittest
 from collections import Counter
@@ -101,7 +105,7 @@ def make_request(
         num_channels: Physical channel count.
         channels_per_block: Channels assigned to one block.
         sequence_length: Current context length.
-        max_sequence_length: Reserved context length.
+        max_sequence_length: Number of token positions reserved in the cache.
 
     Returns:
         Request using four banks, sixteen columns, and four-value bursts.
@@ -193,7 +197,7 @@ class ContextAndLayoutTests(unittest.TestCase):
         # hidden_size / query_heads = 64 / 4 = 16 values per head. Two KV
         # heads give a 2 * 16 = 32-value KV width and each is shared by two
         # query heads. Two channels * four banks gives eight block-local banks;
-        # two channels * one four-bank PU * 16 columns gives capacity 32.
+        # two channels * one four-bank group * 16 columns gives capacity 32.
         self.assertEqual(
             context,
             _LlamaCompileContext(
@@ -326,7 +330,7 @@ class ContextAndLayoutTests(unittest.TestCase):
             )
 
     def test_row_counts_reserve_multirow_rotary_partitions(self) -> None:
-        """Size Q and K workspaces from their largest PU partition."""
+        """Size Q and K workspaces from their largest bank-group partition."""
 
         context = _create_context(
             make_request(
@@ -337,7 +341,7 @@ class ContextAndLayoutTests(unittest.TestCase):
             )
         )
 
-        # One four-bank PU receives all 32 query values. A DRAM row holds 16,
+        # One four-bank group receives all 32 query values. A DRAM row holds 16,
         # so both Q and K workspaces reserve two rows instead of assuming one.
         self.assertEqual(_row_counts(context).projection, 2)
 
@@ -355,9 +359,9 @@ class ContextAndLayoutTests(unittest.TestCase):
             allocator.reserve(0)
 
     def test_grouped_buffer_slots_includes_partition_padding(self) -> None:
-        """Round each PU partition to its own Shared Buffer slot."""
+        """Round each bank-group partition to its own Shared Buffer slot."""
 
-        # Ten values split among four groups become 3, 3, 3, and 1 values.
+        # Ten values split among four groups become 3, 3, 2, and 2 values.
         # With four values per slot, every group still occupies one slot.
         self.assertEqual(
             plan_partitioned_vector(10, 4, 4),
@@ -469,7 +473,8 @@ class NormalizationAndFeedForwardTests(unittest.TestCase):
         )
         norm_counts = Counter(i.opcode for i in norm_builder.instructions)
         # RMSNorm copies its bank result into the Global Buffer once, then
-        # copies that scalar scale back to banks once before the final multiply.
+        # copies the scaled vector to the other operand bank before multiplying
+        # by learned weights. This checks the transfer structure, not its values.
         self.assertEqual(norm_counts[CentOpcode.COPY_BANK_TO_GLOBAL_BUFFER], 1)
         self.assertEqual(norm_counts[CentOpcode.COPY_GLOBAL_BUFFER_TO_BANK], 1)
 
@@ -609,7 +614,7 @@ class NormalizationAndFeedForwardTests(unittest.TestCase):
             )
 
     def test_silu_product_obeys_a_single_partition_plan(self) -> None:
-        """Keep a small FFN chunk on one PU when two PUs are available."""
+        """Keep a small FFN chunk on one bank group when two groups are available."""
 
         request = make_request(
             num_channels=2,
@@ -628,7 +633,7 @@ class NormalizationAndFeedForwardTests(unittest.TestCase):
                 ),
             ),
             # The alternative layout uses only channel zero. The baseline plan
-            # uses both channels because each contains one four-bank PU.
+            # uses both channels because each contains one four-bank group.
             channels=CentChannelSet(channels=(0,)),
         )
         builder = CentProgramBuilder(request.hardware, request.placement)
@@ -749,7 +754,7 @@ class AttentionLoweringTests(unittest.TestCase):
         )
 
         # The first softmax input occupies bank position zero in every
-        # four-bank PU group. Testing the transfer helper directly keeps this
+        # four-bank group. Testing the transfer helper directly keeps this
         # bank-role calculation visible.
         self.assertEqual(
             _create_score_transfer_plan(
@@ -866,7 +871,7 @@ class AttentionLoweringTests(unittest.TestCase):
         self.assertEqual(counts[CentOpcode.ELEMENTWISE_MULTIPLY], 2)
 
     def test_rotary_embedding_obeys_a_single_partition_plan(self) -> None:
-        """Keep query and key on one PU when the block owns two PUs."""
+        """Keep query and key on one bank group when the block owns two groups."""
 
         context, layout, builder = make_state(
             num_channels=2,
@@ -884,7 +889,7 @@ class AttentionLoweringTests(unittest.TestCase):
 
         lower_rotary_embedding(builder, plan)
 
-        # The baseline uses one PU in each channel. This exact instruction list
+        # The baseline uses one bank group in each channel. This instruction list
         # proves the supplied plan keeps both vectors on channel zero instead.
         self.assertEqual(
             builder.instructions,
@@ -947,6 +952,9 @@ class AttentionLoweringTests(unittest.TestCase):
     def test_rotary_embedding_splits_multirow_query_arithmetic(self) -> None:
         """Emit one row-local multiply for each query and key row."""
 
+        # Thirty-two query values fill rows 38 and 39; the one sixteen-value
+        # key head fills row 40. Each sixteen-value row requires four bursts.
+
         context, layout, builder = make_state(
             hidden_size=32,
             num_attention_heads=2,
@@ -985,7 +993,7 @@ class AttentionLoweringTests(unittest.TestCase):
         )
 
     def test_rotary_embedding_rejects_an_undersized_query_span(self) -> None:
-        """Reject a query buffer that cannot hold all PU partitions."""
+        """Reject a query buffer missing slots required by its bank groups."""
 
         context, layout, builder = make_state()
         plan = make_attention_plan(context, layout)
@@ -1024,7 +1032,7 @@ class AttentionLoweringTests(unittest.TestCase):
             ),
         )
 
-        # This one-channel target has one PU group, so all 32 query values need
+        # This one-channel target has one bank group, so all 32 query values need
         # two sixteen-value DRAM rows. Replacing its planned two-row range with
         # one row must be rejected before any instructions are emitted.
         with self.assertRaisesRegex(ValueError, "query rows needs 2"):
@@ -1090,6 +1098,10 @@ class AttentionLoweringTests(unittest.TestCase):
 
     def test_attention_stages_reject_undersized_input_spans(self) -> None:
         """Check the buffer capacity required by each attention stage."""
+
+        # Each sixteen-value operand needs four four-lane slots. Replace it with
+        # one slot, keeping all references to that buffer consistent, so failure
+        # comes from capacity rather than disagreement between stage plans.
 
         context, layout, _ = make_state(sequence_length=16)
         plan = make_attention_plan(context, layout)
@@ -1174,6 +1186,12 @@ class AttentionLoweringTests(unittest.TestCase):
 
     def test_attention_lowerers_reject_inconsistent_physical_plans(self) -> None:
         """Validate every explicit geometry before emitting instructions."""
+
+        # Start with valid plans, then change one relationship at a time. The
+        # default target has one four-bank group and a sixteen-value row: two
+        # rotary pieces or a fifteen-value piece cannot cover its planned vector.
+        # Later cases similarly break cache positions, channel selections, or
+        # row counts without allowing a lowerer to silently choose a new layout.
 
         context, layout, _ = make_state()
         plan = make_attention_plan(context, layout)
@@ -1437,7 +1455,8 @@ class AttentionLoweringTests(unittest.TestCase):
             if isinstance(instruction, MacAllBanks)
         ]
 
-        # Four heads over hidden width 32 produce eight-value heads. Two heads
+        # The preceding tensor allocations place keys at row 58. Four heads
+        # over hidden width 32 produce eight-value heads. Two heads
         # therefore fit in each 16-column row, starting at columns zero and
         # eight. The 32-value KV width occupies two rows, repeating the pair.
         self.assertEqual(
@@ -1533,7 +1552,8 @@ class AttentionLoweringTests(unittest.TestCase):
         plan = make_attention_plan(context, layout)
 
         # The first twelve-token group uses all three channels in both copies.
-        # Five remaining tokens need two channels in each three-channel copy.
+        # Each channel holds four token positions, so five remaining tokens
+        # need two channels in each copy: (0, 1) and (3, 4).
         self.assertEqual(
             plan.score_gemv.sequence_channels,
             (
@@ -1658,8 +1678,12 @@ class LlamaOrchestrationTests(unittest.TestCase):
         )
         _lower_feed_forward(feed_forward_builder, plan)
 
-        # The tiny block has 102 attention instructions and 69 FFN
-        # instructions. Each stage owns exactly one residual ACC operation.
+        # Attention: 12 normalization + 52 for Q/K/V/output projections +
+        # 6 rotary + 5 cache updates + 4 score + 8 softmax + 13 attention-output
+        # commands + 1 residual add + 1 residual spill = 102.
+        # Feed-forward: 12 normalization + 21 gate-projection/activation +
+        # 13 up-projection + 8 gate-product + 13 down-projection +
+        # 1 residual reload + 1 residual add = 69. These are structural counts.
         self.assertEqual(len(attention_builder.instructions), 102)
         self.assertEqual(len(feed_forward_builder.instructions), 69)
         self.assertEqual(

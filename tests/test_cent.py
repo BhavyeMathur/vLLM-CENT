@@ -56,7 +56,8 @@ def hardware() -> CentHardwareSpec:
 
     Returns:
         Two channels, four banks, eight rows, sixteen BF16 columns per row,
-        four BF16 values per micro-operation, and eight Shared Buffer slots.
+        four values per transfer, a sixteen-value Global Buffer, and eight
+        Shared Buffer slots. Scalar columns are the current software convention.
     """
 
     return CentHardwareSpec(
@@ -64,6 +65,7 @@ def hardware() -> CentHardwareSpec:
         num_banks=4,
         dram_rows=8,
         dram_columns=16,
+        global_buffer_columns=16,
         burst_length=4,
         accumulator_slots_per_bank=2,
         sigmoid_activation_function_id=0,
@@ -117,7 +119,8 @@ class PrimitiveValueTests(unittest.TestCase):
         self.assertEqual(channels, CentChannelSet(channels=(0, 3)))
         self.assertEqual(channels, CentChannelSet(channels=(3, 0)))
         self.assertEqual(hash(channels), hash(CentChannelSet(channels=(3, 0))))
-        # CHmask uses one bit per channel: channels 0 and 3 set binary 1001,
+        # The inspection renderer uses bit n for channel n. Channels 0 and 3
+        # set binary 1001 (the AiM timing renderer uses a different bit order),
         # which is rendered as hexadecimal 0x9.
         self.assertEqual(render_channel_mask(channels), "0x9")
         for invalid in ((), (0, 0), (-1,)):
@@ -442,7 +445,7 @@ class HardwareValidationTests(unittest.TestCase):
         channels = CentChannelSet(channels=(0,))
         slot = CentSharedBufferAddress(slot=0)
         # Each otherwise-valid instruction violates the capacity associated
-        # with one operand: WR_SBK and WR_GB cross the 16-column row, WR_ABK
+        # with one operand: WR_SBK and WR_GB exceed their 16-value buffers, WR_ABK
         # selects nonexistent channel 2, RD_MAC selects nonexistent register 2,
         # and EXP crosses the eight-slot Shared Buffer from slot 7.
         invalid = (
@@ -489,15 +492,16 @@ class HardwareValidationTests(unittest.TestCase):
 class ProgramAndRenderingTests(unittest.TestCase):
     """Test CENT programs and assembly rendering."""
 
-    def test_program_is_a_nonempty_sequence_of_paper_instructions(self) -> None:
-        """Require at least one instruction in a program."""
+    def test_program_preserves_instruction_order_and_allows_no_work(self) -> None:
+        """Allow empty instruction sequences for identity and reshape programs."""
 
         instruction = ReceiveCxl()
         program = CentProgram(hardware=hardware(), instructions=(instruction,))
         self.assertEqual(program.hardware, hardware())
         self.assertEqual(program.instructions, (instruction,))
-        with self.assertRaises(ValueError):
-            CentProgram(hardware=hardware(), instructions=())
+        self.assertEqual(
+            CentProgram(hardware=hardware(), instructions=()).instructions, ()
+        )
 
     def test_program_renderer_serializes_every_program_instruction(self) -> None:
         """Render every program instruction in order."""

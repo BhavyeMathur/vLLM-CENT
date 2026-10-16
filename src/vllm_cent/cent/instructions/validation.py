@@ -1,4 +1,10 @@
-"""Check typed CENT instructions against one hardware target."""
+"""Check instruction addresses and transfer sizes against one target.
+
+Constructors reject invalid individual operands. This module checks their
+relationships: whether selected channels exist, registers fit, and complete
+transfers stay inside storage. Passing these checks does not prove numerical
+semantics or input initialization.
+"""
 
 from .address import (
     CentChannelSet,
@@ -11,6 +17,7 @@ from .arithmetic import (
     ElementwiseMultiply,
     Exponent,
     MacAllBanks,
+    MacOperandSource,
     Reduction,
     RunRiscV,
 )
@@ -97,7 +104,7 @@ def _validate_row_column(row: int, column: int, hardware: CentHardwareSpec) -> N
 
     Args:
         row: DRAM row number, or ``RO``.
-        column: Scalar position in the row, or ``CO``.
+        column: Scalar position in the row under the current Python convention.
         hardware: Device that defines the row and column limits.
 
     Raises:
@@ -118,18 +125,21 @@ def _validate_operation_span(
 
     Args:
         operation_size: Number of burst-sized operations, or ``OPsize``.
-        column: First scalar position in the row, or ``CO``.
+        column: First scalar position in the row under the current Python convention.
         hardware: Device that defines burst and row widths.
 
     Raises:
         ValueError: If the generated micro-operations cross a row boundary.
     """
 
-    # TODO(paper): We treat CO as a scalar index and stop at row boundaries. We
-    # need to confirm its unit, alignment, and whether OPsize may wrap rows.
+    # TODO(address units): This API counts scalars, but AiM sources describe CO
+    # as a burst-column index. Audit and migrate addresses, builders, renderers,
+    # and tests together; see docs/research/sk-hynix-aim.md. Row wrapping and
+    # alignment also need an explicit target contract.
 
     # Each operation advances by one burst. Ending exactly at the row width is
-    # valid; ending after it crosses the row boundary.
+    # valid; ending after it crosses the row boundary. With four-value bursts,
+    # column 8 and OPsize 2 occupy [8:16], which fits a sixteen-value row.
     span_end = column + operation_size * hardware.burst_length
     if span_end > hardware.dram_columns:
         raise ValueError("instruction micro-operations cross a DRAM row")
@@ -175,6 +185,13 @@ def validate_instruction(
         ValueError: If an operand is incompatible with the target.
     """
 
+    # Import here because reference services reuse the instruction address types.
+    from ..reference import ReferenceInstruction, validate_reference
+
+    if isinstance(instruction, ReferenceInstruction):
+        validate_reference(instruction, hardware)
+        return
+
     # A single-bank transfer advances through DRAM bursts and Shared Buffer
     # slots. A write reads Rs; a read writes Rd.
     if isinstance(instruction, (WriteSingleBank, ReadSingleBank)):
@@ -201,32 +218,34 @@ def validate_instruction(
         _validate_accumulation_register(instruction.accumulation_register, hardware)
         return
 
-    # Every instruction in this group contains a CHmask.
+    # These categories overlap: a copy has channels, DRAM storage, and Global
+    # Buffer storage. Validate each relevant category before checking its
+    # Shared Buffer or register fields below.
     if isinstance(
-            instruction,
-            (
-                    MacAllBanks,
-                    ElementwiseMultiply,
-                    ApplyActivation,
-                    CopyBankToGlobalBuffer,
-                    CopyGlobalBufferToBank,
-                    WriteBias,
-                    ReadActivation,
-                    ReadMac,
-                    WriteGlobalBuffer,
-            ),
+        instruction,
+        (
+            MacAllBanks,
+            ElementwiseMultiply,
+            ApplyActivation,
+            CopyBankToGlobalBuffer,
+            CopyGlobalBufferToBank,
+            WriteBias,
+            ReadActivation,
+            ReadMac,
+            WriteGlobalBuffer,
+        ),
     ):
         validate_channels(instruction.channels, hardware)
 
     # These instructions start at RO/CO and advance by one burst per operation.
     if isinstance(
-            instruction,
-            (
-                    MacAllBanks,
-                    ElementwiseMultiply,
-                    CopyBankToGlobalBuffer,
-                    CopyGlobalBufferToBank,
-            ),
+        instruction,
+        (
+            MacAllBanks,
+            ElementwiseMultiply,
+            CopyBankToGlobalBuffer,
+            CopyGlobalBufferToBank,
+        ),
     ):
         _validate_row_column(instruction.row, instruction.column, hardware)
         _validate_operation_span(
@@ -234,15 +253,30 @@ def validate_instruction(
         )
 
     if (
-            isinstance(instruction, (CopyBankToGlobalBuffer, CopyGlobalBufferToBank))
-            and instruction.bank >= hardware.num_banks
+        isinstance(instruction, (CopyBankToGlobalBuffer, CopyGlobalBufferToBank))
+        and instruction.bank >= hardware.num_banks
     ):
         raise ValueError("copy bank is outside the target channel")
 
+    # A copy must fit both storage spaces even when their capacities differ.
+    if isinstance(instruction, (CopyBankToGlobalBuffer, CopyGlobalBufferToBank)):
+        _validate_global_buffer_span(
+            instruction.column, instruction.operation_size, hardware
+        )
+
+    # Global-buffer MAC reads the same scalar column span from both spaces.
+    if (
+        isinstance(instruction, MacAllBanks)
+        and instruction.operand_source is MacOperandSource.GLOBAL_BUFFER
+    ):
+        _validate_global_buffer_span(
+            instruction.column, instruction.operation_size, hardware
+        )
+
     # Regid selects a MAC register, not a DRAM or Shared Buffer address.
     if isinstance(
-            instruction,
-            (MacAllBanks, ApplyActivation, ReadActivation, ReadMac),
+        instruction,
+        (MacAllBanks, ApplyActivation, ReadActivation, ReadMac),
     ):
         _validate_accumulation_register(instruction.accumulation_register, hardware)
 
@@ -252,14 +286,11 @@ def validate_instruction(
     elif isinstance(instruction, (ReadActivation, ReadMac)):
         validate_shared_buffer_address(instruction.destination, hardware)
     elif isinstance(instruction, WriteGlobalBuffer):
-        # TODO(architecture): We check this Global Buffer span with the DRAM row
-        # width. We need a separate Global Buffer capacity in the hardware spec.
-
         _validate_shared_buffer_span(
             instruction.source, instruction.operation_size, hardware
         )
-        _validate_operation_span(
-            instruction.operation_size, instruction.column, hardware
+        _validate_global_buffer_span(
+            instruction.column, instruction.operation_size, hardware
         )
     elif isinstance(instruction, (Exponent, Reduction, Accumulate, RunRiscV)):
         # TODO(paper/ABI): We assume equal input and output slot counts. We need
@@ -323,3 +354,22 @@ def _validate_accumulation_register(register: int, hardware: CentHardwareSpec) -
     # Regid and Shared Buffer slots are separate address spaces.
     if register >= hardware.accumulator_slots_per_bank:
         raise ValueError("accumulation register is outside the target PU")
+
+
+def _validate_global_buffer_span(
+    column: int, operation_size: int, hardware: CentHardwareSpec
+) -> None:
+    """Check burst transfers against the independent Global Buffer capacity.
+
+    Args:
+        column: First scalar column in the channel's Global Buffer.
+        operation_size: Number of complete bursts transferred.
+        hardware: Target geometry supplying burst width and buffer capacity.
+
+    Raises:
+        ValueError: If the transfer extends beyond the Global Buffer.
+    """
+    # Convert the burst count to scalar values before adding the starting
+    # offset. The Global Buffer has its own capacity, independent of a DRAM row.
+    if column + operation_size * hardware.burst_length > hardware.global_buffer_columns:
+        raise ValueError("instruction exceeds the target Global Buffer")

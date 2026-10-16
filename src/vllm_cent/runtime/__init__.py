@@ -1,6 +1,7 @@
-"""Reusable runtime-data contracts for CENT executables."""
+"""Connect program input and output names to locations in CENT memory."""
 
 from .bindings import (
+    CentAccumulatorRegion,
     CentDramRegion,
     CentGlobalBufferRegion,
     CentInputBinding,
@@ -12,6 +13,7 @@ from .bindings import (
 from .executable import CentExecutable, CentExecutionManifest
 
 __all__ = [
+    "CentAccumulatorRegion",
     "CentDramRegion",
     "CentExecutable",
     "CentExecutionManifest",
