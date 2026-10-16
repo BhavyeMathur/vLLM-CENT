@@ -1,4 +1,10 @@
-"""Compile Python tensor graphs through separate, checked stages."""
+"""Compile tensor graphs through separate, checked stages.
+
+``compile_graph()`` starts with Python graph objects. ``compile_mlir()`` first imports the
+supported MLIR addition/multiplication subset, then takes the same path. Both return a
+program that can be run repeatedly with new tensor values. This pipeline
+coexists with the older model-specific structural compiler.
+"""
 
 from .artifact import CompiledArtifact, compile_target
 from .ir import CapabilityProfile, ParallelPlan, SemanticGraph, legalize, shard
@@ -33,6 +39,7 @@ __all__ = [
     "allocate_storage",
     "baseline_mapping",
     "compile_graph",
+    "compile_mlir",
     "compile_target",
     "emit_program",
     "lower_target",
@@ -94,3 +101,28 @@ def compile_graph(
     request = MappingRequest(graph=device, target=target, constraints=constraints)
     selected = mapper(request) if mapping is None else mapping
     return compile_target(lower_target(request, selected))
+
+
+def compile_mlir(text: str, target: CentTargetProfile) -> CompiledArtifact:
+    """Read a supported MLIR arithmetic graph and compile it for CENT.
+
+    MLIR is a compiler framework with its own typed operation format. The bridge
+    uses its native parser and verifier, then creates the same Python graph that
+    ``compile_graph()`` accepts. Later device and target passes still run in Python.
+
+    Args:
+        text: MLIR assembly containing one function with static F32 tensor
+            additions, multiplications, and a return. Copy and reshape currently
+            require the direct Python graph API.
+        target: Hardware sizes and command limits for the resulting CENT program.
+
+    Returns:
+        Compiled artifact runnable with the simulator's Python-float reference math.
+
+    Raises:
+        RuntimeError: If the optional native MLIR toolchain is unavailable.
+        ValueError: If parsing, graph verification, or a later lowering check fails.
+    """
+    from ..ir_mlir import from_mlir
+
+    return compile_graph(from_mlir(text), target)
