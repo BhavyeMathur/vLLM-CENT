@@ -8,7 +8,7 @@ from torch.export import ExportedProgram
 
 # Imported for its side effect: the model's forward calls torch.ops.aloi.*,
 # which exist only after this module has registered them.
-from . import custom_ops  # noqa: F401
+from . import aloi  # noqa: F401
 
 __all__ = ["export_model"]
 

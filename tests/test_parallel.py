@@ -84,18 +84,24 @@ def _annotated() -> Module:
     return PassManager((AnnotateRolesAndAxes(_q_o_annotations()),)).run(_q_o_module())
 
 
-def _sharded(plan: ParallelPlan) -> Module:
+# The model's head count, as a model's axis sizes would give it.
+HEAD_SIZES = {"q_head": HEADS}
+
+
+def _sharded(plan: ParallelPlan, axis_sizes: dict[str, int] | None = None) -> Module:
     """Annotate the q/o module and apply ``plan`` through a verifying manager.
 
     Args:
         plan: Plan to apply.
+        axis_sizes: Head counts; 4 query heads unless given.
 
     Returns:
         The sharded module.
     """
 
+    sizes = HEAD_SIZES if axis_sizes is None else axis_sizes
     return PassManager(
-        (AnnotateRolesAndAxes(_q_o_annotations()), ApplyTensorParallel(plan))
+        (AnnotateRolesAndAxes(_q_o_annotations()), ApplyTensorParallel(plan, sizes))
     ).run(_q_o_module())
 
 
@@ -110,7 +116,7 @@ def _head_plan(tp: int = 2) -> ParallelPlan:
     """
 
     plan = ParallelPlan(tp=tp)
-    plan.split("q_head", size=HEADS)
+    plan.split("q_head")
     return plan
 
 
@@ -142,19 +148,17 @@ def _single_projection(out_size: int) -> Module:
 class ParallelPlanTest(unittest.TestCase):
     """The builder records rules and exceptions and rejects conflicts early."""
 
-    def test_records_rules_sizes_and_exceptions(self) -> None:
+    def test_records_rules_and_exceptions(self) -> None:
         """Rules keep their order; exceptions map names to placements."""
 
         plan = ParallelPlan(tp=8)
-        plan.split("q_head", size=64)
+        plan.split("q_head")
         plan.split("intermediate")
         plan.replicate("k_proj.weight", "v_proj.weight")
         plan.split("hidden", only=("lm_head.weight",))
 
         self.assertEqual(plan.tp, 8)
         self.assertEqual(plan.split_axes, ("q_head", "intermediate"))
-        self.assertEqual(plan.axis_size("q_head"), 64)
-        self.assertIsNone(plan.axis_size("intermediate"))
         self.assertEqual(
             dict(plan.exceptions),
             {
@@ -186,17 +190,6 @@ class ParallelPlanTest(unittest.TestCase):
 
             ParallelPlan(tp=0)
 
-        def uneven_heads(_: ParallelPlan) -> None:
-            """8 KV heads over 16 ranks would give each half a head."""
-
-            ParallelPlan(tp=16).split("kv_head", size=8)
-
-        def conflicting_size(plan: ParallelPlan) -> None:
-            """One axis cannot have two sizes."""
-
-            plan.split("q_head", size=64)
-            plan.split("q_head", size=32, only=("wq",))
-
         def split_twice(plan: ParallelPlan) -> None:
             """The same rule written twice."""
 
@@ -227,8 +220,6 @@ class ParallelPlanTest(unittest.TestCase):
 
         for build in (
             zero_ranks,
-            uneven_heads,
-            conflicting_size,
             split_twice,
             redundant_only,
             empty_only,
@@ -316,30 +307,55 @@ class ApplyTensorParallelTest(unittest.TestCase):
         no_size = ParallelPlan(tp=2)
         no_size.split("q_head")
         typo_axis = ParallelPlan(tp=2)
-        typo_axis.split("q_haed", size=HEADS)
+        typo_axis.split("q_haed")
         typo_name = _head_plan()
         typo_name.replicate("wk")
-        # 16 entries cannot be 6 whole heads.
-        partial_heads = ParallelPlan(tp=2)
-        partial_heads.split("q_head", size=6)
         axis_not_on_tensor = ParallelPlan(tp=2)
-        axis_not_on_tensor.split("kv_head", size=2, only=("wq",))
+        axis_not_on_tensor.split("kv_head", only=("wq",))
         # Wq's dims are q_head*head_dim and hidden: both would be split.
         two_dims = _head_plan()
         two_dims.split("hidden")
 
+        # (plan, axis sizes, message)
         cases = {
-            "packed axis without size": (no_size, r"plan\.split\('q_head', size=\.\.\.\)"),
-            "misspelled axis": (typo_axis, r"split axes match no tensor: \['q_haed'\]"),
-            "misspelled tensor": (typo_name, r"exceptions name unknown tensors: \['wk'\]"),
-            "dimension not whole heads": (partial_heads, "not a whole number of q_head"),
-            "axis missing on tensor": (axis_not_on_tensor, "%wq: axis 'kv_head'"),
-            "two split dimensions": (two_dims, "only one dimension can be split"),
+            "packed axis without size": (no_size, {}, "has no size"),
+            "misspelled axis": (
+                typo_axis,
+                HEAD_SIZES,
+                r"split axes match no tensor: \['q_haed'\]",
+            ),
+            "misspelled tensor": (
+                typo_name,
+                HEAD_SIZES,
+                r"exceptions name unknown tensors: \['wk'\]",
+            ),
+            # 16 entries cannot be 6 whole heads.
+            "dimension not whole heads": (
+                _head_plan(),
+                {"q_head": 6},
+                "not a whole number of q_head",
+            ),
+            # 4 heads over 8 ranks would give each half a head.
+            "heads do not divide over tp": (
+                _head_plan(tp=8),
+                HEAD_SIZES,
+                "q_head of size 4 cannot be split over tp=8",
+            ),
+            "axis missing on tensor": (
+                axis_not_on_tensor,
+                HEAD_SIZES,
+                "%wq: axis 'kv_head'",
+            ),
+            "two split dimensions": (
+                two_dims,
+                HEAD_SIZES,
+                "only one dimension can be split",
+            ),
         }
-        for name, (plan, message) in cases.items():
+        for name, (plan, sizes, message) in cases.items():
             with self.subTest(case=name):
                 with self.assertRaisesRegex(ValueError, message):
-                    _sharded(plan)
+                    _sharded(plan, sizes)
 
     def test_plain_axis_must_divide(self) -> None:
         """6 rows cannot be split over 4 ranks."""
@@ -366,7 +382,7 @@ class ApplyTensorParallelTest(unittest.TestCase):
         """Editing the plan after creating the pass does not change the pass."""
 
         plan = _head_plan()
-        apply = ApplyTensorParallel(plan)
+        apply = ApplyTensorParallel(plan, HEAD_SIZES)
         plan.replicate("wq", "wo")
         sharded = PassManager((apply,)).run(_annotated())
         self.assertIn("aloi.all_reduce", print_module(sharded))
@@ -376,7 +392,7 @@ class ApplyTensorParallelTest(unittest.TestCase):
 
         module = _annotated()
         before = print_module(module)
-        PassManager((ApplyTensorParallel(_head_plan()),)).run(module)
+        PassManager((ApplyTensorParallel(_head_plan(), HEAD_SIZES),)).run(module)
         self.assertEqual(print_module(module), before)
 
 

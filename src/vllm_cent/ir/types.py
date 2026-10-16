@@ -81,12 +81,16 @@ class TensorRole(StrEnum):
 
     Members:
         ACTIVATION: Computed during the forward pass and consumed by later
-            ops. Every op result is an activation; so is the model input.
-        WEIGHT: A parameter loaded once and kept resident on the device.
+            ops. Most op results are activations; so is the model input.
+        WEIGHT: A parameter or constant table (e.g. RoPE cos/sin), loaded once
+            and kept resident on the device.
+        KV_CACHE: Persistent attention state, read and extended every decode
+            step. The updated cache returned by kv_update keeps this role.
     """
 
     ACTIVATION = auto()
     WEIGHT = auto()
+    KV_CACHE = auto()
 
 
 # Joins the names of semantic axes that share one flat dimension.
@@ -125,6 +129,22 @@ def outermost_axis(axis_name: str) -> str:
     If the outermost axis is a packed axis, e.g. "q_head*head_dim", get only the first dimension.
     """
     return axis_name.split(_PACKED_AXIS_SEPARATOR)[0]
+
+
+def packed_axis_factors(axis_name: str) -> tuple[str, ...]:
+    """Return the axes packed into ``axis_name``, outermost first.
+
+    ``"q_head*head_dim"`` gives ``("q_head", "head_dim")``; a plain name gives
+    a one-element tuple. This undoes packed_axis().
+
+    Args:
+        axis_name: Plain or packed axis name.
+
+    Returns:
+        The axis names in the dimension.
+    """
+
+    return tuple(axis_name.split(_PACKED_AXIS_SEPARATOR))
 
 @dataclass(frozen=True, slots=True)
 class Replicate:
@@ -225,3 +245,11 @@ class TensorType:
     def full_shape(self) -> tuple[int, ...]:
         """The whole tensor's shape: global_shape when sharded, otherwise shape."""
         return self.shape if self.global_shape is None else self.global_shape
+
+    @property
+    def sharded_dim(self) -> int | None:
+        """The dimension split across ranks, or None if nothing is split."""
+
+        if isinstance(self.placement, Shard):
+            return self.dim_of(self.placement.axis)
+        return None

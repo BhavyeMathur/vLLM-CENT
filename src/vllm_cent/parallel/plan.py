@@ -7,8 +7,8 @@ the axes and the ops.
 A plan is written as statements, rules first, exceptions after::
 
     plan = ParallelPlan(tp=8)
-    plan.split("q_head", size=64)               # rule: split q_head everywhere
-    plan.split("intermediate")                  # rule on a plain axis: no size
+    plan.split("q_head")                        # rule: split q_head everywhere
+    plan.split("intermediate")
     plan.replicate("k_proj.weight")             # exception: keep it whole
     plan.split("hidden", only=("lm_head.weight",))  # exception: split one tensor
 """
@@ -52,10 +52,6 @@ class ParallelPlan:
         self._tp = tp
         # Global rules, in the order they were written.
         self._split_axes: list[str] = []
-        # Sizes of axes that appear as the outer factor of a packed
-        # dimension, e.g. q_head = 64 inside q_head*head_dim. A plain axis
-        # needs no entry: its dimension length is its size.
-        self._axis_sizes: dict[str, int] = {}
         # Per-tensor exceptions, keyed by argument name (a parameter FQN or
         # an input name).
         self._exceptions: dict[str, Replicate | Shard] = {}
@@ -82,25 +78,7 @@ class ParallelPlan:
 
         return MappingProxyType(self._exceptions)
 
-    def axis_size(self, axis: str) -> int | None:
-        """Return the size given for ``axis``, or None if none was given.
-
-        Args:
-            axis: Axis name.
-
-        Returns:
-            The axis size, e.g. the number of heads.
-        """
-
-        return self._axis_sizes.get(axis)
-
-    def split(
-        self,
-        axis: str,
-        *,
-        size: int | None = None,
-        only: Iterable[str] | None = None,
-    ) -> None:
+    def split(self, axis: str, *, only: Iterable[str] | None = None) -> None:
         """Split ``axis`` evenly over the tp ranks.
 
         Without ``only`` this is a rule: every tensor whose axes contain
@@ -108,21 +86,15 @@ class ParallelPlan:
         ``only`` it is an exception for the named tensors alone.
 
         Args:
-            axis: Semantic axis to split, e.g. ``"q_head"``.
-            size: Size of the axis. Required when the axis is the outer
-                factor of a packed dimension, because the dimension length
-                alone does not tell how many heads it holds.
+            axis: Semantic axis to split, e.g. ``"q_head"``. How many heads it
+                has comes from the model (its axis sizes), not from the plan.
             only: Names of the tensors this exception applies to.
 
         Raises:
-            ValueError: If size cannot be split evenly over tp, the axis was
-                given a different size before, the rule already exists, an
-                exception names an axis that is already a rule, ``only`` is
-                empty, or a named tensor already has an exception.
+            ValueError: If the rule already exists, an exception names an axis
+                that is already a rule, ``only`` is empty, or a named tensor
+                already has an exception.
         """
-
-        if size is not None:
-            self._record_size(axis, size)
 
         if only is None:
             if axis in self._split_axes:
@@ -158,30 +130,6 @@ class ParallelPlan:
             raise ValueError("replicate() names no tensor")
         for name in names:
             self._add_exception(name, Replicate())
-
-    def _record_size(self, axis: str, size: int) -> None:
-        """Remember the size of ``axis``.
-
-        Args:
-            axis: Axis name.
-            size: Axis size.
-
-        Raises:
-            ValueError: If the size is not a positive multiple of tp, or the
-                axis already has a different size.
-        """
-
-        # Every rank must get the same number of whole heads: with 8 KV heads
-        # and tp=16, each rank would get half a head.
-        if size < 1 or size % self._tp != 0:
-            raise ValueError(
-                f"axis {axis!r} of size {size} cannot be split evenly over "
-                f"tp={self._tp}"
-            )
-        known = self._axis_sizes.get(axis)
-        if known is not None and known != size:
-            raise ValueError(f"axis {axis!r} was given size {known}, now {size}")
-        self._axis_sizes[axis] = size
 
     def _add_exception(self, name: str, placement: Replicate | Shard) -> None:
         """Record one per-tensor exception.

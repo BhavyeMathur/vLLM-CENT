@@ -272,3 +272,147 @@ class AllReduceOp(Operation):
         return (replace(self.x.type, placement = Replicate()),)
 
     
+
+@dataclass(frozen = True, eq = False, slots=True)
+class SiluOp(Operation):
+    """SiLU activation, ``x * sigmoid(x)``, element by element.
+
+    SiluOp(operands=(x,))
+    """
+
+    NAME = "aloi.silu"
+    NUM_OPERANDS = 1
+
+    @property
+    def x(self) -> Value:
+        return self.operands[0]
+
+    def infer_result_types(self) -> tuple[TensorType, ...]:
+        """The result has x's shape, dtype, axes and placement.
+
+        Raises:
+            ValueError: If x is a partial sum. SiLU is not linear, so
+                silu(a) + silu(b) != silu(a + b): the parts must be summed
+                first.
+        """
+
+        if isinstance(self.x.type.placement, Partial):
+            raise ValueError(f"{self.NAME}: x is a partial sum; all_reduce it first")
+        return (replace(self.x.type, role = TensorRole.ACTIVATION),)
+
+
+@dataclass(frozen = True, eq = False, slots=True)
+class SoftmaxOp(Operation):
+    """Softmax over the last dimension.
+
+    SoftmaxOp(operands=(x,))
+    """
+
+    NAME = "aloi.softmax"
+    NUM_OPERANDS = 1
+
+    @property
+    def x(self) -> Value:
+        return self.operands[0]
+
+    def infer_result_types(self) -> tuple[TensorType, ...]:
+        """The result has x's shape, dtype, axes and placement.
+
+        Raises:
+            ValueError: If x is a scalar, a partial sum, or split along its
+                last dimension. The maximum and the sum run over the whole
+                last dimension, so every rank needs all of it.
+        """
+
+        if self.x.type.rank < 1:
+            raise ValueError(f"{self.NAME}: x needs a dimension to normalize over")
+        if isinstance(self.x.type.placement, Partial):
+            raise ValueError(f"{self.NAME}: x is a partial sum; all_reduce it first")
+        if self.x.type.sharded_dim == self.x.type.rank - 1:
+            raise ValueError(
+                f"{self.NAME}: x's last dimension is split across ranks; "
+                "softmax needs the whole dimension on every rank"
+            )
+        return (replace(self.x.type, role = TensorRole.ACTIVATION),)
+
+
+@dataclass(frozen = True, eq = False, slots=True)
+class _ElementwiseBinaryOp(Operation):
+    """Shared rules of ops that combine two same-shaped tensors elementwise.
+
+    There is no broadcasting: both operands have the same shape, dtype, axes
+    and placement, and so does the result. Subclasses only name the op.
+    """
+
+    NUM_OPERANDS = 2
+
+    @property
+    def lhs(self) -> Value:
+        return self.operands[0]
+
+    @property
+    def rhs(self) -> Value:
+        return self.operands[1]
+
+    def infer_result_types(self) -> tuple[TensorType, ...]:
+        """Check that the operands line up element for element.
+
+        Raises:
+            ValueError: If shapes, dtypes, annotated axes or placements
+                differ, or the operands are partial sums.
+        """
+
+        lhs = self.lhs.type
+        rhs = self.rhs.type
+        if lhs.shape != rhs.shape:
+            raise ValueError(
+                f"{self.NAME}: operand shapes differ, {lhs.shape} and {rhs.shape}"
+            )
+        if lhs.dtype != rhs.dtype:
+            raise ValueError(
+                f"{self.NAME}: operand dtypes differ, {lhs.dtype} and {rhs.dtype}"
+            )
+        if lhs.axes and rhs.axes and lhs.axes != rhs.axes:
+            raise ValueError(
+                f"{self.NAME}: operand axes differ, {lhs.axes} and {rhs.axes}"
+            )
+
+        # Equal placements mean every rank holds matching pieces of both
+        # operands. A partial sum is rejected because the result is used
+        # right away; an all_reduce always follows the op that made it.
+        if lhs.placement != rhs.placement or isinstance(lhs.placement, Partial):
+            raise ValueError(
+                f"{self.NAME}: unsupported placements "
+                f"lhs={lhs.placement}, rhs={rhs.placement}"
+            )
+
+        axes = lhs.axes if lhs.axes and rhs.axes else ()
+        return (
+            TensorType(
+                shape = lhs.shape,
+                dtype = lhs.dtype,
+                axes = axes,
+                global_shape = lhs.global_shape,
+                placement = lhs.placement,
+            ),
+        )
+
+
+@dataclass(frozen = True, eq = False, slots=True)
+class AddOp(_ElementwiseBinaryOp):
+    """Elementwise sum, e.g. a residual connection.
+
+    AddOp(operands=(lhs, rhs))
+    """
+
+    NAME = "aloi.add"
+
+
+@dataclass(frozen = True, eq = False, slots=True)
+class MulOp(_ElementwiseBinaryOp):
+    """Elementwise product, e.g. the SwiGLU gate times the up projection.
+
+    MulOp(operands=(lhs, rhs))
+    """
+
+    NAME = "aloi.mul"

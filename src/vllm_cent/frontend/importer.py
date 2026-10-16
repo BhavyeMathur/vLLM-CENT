@@ -8,7 +8,8 @@ function's results. It accepts static shapes only.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections import Counter
+from collections.abc import Callable, Iterable, Mapping
 
 import torch
 from torch._ops import OpOverload
@@ -18,10 +19,18 @@ from torch.fx import Node
 
 # Imported for its side effect: registering torch.ops.aloi.*, which the
 # converter table below refers to.
-from . import custom_ops  # noqa: F401
+from . import aloi  # noqa: F401
 from ..ir.base import Function, Module, Operation, Value
 from ..ir.printer import format_type
-from ..ir.semantic import LinearOp, RMSNormOp
+from ..ir.semantic import AddOp, LinearOp, MulOp, RMSNormOp, SiluOp, SoftmaxOp
+from ..ir.transformer import (
+    GqaQKOp,
+    GqaSVOp,
+    KvUpdateOp,
+    MergeHeadsOp,
+    RopeOp,
+    SplitHeadsOp,
+)
 from ..ir.types import DType, TensorType
 
 __all__ = ["import_exported_program"]
@@ -67,7 +76,7 @@ def _argument_names(program: ExportedProgram) -> dict[str, str]:
 
     Raises:
         NotImplementedError: For input kinds the importer does not handle
-            yet, such as BUFFER or CONSTANT_TENSOR.
+            yet, such as CONSTANT_TENSOR.
     """
 
     names: dict[str, str] = {}
@@ -75,7 +84,9 @@ def _argument_names(program: ExportedProgram) -> dict[str, str]:
     for spec in program.graph_signature.input_specs:
         # spec.kind is an InputKind enum member, not a string, so compare
         # with "is" against the enum.
-        if spec.kind is InputKind.PARAMETER and spec.target is not None:
+        # Parameters and buffers (e.g. a RoPE cos/sin table) are named by
+        # FQN, the key they have in the model's state.
+        if spec.kind in (InputKind.PARAMETER, InputKind.BUFFER) and spec.target is not None:
             names[spec.arg.name] = spec.target
         elif spec.kind is InputKind.USER_INPUT:
             names[spec.arg.name] = spec.arg.name
@@ -87,24 +98,104 @@ def _argument_names(program: ExportedProgram) -> dict[str, str]:
     return names
 
 
-def _module_path(node: Node) -> str | None:
+def _module_path(node: Node) -> str:
     """Return the path of the innermost nn.Module that created ``node``.
 
     torch.export records the module call stack of every op, outermost first,
-    as ``{key: (path, class name)}``. The innermost path, e.g. ``q_proj``,
-    becomes the result's ``name_hint``.
+    as ``{key: (path, class name)}``.
 
     Returns:
-        The module path, or None when there is none to use: placeholders have
-        no stack, and an op called directly in the root ``forward`` has the
-        empty path ``""``. The printer then numbers the result instead.
+        The innermost path, e.g. ``self_attn.q_proj``. Placeholders have no
+        stack, and an op called in the root ``forward`` has path ``""``.
     """
 
     stack = node.meta.get("nn_module_stack")
     if not stack:
-        return None
+        return ""
     path, _ = list(stack.values())[-1]
-    return path or None
+    return str(path)
+
+
+def _name_hints(
+    nodes: Iterable[Node], parameters: Mapping[str, str]
+) -> dict[Node, str]:
+    """Choose a readable result name for every op call.
+
+    - A call that reads exactly one parameter is named after the module that
+      owns it: ``aloi.linear(x, self.q_proj.weight)`` gives
+      ``self_attn.q_proj``, ``aloi.rms_norm(x, self.input_layernorm.weight,
+      eps)`` gives ``input_layernorm``.
+    - Otherwise, the only such call inside a module is named after the
+      module; several calls inside one module's forward get the module path
+      plus FX's unique node name (``self_attn.rope``, ``self_attn.rope_1``);
+      calls in the root forward get the node name alone (``add_1``).
+
+    Args:
+        nodes: The graph's nodes.
+        parameters: Parameter placeholder name to parameter FQN.
+
+    Returns:
+        A hint for every call_function node.
+    """
+
+    hints: dict[Node, str] = {}
+    paths: dict[Node, str] = {}
+    for node in nodes:
+        if node.op != "call_function":
+            continue
+        owners = [
+            parameters[operand.name].rpartition(".")[0]
+            for operand in node.all_input_nodes
+            if operand.name in parameters
+        ]
+        # A root-level parameter such as "w" has no owning module ("").
+        if len(owners) == 1 and owners[0]:
+            hints[node] = owners[0]
+        else:
+            paths[node] = _module_path(node)
+
+    calls_per_path = Counter(paths.values())
+    for node, path in paths.items():
+        if not path:
+            hints[node] = node.name
+        elif calls_per_path[path] == 1:
+            hints[node] = path
+        else:
+            hints[node] = f"{path}.{node.name}"
+    return hints
+
+
+def _arguments(node: Node) -> dict[str, object]:
+    """Return every schema argument of an op call by name, defaults filled in.
+
+    torch.export drops trailing optional arguments the caller omitted (rope
+    without Llama 3 scaling has 3 arguments, not 7), and keyword-only ones such
+    as add's ``alpha`` live in ``node.kwargs``. Going through the op's schema
+    lets converters read every argument by name.
+
+    Args:
+        node: A call_function node whose target is an OpOverload.
+
+    Returns:
+        Argument name to value.
+
+    Raises:
+        TypeError: If a required argument is missing.
+    """
+
+    target = node.target
+    assert isinstance(target, OpOverload)
+    values: dict[str, object] = {}
+    for index, argument in enumerate(target._schema.arguments):
+        if index < len(node.args):
+            values[argument.name] = node.args[index]
+        elif argument.name in node.kwargs:
+            values[argument.name] = node.kwargs[argument.name]
+        elif argument.has_default_value():
+            values[argument.name] = argument.default_value
+        else:
+            raise TypeError(f"{target}: missing argument {argument.name!r}")
+    return values
 
 
 def _value(env: dict[Node, Value], arg: object) -> Value:
@@ -127,63 +218,162 @@ def _value(env: dict[Node, Value], arg: object) -> Value:
     return env[arg]
 
 
+def _float(name: str, value: object) -> float:
+    """Return a float attribute.
+
+    An int is accepted: a schema ``float`` may be called with ``10000``.
+
+    Raises:
+        TypeError: If the value is not a number.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{name} must be a number, got {value!r}")
+    return float(value)
+
+
+def _optional_float(name: str, value: object) -> float | None:
+    """Return an optional float attribute; see _float."""
+
+    return None if value is None else _float(name, value)
+
+
+def _int(name: str, value: object) -> int:
+    """Return an int attribute.
+
+    Raises:
+        TypeError: If the value is not an int.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an int, got {value!r}")
+    return value
+
+
 # A converter turns one FX call into one IR op. It receives the node, the
 # node-to-value map for looking up operands, and the result's name hint
 # (Operation is frozen, so the hint must be given at construction).
 _Converter = Callable[[Node, dict[Node, Value], str | None], Operation]
 
 
-def _convert_linear(
-    node: Node, env: dict[Node, Value], name_hint: str | None
-) -> Operation:
-    """Convert ``aloi::linear(x, weight)`` into a ``LinearOp``.
+def _tensor_op(op_class: type[Operation], *operand_names: str) -> _Converter:
+    """Make a converter for an op whose arguments are all tensor operands.
 
     Args:
-        node: The FX call.
-        env: FX node to IR value map.
-        name_hint: Name hint for the result.
+        op_class: IR op to build.
+        *operand_names: Schema argument names, in operand order.
 
     Returns:
-        The new op.
+        The converter.
     """
 
-    x, weight = node.args
-    return LinearOp(operands=(_value(env, x), _value(env, weight)), name_hint=name_hint)
+    def convert(
+        node: Node, env: dict[Node, Value], name_hint: str | None
+    ) -> Operation:
+        """Build ``op_class`` from the named tensor arguments."""
+
+        arguments = _arguments(node)
+        operands = tuple(_value(env, arguments[name]) for name in operand_names)
+        return op_class(operands=operands, name_hint=name_hint)
+
+    return convert
 
 
 def _convert_rms_norm(
     node: Node, env: dict[Node, Value], name_hint: str | None
 ) -> Operation:
-    """Convert ``aloi::rms_norm(x, weight, eps=None)`` into an ``RMSNormOp``.
+    """Convert ``aloi::rms_norm(x, weight, eps=None)`` into an ``RMSNormOp``."""
 
-    Args:
-        node: The FX call.
-        env: FX node to IR value map.
-        name_hint: Name hint for the result.
-
-    Returns:
-        The new op.
-
-    Raises:
-        TypeError: If ``eps`` is neither a float nor None.
-    """
-
-    # When the caller omits eps, torch.export drops it: args has 2 entries.
-    x, weight, *rest = node.args
-    eps = rest[0] if rest else None
-    if eps is not None and not isinstance(eps, float):
-        raise TypeError(f"rms_norm eps must be a float or None, got {eps!r}")
+    arguments = _arguments(node)
     return RMSNormOp(
-        operands=(_value(env, x), _value(env, weight)),
-        eps=eps,
+        operands=(_value(env, arguments["x"]), _value(env, arguments["weight"])),
+        eps=_optional_float("eps", arguments["eps"]),
         name_hint=name_hint,
     )
 
 
-# Supporting a new op means one converter and one entry here.
+def _convert_split_heads(
+    node: Node, env: dict[Node, Value], name_hint: str | None
+) -> Operation:
+    """Convert ``aloi::split_heads(x, head_dim)`` into a ``SplitHeadsOp``."""
+
+    arguments = _arguments(node)
+    return SplitHeadsOp(
+        operands=(_value(env, arguments["x"]),),
+        head_dim=_int("head_dim", arguments["head_dim"]),
+        name_hint=name_hint,
+    )
+
+
+def _convert_rope(
+    node: Node, env: dict[Node, Value], name_hint: str | None
+) -> Operation:
+    """Convert ``aloi::rope(x, positions, cos_sin_cache, is_neox_style)``."""
+
+    arguments = _arguments(node)
+    is_neox_style = arguments["is_neox_style"]
+    if not isinstance(is_neox_style, bool):
+        raise TypeError(f"is_neox_style must be a bool, got {is_neox_style!r}")
+    return RopeOp(
+        operands=(
+            _value(env, arguments["x"]),
+            _value(env, arguments["positions"]),
+            _value(env, arguments["cos_sin_cache"]),
+        ),
+        is_neox_style=is_neox_style,
+        name_hint=name_hint,
+    )
+
+
+def _convert_gqa_qk(
+    node: Node, env: dict[Node, Value], name_hint: str | None
+) -> Operation:
+    """Convert ``aloi::gqa_qk(q, k_cache, scale)`` into a ``GqaQKOp``."""
+
+    arguments = _arguments(node)
+    return GqaQKOp(
+        operands=(_value(env, arguments["q"]), _value(env, arguments["k_cache"])),
+        scale=_float("scale", arguments["scale"]),
+        name_hint=name_hint,
+    )
+
+
+def _convert_add(
+    node: Node, env: dict[Node, Value], name_hint: str | None
+) -> Operation:
+    """Convert ``aten.add.Tensor(self, other, alpha=1)`` into an ``AddOp``.
+
+    Raises:
+        NotImplementedError: If alpha is not 1; ``a + alpha * b`` has no IR op.
+    """
+
+    arguments = _arguments(node)
+    if arguments["alpha"] != 1:
+        raise NotImplementedError(f"add with alpha={arguments['alpha']!r}")
+    return AddOp(
+        operands=(_value(env, arguments["self"]), _value(env, arguments["other"])),
+        name_hint=name_hint,
+    )
+
+
+# Supporting a new op means one converter and one entry here. The aloi::*
+# custom ops come from the model; the aten ops are the plain PyTorch
+# elementwise ops a model writes as F.silu(x), a * b and a + b.
 _CONVERTERS: dict[OpOverload, _Converter] = {
-    torch.ops.aloi.linear.default: _convert_linear,
+    torch.ops.aloi.linear.default: _tensor_op(LinearOp, "x", "weight"),
     torch.ops.aloi.rms_norm.default: _convert_rms_norm,
+    torch.ops.aloi.split_heads.default: _convert_split_heads,
+    torch.ops.aloi.merge_heads.default: _tensor_op(MergeHeadsOp, "x"),
+    torch.ops.aloi.rope.default: _convert_rope,
+    torch.ops.aloi.kv_update.default: _tensor_op(
+        KvUpdateOp, "cache", "new", "positions"
+    ),
+    torch.ops.aloi.gqa_qk.default: _convert_gqa_qk,
+    torch.ops.aloi.softmax.default: _tensor_op(SoftmaxOp, "x"),
+    torch.ops.aloi.gqa_sv.default: _tensor_op(GqaSVOp, "probs", "v_cache"),
+    torch.ops.aten.silu.default: _tensor_op(SiluOp, "self"),
+    torch.ops.aten.mul.Tensor: _tensor_op(MulOp, "self", "other"),
+    torch.ops.aten.add.Tensor: _convert_add,
 }
 
 
@@ -218,6 +408,9 @@ def import_exported_program(program: ExportedProgram, module_name: str) -> Modul
             )
 
     names = _argument_names(program)
+    hints = _name_hints(
+        program.graph.nodes, program.graph_signature.inputs_to_parameters
+    )
     env: dict[Node, Value] = {}
     arguments: list[Value] = []
     operations: list[Operation] = []
@@ -237,7 +430,7 @@ def import_exported_program(program: ExportedProgram, module_name: str) -> Modul
                 raise NotImplementedError(
                     f"no ALOI converter for {node.target} (node {node.name})"
                 )
-            op = converter(node, env, _module_path(node))
+            op = converter(node, env, hints[node])
 
             # Every op converted so far has exactly one result. Unpacking
             # (instead of results[0]) fails loudly if that ever changes.

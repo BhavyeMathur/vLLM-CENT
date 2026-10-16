@@ -19,6 +19,7 @@ an operand it cannot use.
 from __future__ import annotations
 
 import copy
+from collections.abc import Mapping
 from dataclasses import replace
 
 from ..ir.base import Function, Module, Operation, Value, rebuild_function
@@ -39,15 +40,23 @@ class ApplyTensorParallel(FunctionPass):
 
     NAME = "apply-tensor-parallel"
 
-    def __init__(self, plan: ParallelPlan) -> None:
+    def __init__(
+        self, plan: ParallelPlan, axis_sizes: Mapping[str, int] | None = None
+    ) -> None:
         """Create the pass.
 
         Args:
             plan: Ownership rules. The plan is copied, so later split() or
                 replicate() calls do not change this pass.
+            axis_sizes: Size of each axis that is the outer factor of a packed
+                dimension, e.g. ``{"q_head": 64}`` for q_head*head_dim. These
+                are model facts (head counts), so the model supplies them; a
+                plain axis needs no entry, its dimension length is its size.
+                The mapping is copied.
         """
 
         self._plan = copy.deepcopy(plan)
+        self._axis_sizes: dict[str, int] = dict(axis_sizes or {})
 
     def run(self, module: Module) -> Module:
         """Check the plan against the whole module, then shard each function.
@@ -79,8 +88,7 @@ class ApplyTensorParallel(FunctionPass):
         ]
         if unannotated:
             raise ValueError(
-                f"arguments {unannotated} have no axes; "
-                "run AnnotateRolesAndAxes first"
+                f"arguments {unannotated} have no axes; run AnnotateRolesAndAxes first"
             )
 
         # A misspelled tensor name would otherwise leave its exception unused.
@@ -115,7 +123,9 @@ class ApplyTensorParallel(FunctionPass):
                 rejects its operands' placements.
         """
 
-        new_arguments = [self._shard_argument(argument) for argument in function.operands]
+        new_arguments = [
+            self._shard_argument(argument) for argument in function.operands
+        ]
         return rebuild_function(function, new_arguments, rewrite=_insert_all_reduce)
 
     def _placement_for(self, argument: Value) -> Replicate | Shard:
@@ -195,8 +205,8 @@ class ApplyTensorParallel(FunctionPass):
         """Check that splitting ``axis`` gives every rank a whole share.
 
         For a plain dimension the axis size is its length. For a packed one
-        such as q_head*head_dim of length 8192, the plan supplies the head
-        count (64): the length must hold whole heads (8192 / 64 = 128 each),
+        such as q_head*head_dim of length 8192, the model's axis sizes supply
+        the head count (64): the length must hold whole heads (8192 / 64 = 128 each),
         and the heads must split evenly over tp (64 / 8 = 8 per rank).
 
         Args:
@@ -205,7 +215,7 @@ class ApplyTensorParallel(FunctionPass):
             axis: Axis being split.
 
         Raises:
-            ValueError: If a packed axis has no size in the plan, the
+            ValueError: If a packed axis has no size, the
                 dimension is not a whole number of that axis, or the axis
                 size is not a multiple of tp.
         """
@@ -216,11 +226,11 @@ class ApplyTensorParallel(FunctionPass):
         if dim_name == axis:
             axis_size = length
         else:
-            size = self._plan.axis_size(axis)
+            size = self._axis_sizes.get(axis)
             if size is None:
                 raise ValueError(
-                    f"%{argument.name}: {axis!r} is packed in {dim_name!r}; "
-                    f"give its size with plan.split({axis!r}, size=...)"
+                    f"%{argument.name}: {axis!r} is packed in {dim_name!r} and "
+                    "has no size; the model's axis sizes must provide it"
                 )
             if length % size != 0:
                 raise ValueError(

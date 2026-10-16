@@ -1,0 +1,13 @@
+# Llama 2 70B, one decode step on 8 tensor-parallel ranks, Megatron style.
+#
+#   aloi-compile --model examples/llama_70b/llama2_70b.json \
+#                --run examples/llama_70b/runs/llama2_70b_tp8_decode.yaml
+parallel:
+  tp: 8
+  split: [q_head, kv_head, intermediate]
+workload:
+  phase: decode
+  batch: 1
+  context_len: 2048
+scope:
+  layers: 1

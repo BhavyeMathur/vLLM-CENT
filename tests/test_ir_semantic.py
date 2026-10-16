@@ -1,11 +1,19 @@
-"""Tests for the semantic dialect: aloi.linear, aloi.rms_norm, aloi.all_reduce."""
+"""Tests for the generic semantic ops: linear, rms_norm, all_reduce, elementwise."""
 
 from __future__ import annotations
 
 import unittest
 
 from vllm_cent.ir.base import Value
-from vllm_cent.ir.semantic import AllReduceOp, LinearOp, RMSNormOp
+from vllm_cent.ir.semantic import (
+    AddOp,
+    AllReduceOp,
+    LinearOp,
+    MulOp,
+    RMSNormOp,
+    SiluOp,
+    SoftmaxOp,
+)
 from vllm_cent.ir.types import (
     DType,
     Partial,
@@ -606,6 +614,96 @@ class AllReduceOpTest(unittest.TestCase):
             with self.subTest(placement=operand.type.placement):
                 with self.assertRaisesRegex(ValueError, "partial sum"):
                     AllReduceOp(operands=(operand,))
+
+
+class UnaryElementwiseOpTest(unittest.TestCase):
+    """silu and softmax keep the operand's type, except the role."""
+
+    def test_type_is_kept(self) -> None:
+        """A sharded tensor stays sharded; a weight-typed input becomes activation.
+
+        The shard is attention scores [1, 1, 8, 2048]: 8 of 64 heads per rank,
+        split on dimension 2, so softmax still sees whole rows of 2048.
+        """
+
+        scores = _placed(
+            (1, 1, 8, 2048),
+            (*TOKEN_AXES, "q_head", "context"),
+            Shard("q_head"),
+            global_shape=(1, 1, 64, 2048),
+        )
+        for op_class in (SiluOp, SoftmaxOp):
+            with self.subTest(op=op_class.NAME):
+                op = op_class(operands=(scores,))
+                self.assertEqual(op.results[0].type, scores.type)
+                weight = _placed((4,), (HIDDEN,), Replicate(), role=TensorRole.WEIGHT)
+                result = op_class(operands=(weight,)).results[0].type
+                self.assertIs(result.role, TensorRole.ACTIVATION)
+
+    def test_rejects_partial_sum(self) -> None:
+        """Neither op is linear, so the ranks must add their parts first."""
+
+        partial = _placed((1, 1, HIDDEN_SIZE), (*TOKEN_AXES, HIDDEN), Partial())
+        for op_class in (SiluOp, SoftmaxOp):
+            with self.subTest(op=op_class.NAME):
+                with self.assertRaisesRegex(ValueError, "partial sum"):
+                    op_class(operands=(partial,))
+
+    def test_softmax_needs_whole_last_dimension(self) -> None:
+        """The softmax sum runs over the last dimension; SiLU has no such need."""
+
+        split_last = _sharded_heads()  # q_head*head_dim split on the last dim
+        with self.assertRaisesRegex(ValueError, "whole dimension"):
+            SoftmaxOp(operands=(split_last,))
+        with self.assertRaisesRegex(ValueError, "dimension to normalize"):
+            SoftmaxOp(operands=(_value(),))
+
+
+class BinaryElementwiseOpTest(unittest.TestCase):
+    """add and mul combine two identically typed tensors."""
+
+    def test_matching_operands(self) -> None:
+        """The residual add of whole tensors and the SwiGLU product of shards."""
+
+        residual = AddOp(operands=(_replicated_hidden(), _replicated_hidden()))
+        self.assertEqual(residual.results[0].type, _replicated_hidden().type)
+        gated = MulOp(operands=(_sharded_heads(), _sharded_heads()))
+        self.assertEqual(gated.results[0].type, _sharded_heads().type)
+        self.assertEqual((AddOp.NAME, MulOp.NAME), ("aloi.add", "aloi.mul"))
+
+    def test_unannotated_operand_gives_unannotated_result(self) -> None:
+        """Axes are only kept when both operands have them."""
+
+        op = AddOp(operands=(_replicated_hidden(), _value(1, 1, HIDDEN_SIZE)))
+        self.assertEqual(op.results[0].type.axes, ())
+
+    def test_rejections(self) -> None:
+        """No broadcasting, no dtype mixing, no mismatched axes or placements."""
+
+        partial = _placed((1, 1, HIDDEN_SIZE), (*TOKEN_AXES, HIDDEN), Partial())
+        cases = {
+            "shapes differ": (_value(1, HIDDEN_SIZE), _value(1, 1, HIDDEN_SIZE)),
+            "dtypes differ": (
+                _value(1, HIDDEN_SIZE),
+                _value(1, HIDDEN_SIZE, dtype=DType.BF16),
+            ),
+            "axes differ": (
+                _replicated_hidden(),
+                _placed((1, 1, HIDDEN_SIZE), (*TOKEN_AXES, Q_PROJ_OUT), Replicate()),
+            ),
+            "placements differ": (
+                _sharded_heads(),
+                _placed(
+                    (1, 1, LOCAL_HEADS_WIDTH), (*TOKEN_AXES, Q_PROJ_OUT), Replicate()
+                ),
+            ),
+            "partial sums": (partial, partial),
+        }
+        for name, operands in cases.items():
+            for op_class in (AddOp, MulOp):
+                with self.subTest(case=name, op=op_class.NAME):
+                    with self.assertRaises(ValueError):
+                        op_class(operands=operands)
 
 
 if __name__ == "__main__":
