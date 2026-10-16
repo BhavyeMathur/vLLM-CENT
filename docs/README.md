@@ -13,9 +13,22 @@ Codex tasks. It complements the code; it does not repeat docstrings, nearby
    interface, data contract, module boundary, or target assumption.
 4. Read only the research note relevant to the task. For example,
    [`research/aim-simulator.md`](research/aim-simulator.md) explains what the
-   AiM simulator can and cannot validate.
+   AiM simulator can and cannot validate, while
+   [`research/sk-hynix-aim.md`](research/sk-hynix-aim.md) reconciles the chip,
+   Hynix software stack, CENT paper, and open execution contracts. The newer
+   [`execution-contracts.md`](research/execution-contracts.md) distinguishes
+   primary hardware evidence from the implemented GEMV, RMSNorm, activation, and
+   attention reference rules
+   and lists the exact questions still blocking physical export.
 5. Inspect `git status`, recent commits, and the source files in scope. These
    documents summarize the repository; they do not replace the current code.
+
+## Project update for readers outside the repository
+
+[Compiler and simulator project update](PROJECT_UPDATE.md) provides an executive
+summary, the input API, a worked example through every IR stage, the final
+artifact, and current capabilities and limits. It is a dated snapshot intended
+for project updates; `PROJECT_STATE.md` remains the short ongoing status page.
 
 ## Keeping tasks synchronized
 

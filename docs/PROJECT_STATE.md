@@ -1,121 +1,92 @@
 # Project state
 
-Last synchronized: 2026-09-17  
-Code snapshot: `d76b8c1` (`Added tensor/vector layout planning API`)
+Last synchronized: 2026-10-15
 
-## Goal and ownership boundary
+## Goal
 
-The long-term goal is to run vLLM-supported models on CENT hardware. This
-repository owns the compiler-side software interface: it turns model
-operations, tensor bindings, and hardware-aware layout plans into a typed and
-validated `CentProgram`.
+Compile one model decode step for PIM hardware, while keeping model blocks
+identifiable. vLLM will own request scheduling and sampling. GPU prefill followed
+by CENT decode is the intended serving path; that integration is not implemented.
+See [MULTI_LEVEL_COMPILER.md](MULTI_LEVEL_COMPILER.md) for the stages and API examples.
 
-The intended serving path is:
+## What works
 
-```text
-vLLM request and decode scheduler
-              |
-     future CENT worker/runner
-              |
-      model-family frontend
-              |
-     reusable operation lowering
-              |
-       typed CENT program
-              |
-  runtime bindings and target adapter
-          /                 \
-AiM timing simulation   functional execution
-```
+- The Python graph API separates tensor math, splitting tensors across devices,
+  selecting supported device operations, assigning storage, and emitting CENT
+  instructions. Each stage checks its input. Manual mappings and the default
+  mapper use the same checks.
+- Addition, elementwise multiplication, copy, and contiguous reshape compile and
+  execute on logical device zero. Shapes are static, and addition/multiplication
+  require equal shapes. Storage reuse preserves requested inputs and intermediate
+  outputs. Padding lanes are initialized to zero. Compiled programs accept new
+  tensor values without recompilation.
+- With `ExecutionContract.REFERENCE`, bias-free Linear (`x @ weights.T`), RMSNorm,
+  ReLU, sigmoid, tanh, SiLU, both GELU formulas, and last-axis softmax execute
+  numerically. Linear processes each input vector through bounded matrix tiles.
+  RMSNorm computes its own mean square and scale. Softmax rejects NaN, positive
+  infinity, and rows whose entries are all negative infinity.
+- `models.llama.build_feed_forward_graph` composes RMSNorm, gate/up projections,
+  SiLU and multiplication, a down projection, and the residual addition.
+- `graphs.build_attention_graph` computes attention over supplied rank-four
+  Q/K/V tensors. It supports batches, grouped query heads, separate value widths,
+  additive masks, and causal masks with an explicit query-position offset.
+  It returns separate heads. Keys and transposed values are reused per KV head;
+  one row of attention scores and matrix scratch are reused across queries.
+- Reference services explicitly initialize/read selected accumulators and perform
+  packing and nonlinear math. They have distinct instruction types. Physical
+  CENT and AiM serializers reject them instead of pretending they have hardware
+  encodings. All graph inputs and scratch must fit in the Shared Buffer.
+- The functional simulator checks supported data movement and arithmetic, faults
+  on unwritten inputs, and commits each instruction's writes together. Disabling
+  tracing discards completed write records rather than retaining every temporary
+  value. Its Python-float results validate data flow, not hardware precision or
+  timing.
+- Optional native MLIR parsing, verification, and optimization support addition
+  and multiplication through registered `func`/`arith` dialects. Imported graphs
+  use the same Python compilation stages as directly constructed graphs.
+- The older typed CENT instructions, structural Llama compiler, and AiM timing
+  serializer remain available. A structurally valid Llama trace is not evidence
+  of an executable numerical model.
 
-The current integration plan keeps prefill on a GPU and sends supported decode
-work to CENT. The vLLM worker/runner, tensor loader, execution runtime, and
-functional emulator are not implemented here yet. A PyTorch backend may become
-one useful entry point, but it would not make vLLM compatibility automatic;
-vLLM still needs explicit scheduling, KV-cache, worker, and result-transfer
-integration.
+Validation: **334 tests pass**, including independent scalar oracles, native MLIR,
+and the external PyTorch SDPA oracle. Branch-enabled coverage is **98%**. Ruff
+lint/format, strict mypy, and whitespace checks pass. These checks cover the
+supported reference calculations, not physical hardware or complete model decode.
 
-## Implemented and verified
+## What does not work yet
 
-- Typed instructions cover the paper ISA, use descriptive Python operands, and
-  retain the paper names in documentation and rendering.
-- Hardware, addresses, instructions, programs, and renderers perform structural
-  validation without depending on Llama.
-- The AiM adapter renders the DRAM-side subset accepted by the timing simulator
-  and rejects operands or instructions that its trace format cannot represent.
-- Reusable lowering exists for data movement, GEMV, elementwise operations,
-  normalization stages, and transformer attention stages.
-- Model-specific Llama code plans storage and orchestrates one batch-one decode
-  block. Tests cover small examples and the Llama 3 8B and 70B dimensions.
-- Layout choice is represented by immutable plans supplied to lowerers. The
-  current planner uses a simple baseline policy; an optimizer can replace that
-  policy without rewriting instruction emission.
-- Logical Shared Buffer vectors have an explicit physical layout and a
-  zero-padding contract. Raw output spans remain raw when the ISA does not yet
-  establish their lane order or padding.
+- There is no physical export for the reference services. Register selection,
+  result packing, scalar-program arguments, completion rules, and hardware
+  precision still need verified target definitions. Hynix MRS latch selection
+  is established; its complete command encoding is not. See
+  [execution contracts](research/execution-contracts.md).
+- No persistent weights, KV-cache updates, dynamic shapes, worker integration,
+  or complete model decode are implemented. Current scratch owns DRAM row zero;
+  it must not be mixed with long-lived DRAM data without a shared allocator.
+- Addition, multiplication, and copy can be verified with tensors split across
+  ranks, but execution is single-device. Collectives and distributed execution
+  are not implemented. Reshape and reference operations remain single-rank.
+- There are no general semantic broadcasting, reduction, transpose, or strided
+  view operations. Internal reference helpers provide only the specific steps
+  needed by the supported operations. Batched Linear repeats GEMV; it is not
+  an optimized matrix-matrix kernel.
+- Attention does not include Q/K/V projections, RoPE, cache management, head
+  merging, or the output projection. The feed-forward and attention graphs do
+  not yet form a complete transformer block.
+- Native device/target MLIR dialects and a maintained `torch.export` frontend
+  are not implemented. Device and target passes remain typed Python.
 
-As of this snapshot, Ruff and strict mypy pass. All 117 unit tests pass on
-Python 3.14, with 98% branch coverage. These checks establish typed structural
-behavior, not end-to-end numerical correctness.
+## Next work
 
-## Not implemented yet
-
-- The compiler does not load weights, activations, KV-cache data, or request
-  values into their planned addresses.
-- Several public lowering functions emit only structural stages because result
-  packing, reductions, or target runtime calls are not defined.
-- One Llama block is therefore not numerically executable even though it
-  produces a structurally valid program.
-- No runtime executes the mixed near-bank, PNM, and CXL instruction stream.
-- No vLLM platform, worker, model runner, or KV-cache connector calls this
-  compiler.
-- No cost model or search procedure chooses layouts for latency, bandwidth,
-  capacity, or parallelism.
-
-## Immediate milestone
-
-Make one RMSNorm invocation numerically complete on a small, hand-checkable
-vector. That requires the compiler and runtime contract to account for every
-input value, partial sum, final reduction, scale, output lane, and padding lane.
-Validate the result against a simple host implementation or an agreed
-functional executor. AiM alone cannot provide this check because it models
-timing rather than tensor values.
-
-This milestone is intentionally below a whole transformer block. It tests the
-same boundaries that later operations need: data loading, accumulator
-initialization, `RD_MAC` packing, reduction, PNM calls, zero padding, and result
-retrieval.
-
-## Blocking questions
-
-The affected source also contains nearby `TODO` comments. This list includes
-only questions that block several operations or an end-to-end result.
-
-1. **`WR_BIAS` accumulator selection and source.** Which accumulator does it
-   initialize when the instruction has no `Regid`, and how is the zero value
-   placed at its Shared Buffer source?
-2. **`RD_MAC` result layout.** When several channels, banks, and registers
-   produce results, which Shared Buffer lanes and slots receive each value?
-3. **PNM operation contracts.** What exact operations and output layouts do
-   `RED`, `ACC`, and `EXP` implement, and which RISC-V program counters provide
-   reciprocal, square root, and other required scalar functions?
-4. **Inactive PU groups.** How does a program disable bank groups that have no
-   logical work so they cannot contribute stale values?
-5. **Runtime tensor manifest.** Which component owns weights and request data,
-   performs physical packing, establishes zero padding, launches a program,
-   and interprets its outputs?
-
-The paper/AiM copy-instruction operand mismatch is documented in the AiM
-research note. The current policy keeps a paper-oriented typed instruction and
-handles the simulator's explicit bank operand in its target adapter.
-
-## Planned order of work
-
-1. Resolve the blocking ISA and runtime contracts with the CENT and simulator
-   owners; update code-level `TODO` comments and tests with each answer.
-2. Complete and numerically validate RMSNorm.
-3. Apply the same result-packing and runtime-binding contracts to GEMV,
-   attention, softmax, residuals, and the feed-forward network.
-4. Make one Llama block numerically match a trusted host implementation.
-5. Define the vLLM worker/runner boundary for GPU prefill and CENT decode.
-6. Add a cost model and layout search only after correctness measurements exist.
+1. Compose model-specific projections, positional encoding, head merging, and
+   output projection around attention; compare a complete block with an
+   independent numerical implementation.
+2. Introduce persistent weights and a shared DRAM allocator, then define KV-cache
+   updates and repeated decode before connecting vLLM workers.
+3. Resolve physical encoding, precision, reduction, and scalar-runtime questions
+   before exporting reference operations to hardware. Keep the column-address
+   units audit from the
+   [SK hynix research](research/sk-hynix-aim.md) explicit.
+4. Add native device/target MLIR passes and the maintained PyTorch frontend.
+5. Connect the external mapper through `MappingProvider` once a numerically
+   correct baseline can be measured. Cost models and search belong to that team.
