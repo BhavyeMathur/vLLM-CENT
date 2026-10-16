@@ -128,6 +128,12 @@ requirements for this repository.
 - Keep runtime validation for constraints annotations cannot express, including
   numeric ranges, alignment, capacity, and relationships among fields.
 - Prefer immutable, slotted dataclasses for structured values and instructions.
+- Put operation-specific parameters and mathematical checks on the concrete
+  operation type. A shared operation base may hold graph connections, but must
+  not accumulate optional fields for every operation or branch on a catalogue
+  of operation kinds. For example, only `RmsNormOperation` owns `epsilon`;
+  `AddOperation` must not accept it at all. Graph verification handles names
+  and dependencies, then delegates shape rules to the concrete operation.
 - Do not use a dictionary when the keys form a known schema that can be modeled
   by a dataclass or another custom type.
 - When conversion to a dictionary is genuinely required, use dataclass tools
@@ -161,51 +167,126 @@ requirements for this repository.
   copies have meaningfully different semantics. Document the reason when
   duplication is intentionally retained.
 
-## Documentation
+## Documentation: plain English is required
 
-- Every class, function, and method requires a developer-facing docstring,
-  including private helpers and test helpers.
-- Function and method docstrings must document every argument.
-- Document every return value. Omit the `Returns` section when a function
-  returns `None`; never write `Returns: None`.
+This is a code-review requirement, not a style preference. A technically
+correct docstring is still unacceptable if the reader has to decode dense
+compiler or hardware language to understand it. Assume the reader knows Python
+but is new to this compiler, CENT hardware, and LLM inference.
+
+- Start with what the object or function does for the caller. Explain the
+  purpose before the implementation, restrictions, or specialist vocabulary.
+- Treat docstrings as source for generated API documentation, not Markdown chat
+  messages. Keep the existing Google-style sections (`Args`, `Attributes`,
+  `Returns`, `Raises`, `Examples`) consistently indented and parseable.
+- Format Python names and expressions in prose as reStructuredText inline code
+  literals with double backticks: ``inputs``, ``None``, ``shard()``, and
+  ``device_ids=(0, 1)``. Use this convention consistently instead of mixing
+  Markdown single-backtick spans or fenced code blocks into docstrings.
+  Section entry labels such as `inputs:` or `ValueError:` stay unquoted so the
+  documentation parser can recognize them; quote references in their prose.
+- Keep the opening summary and elaboration about the general meaning, purpose,
+  and behavior of the API. Put worked or specialized examples in a separate
+  `Examples:` section, normally after the argument/attribute/return/error
+  sections. Do not use an example as a substitute for explaining the API.
+  Use indented prose with inline literals, a reStructuredText literal block,
+  or a valid doctest in that section. Label conceptual snippets as such and do
+  not give non-executable pseudocode a doctest prompt.
+- Use ordinary verbs and short, connected sentences. Prefer "split the tensor
+  equally across devices" to "supply a uniform logical partition", and
+  "an earlier operation must produce each input" to "enforce dominance".
+- Keep precise technical terms when they are useful, but explain them before
+  relying on them. For example, a rank is a device's position in the parallel
+  plan; an alias means two values use the same storage. Expanding an acronym
+  alone is not an explanation of the concept.
+- Do not stack undefined terms such as "capability-legal rank-local SSA
+  signature". Explain the actual data and relationship in separate sentences.
+  A noun followed by "metadata", "contract", "binding", or "invariant" is
+  not a sufficient description of what the value means.
+- Use a small concrete example whenever splitting, padding, indexing, address
+  units, storage reuse, or a mathematical operation is otherwise hard to see.
+  State the example's assumptions. Do not turn example dimensions or simulator
+  conventions into claims about the physical hardware.
+- Every module should explain what part of the work it owns. Every class,
+  function, and method requires a developer-facing docstring, including private
+  helpers and test helpers. Simple accessors and tests can be brief; nontrivial
+  algorithms need enough explanation to follow their inputs through the result.
+- Document every argument: what it represents, how this function uses it, and
+  its units or ordering when relevant. Repeating the type or parameter name is
+  not enough. Avoid circular descriptions such as "plan: The operation plan".
+- Document every return value: what it contains, how it relates to the inputs,
+  and ordering or units when relevant. State side effects such as appending
+  commands, updating a lookup table, or changing simulated memory. Omit a
+  `Returns` section for functions that return `None`.
 - Document every intentionally raised exception and the condition that causes
-  it.
-- Dataclass docstrings must document every field. Explain what the field means,
-  including units and relationships to other fields when they matter.
-- State a valid range only when it teaches the reader something that is not
-  obvious. Do not add words such as "positive" or "nonnegative" merely because
-  the implementation validates them. Put detailed validation rules in
-  ``Raises`` and in the validation code.
-- Enum docstrings must document every member.
-- Write docstrings as durable API documentation, not as conversational notes,
-  implementation history, or messages to the current reviewer.
-- Use the same plain language in docstrings as in comments. Define a value by
-  what it represents before describing constraints or implementation details.
+  it. Preserve important propagated errors at public entry points. Describe the
+  actual failure instead of saying only "if the contract is invalid".
+- Dataclass docstrings must explain every field. Enum docstrings must explain
+  every member. Put detailed range checks under `Raises`; include a range in a
+  field description only when it helps the reader understand the meaning.
+- Explain what this implementation supports and where it stops. Preserve the
+  distinction between choosing a plan and executing it, validating shapes and
+  proving numerical correctness, and simulator behavior and hardware facts.
+- Write durable documentation about the code. Do not put chat history, review
+  messages, or claims about the author's intentions into docstrings.
+
+Use this level of explanation for `ParallelPlan` and similarly central types:
+
+```python
+"""Describe how to split the graph's tensors across logical devices.
+
+The ``shard()`` pass applies this choice; this object only records it.
+Every tensor is split equally along the selected dimension. With one
+device, tensors stay whole. Physical addresses are selected later.
+
+Attributes:
+    device_ids: Devices that receive the pieces, in order. A device's
+        position in this tuple is its rank.
+    shard_axis: Tensor dimension to split equally. For a matrix, ``0``
+        splits rows and ``1`` splits columns. Ignored for a single device.
+
+Examples:
+    For an eight-element vector, ``device_ids=(0, 1)`` and ``shard_axis=0``
+    assign entries ``[0:4]`` to device 0 and ``[4:8]`` to device 1.
+"""
+```
 
 ## Comments and readability
 
-- Code must be understandable to a developer who is unfamiliar with CENT and
-  LLM inference. Use explanatory comments throughout nontrivial control flow.
-- Explain the sequence of operations, relevant hardware behavior, formulas,
-  partitioning, address calculations, and why a particular implementation is
-  correct.
-- Place comments next to the code they explain.
-- Explain unusual language mechanisms even when the resulting code is short.
-  State why the ordinary implementation cannot be used and why the chosen
-  mechanism is appropriate. For example, explain that ``object.__setattr__``
-  is needed to normalize a field during initialization of a frozen dataclass.
-- Do not merely translate a line of Python into English. Comments should supply
-  the missing reasoning or domain context.
-- Explain every nontrivial hard-coded expected value in tests, including how it
-  follows from model dimensions, hardware geometry, or instruction semantics.
-- Prefer readable intermediate names over compressed expressions. Split a
-  calculation into named steps when those names help explain the algorithm.
-- Write comments in plain language and keep sentences short. A comment should
-  make the code easier to read, not introduce several new terms at once.
-- For a complicated TODO, first say what is already known. Then list the open
-  questions separately. Concrete examples are better than compressed jargon.
-- Leave a blank comment line between a TODO and the ordinary comment that
-  follows it. This makes it clear where the TODO ends.
+- Explain nontrivial code where the reader encounters it. Add comments before
+  meaningful steps and beside subtle expressions, not only at the top of a
+  long function. Cover the sequence of work, reasons for branches, ownership,
+  indexing formulas, and why values must be preserved or initialized.
+- Explain why the step is needed or how it contributes to the result. Do not
+  annotate obvious Python line by line ("increment the counter"). The goal is
+  understanding, not maximum comment count or shorter source files.
+- For index and address arithmetic, name the units being converted and use a
+  small example when helpful: five values with two lanes per slot need three
+  slots, and the last lane must be zero.
+- For reuse, caching, or mutation, explain what can change, what must remain
+  available, and when it becomes safe to overwrite or discard something.
+- Explain unusual Python mechanisms. For example, `object.__setattr__` is
+  needed to normalize a field during initialization of a frozen dataclass.
+- Preserve explanatory comments that are already clear. Rewrite confusing
+  comments rather than adding a second explanation that contradicts them.
+- Explain nontrivial expected values in tests: why these addresses, counts, or
+  numbers follow from the example. Describe which bug or behavior the test
+  exercises. Keep assertions and examples precise.
+- Prefer readable intermediate names over compressed expressions when changing
+  executable code. A documentation-only task must not quietly change behavior
+  or reorganize APIs.
+- For a TODO, first state what is known, then the exact unanswered question and
+  its source (paper, target ABI, or unfinished implementation). Leave a blank
+  comment line before ordinary comments resume.
+
+Before declaring a change complete, read its documentation as a new developer.
+Could that reader explain what goes in, what happens, what comes out, what
+changes, and why the non-obvious steps are needed? If understanding still
+requires translating a dense phrase or looking up several unexplained terms,
+rewrite it. Also check that identifiers use code markup and examples are in
+their own section, so generated pages separate API meaning from usage examples.
+Passing lint or having all docstring sections does not satisfy this requirement
+by itself.
 
 ## CENT and model separation
 
