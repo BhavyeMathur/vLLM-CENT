@@ -4,16 +4,48 @@ import math
 import unittest
 from dataclasses import replace
 
+from vllm_cent.ir import AttentionOp, DType, Function, TensorType, Value
 from vllm_cent.pipeline import AccumulatorPlacement, ExecutionContract, compile_graph
-from vllm_cent.pipeline.ir import SemanticGraph, TensorType, Value
-from vllm_cent.pipeline.operations import AttentionOperation
 from vllm_cent.runtime import CentNamedScalars
 from tests.test_pipeline_gemv_norm import target
 
 
+def _fp32(name: str, *shape: int) -> Value:
+    """Create a named fp32 function argument, the only format the pipeline runs.
+
+    Args:
+        name: Argument name; the compiled program's input of the same name.
+        shape: Tensor dimensions, outermost first.
+
+    Returns:
+        A new graph input value with the requested shape.
+    """
+    return Value(type=TensorType(shape=shape, dtype=DType.FP32), name=name)
+
+
+def _single_attention(
+    inputs: tuple[Value, ...], operation: AttentionOp, *, preserve: bool
+) -> Function:
+    """Wrap one attention operation, whose result is named ``out``, in a function.
+
+    Args:
+        inputs: Graph arguments, in the order the program receives them.
+        operation: Attention reading ``inputs``.
+        preserve: Whether the function also returns every input after ``out``,
+            which keeps their storage alive and observable.
+
+    Returns:
+        Function returning ``out`` and, when requested, the unchanged inputs.
+    """
+    results = (*operation.results, *inputs) if preserve else operation.results
+    return Function(
+        name="main", operands=inputs, operations=(operation,), results=results
+    )
+
+
 def attention_graph(
     *, causal: bool = False, offset: int = 0, mask: bool = False
-) -> SemanticGraph:
+) -> Function:
     """Build two query heads sharing one key/value head, with different value width.
 
     Args:
@@ -22,28 +54,20 @@ def attention_graph(
         mask: Whether to include a separate full query-head mask.
 
     Returns:
-        Static graph retaining all original operands as observable outputs.
+        Static graph retaining all original operands as observable outputs. The
+        ``(1, 2, 2, 2)`` attention result is named ``out``, which also names the
+        attention operation in mapping plans.
     """
-    inputs = (
-        Value("q", TensorType((1, 2, 2, 3))),
-        Value("k", TensorType((1, 1, 3, 3))),
-        Value("v", TensorType((1, 1, 3, 2))),
-    )
+    inputs = (_fp32("q", 1, 2, 2, 3), _fp32("k", 1, 1, 3, 3), _fp32("v", 1, 1, 3, 2))
     if mask:
-        inputs += (Value("mask", TensorType((1, 2, 2, 3))),)
-    return SemanticGraph(
-        inputs=inputs,
-        operations=(
-            AttentionOperation(
-                name="attention",
-                inputs=tuple(value.name for value in inputs),
-                output=Value("out", TensorType((1, 2, 2, 2))),
-                causal=causal,
-                query_position_offset=offset,
-            ),
-        ),
-        outputs=("out", *(value.name for value in inputs)),
+        inputs += (_fp32("mask", 1, 2, 2, 3),)
+    operation = AttentionOp(
+        operands=inputs,
+        causal=causal,
+        query_position_offset=offset,
+        name_hint="out",
     )
+    return _single_attention(inputs, operation, preserve=True)
 
 
 class AttentionTests(unittest.TestCase):
@@ -62,7 +86,7 @@ class AttentionTests(unittest.TestCase):
             target(),
             mapping=replace(
                 artifact.target_ir.mapping,
-                accumulators=(AccumulatorPlacement(operation="attention", register=1),),
+                accumulators=(AccumulatorPlacement(operation="out", register=1),),
             ),
         )
         inputs = tuple(
@@ -101,17 +125,18 @@ class AttentionTests(unittest.TestCase):
             compile_graph(
                 graph, replace(target(), execution_contract=ExecutionContract.STANDARD)
             )
-        operation = graph.operations[0]
-        with self.assertRaises(ValueError):
-            operation.verify(
-                (
-                    TensorType((1, 3, 2, 3)),
-                    TensorType((1, 2, 3, 3)),
-                    TensorType((1, 2, 3, 2)),
+        # Three query heads cannot be shared equally by two key/value heads.
+        with self.assertRaisesRegex(ValueError, "do not fit"):
+            AttentionOp(
+                operands=(
+                    _fp32("q", 1, 3, 2, 3),
+                    _fp32("k", 1, 2, 3, 3),
+                    _fp32("v", 1, 2, 3, 2),
                 )
             )
+        operation = graph.operations[0]
         for changes in ({"scale": math.nan}, {"query_position_offset": -1}):
-            with self.assertRaises(ValueError):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
                 replace(operation, **changes)
 
     def test_non_square_causal_prefix_requires_explicit_offset(self) -> None:
@@ -119,39 +144,41 @@ class AttentionTests(unittest.TestCase):
         from vllm_cent.pipeline import ValuePlacement
 
         inputs = (
-            Value("q", TensorType((1, 1, 1, 1))),
-            Value("k", TensorType((1, 1, 5, 1))),
-            Value("v", TensorType((1, 1, 5, 1))),
+            _fp32("q", 1, 1, 1, 1),
+            _fp32("k", 1, 1, 5, 1),
+            _fp32("v", 1, 1, 5, 1),
         )
-        graph = SemanticGraph(
-            inputs=inputs,
-            operations=(
-                AttentionOperation(
-                    name="attention",
-                    inputs=("q", "k", "v"),
-                    output=Value("out", inputs[0].type),
-                    causal=True,
-                    scale=0.0,
-                ),
-            ),
-            outputs=("out",),
-        )
+
+        def positioned(offset: int) -> Function:
+            """Return the causal one-query graph with the first query at ``offset``.
+
+            Args:
+                offset: Query position; keys ``0`` through ``offset`` are visible.
+
+            Returns:
+                Function computing ``out`` with a zero score scale, so every
+                visible key receives equal weight.
+            """
+            operation = AttentionOp(
+                operands=inputs,
+                causal=True,
+                query_position_offset=offset,
+                scale=0.0,
+                name_hint="out",
+            )
+            return _single_attention(inputs, operation, preserve=False)
+
+        graph = positioned(0)
         values = (
             CentNamedScalars(name="q", values=(2.0,)),
             CentNamedScalars(name="k", values=(1.0, 2.0, 3.0, 4.0, 5.0)),
             CentNamedScalars(name="v", values=(1.0, 2.0, 3.0, 4.0, 5.0)),
         )
+        # Zero scale makes visible keys equally likely: offset zero sees only
+        # v[0] = 1, while offsets four and seven see all five values (mean 3).
         for offset, expected in ((0, 1.0), (4, 3.0), (7, 3.0)):
-            positioned = replace(
-                graph,
-                operations=(
-                    replace(graph.operations[0], query_position_offset=offset),
-                ),
-            )
-            self.assertAlmostEqual(
-                compile_graph(positioned, target()).execute(values)[0].values[0],
-                expected,
-            )
+            artifact = compile_graph(positioned(offset), target())
+            self.assertAlmostEqual(artifact.execute(values)[0].values[0], expected)
         # The output fits the query's slot, but attention reads queries repeatedly.
         with self.assertRaisesRegex(ValueError, "live"):
             compile_graph(
@@ -183,13 +210,17 @@ class AttentionTests(unittest.TestCase):
             )
         with self.assertRaises(ValueError):
             compile_target(replace(artifact.target_ir, reference_workspace=None))
-        operation = graph.operations[0]
-        types = tuple(value.type for value in graph.inputs)
+        q, k, v = graph.operands
+        # Missing operands, a one-dimensional mask, and a two-dimensional query
+        # are rejected when the operation is built.
         for invalid in (
             (),
-            types[:2],
-            (*types, TensorType((3,))),
-            (TensorType((2, 3)), *types[1:]),
+            (q, k),
+            (q, k, v, _fp32("mask", 3)),
+            (_fp32("q", 2, 3), k, v),
         ):
-            with self.subTest(types=invalid), self.assertRaises(ValueError):
-                operation.verify(invalid)
+            with (
+                self.subTest(shapes=[value.type.shape for value in invalid]),
+                self.assertRaises(ValueError),
+            ):
+                AttentionOp(operands=invalid)

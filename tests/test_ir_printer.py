@@ -238,6 +238,18 @@ class PrintFunctionTest(unittest.TestCase):
             "}",
         )
 
+    def test_empty_name_is_numbered(self) -> None:
+        """An empty name would print as a bare '%', so it is numbered like no name."""
+
+        empty = Value(type=VECTOR, name="")
+        function = Function(
+            name="f", operands=(empty,), operations=(), results=(empty,)
+        )
+        self.assertEqual(
+            print_function(function),
+            f"func @f(%0: {VECTOR_TEXT}) -> ({VECTOR_TEXT}) {{\n  return %0\n}}",
+        )
+
     def test_numbering_skips_claimed_names(self) -> None:
         """An argument named '0' forces unnamed results to start at %1."""
 

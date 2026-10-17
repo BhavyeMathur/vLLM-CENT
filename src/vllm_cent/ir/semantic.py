@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from math import inf, prod
 
+from ..activations import ActivationKind
 from .types import Partial, Placement, Replicate, Shard, TensorRole, TensorType
 from .base import Value, Operation
 
@@ -163,9 +165,11 @@ class RMSNormOp(Operation):
     def infer_result_types(self) -> tuple[TensorType, ...]:
         """RMSNorm keeps x's shape, dtype and axes; the result is an activation."""
 
-        if (self.eps is not None) and self.eps <= 0:
+        # nan fails every comparison, so test for the valid range rather than
+        # for eps <= 0; this rejects nan and inf as well as non-positive eps.
+        if (self.eps is not None) and not (0 < self.eps < inf):
             raise ValueError(
-                f"{self.NAME}: eps must be positive, "
+                f"{self.NAME}: eps must be positive and finite, "
                 f"got {self.eps}"
             )
 
@@ -239,6 +243,81 @@ class RMSNormOp(Operation):
 
 
 @dataclass(frozen = True, eq = False, slots=True)
+class CopyOp(Operation):
+    """A copy of x as a new value; every element stays where it is.
+
+    CopyOp(operands=(x,))
+    """
+
+    NAME = "aloi.copy"
+    NUM_OPERANDS = 1
+
+    @property
+    def x(self) -> Value:
+        return self.operands[0]
+
+    def infer_result_types(self) -> tuple[TensorType, ...]:
+        """The result has x's shape, dtype, axes and placement.
+
+        A partial sum is accepted: copying is linear, so copying each rank's
+        part and summing later gives the same tensor as summing first.
+        """
+
+        return (replace(self.x.type, role = TensorRole.ACTIVATION),)
+
+
+@dataclass(frozen = True, eq = False, slots=True)
+class ReshapeOp(Operation):
+    """View x's elements, in row-major order, with a new shape.
+
+    No element moves: this is not a transpose or a strided view. A (2, 3)
+    tensor can become (6,) or (3, 2), and all three list the same six values
+    in the same order.
+
+    ReshapeOp(operands=(x,), shape=(6,))
+
+    Attributes:
+        shape: The result shape, fully known (no -1). It has as many elements
+            as x.
+    """
+
+    NAME = "aloi.reshape"
+    NUM_OPERANDS = 1
+
+    shape: tuple[int, ...]
+
+    @property
+    def x(self) -> Value:
+        return self.operands[0]
+
+    def infer_result_types(self) -> tuple[TensorType, ...]:
+        """The result has the new shape and x's dtype, with no axes.
+
+        Axes are dropped: a general reshape can merge or split axes in ways a
+        name cannot describe. split_heads and merge_heads are the reshapes
+        that keep axis names.
+
+        Raises:
+            ValueError: If a dimension is negative, the element counts
+                differ, or x is split or a partial sum. Which elements a rank
+                owns can change under a reshape: after (8 heads x 128) on one
+                rank becomes another shape, the split dimension may be merged
+                with others, and Shard(axis) can no longer describe it.
+        """
+
+        x = self.x.type
+        if any(d < 0 for d in self.shape) or prod(self.shape) != prod(x.shape):
+            raise ValueError(
+                f"{self.NAME}: cannot reshape {x.shape} to {self.shape}"
+            )
+        if not isinstance(x.placement, Replicate):
+            raise ValueError(
+                f"{self.NAME}: x is {x.placement}; only whole tensors are reshaped"
+            )
+        return (TensorType(shape = tuple(self.shape), dtype = x.dtype),)
+
+
+@dataclass(frozen = True, eq = False, slots=True)
 class AllReduceOp(Operation):
     """Sum a partial tensor over all tensor-parallel ranks.
 
@@ -271,17 +350,25 @@ class AllReduceOp(Operation):
             )
         return (replace(self.x.type, placement = Replicate()),)
 
-    
 
-@dataclass(frozen = True, eq = False, slots=True)
-class SiluOp(Operation):
-    """SiLU activation, ``x * sigmoid(x)``, element by element.
+@dataclass(frozen = True, eq = False, slots = True)
+class ActivationOp(Operation):
+    """A parameter-free activation applied to every element.
 
-    SiluOp(operands=(x,))
+    ``function`` picks the formula: SiLU, ReLU, sigmoid, tanh, or one of the
+    two GELU formulas. The exact (erf) GELU and its tanh approximation are
+    different choices; no pass may exchange them.
+
+    ActivationOp(operands=(x,), function=ActivationKind.SILU)
+
+    Attributes:
+        function: Which formula to apply.
     """
 
-    NAME = "aloi.silu"
+    NAME = "aloi.activation"
     NUM_OPERANDS = 1
+
+    function: ActivationKind
 
     @property
     def x(self) -> Value:
@@ -290,9 +377,12 @@ class SiluOp(Operation):
     def infer_result_types(self) -> tuple[TensorType, ...]:
         """The result has x's shape, dtype, axes and placement.
 
+        A split x stays split the same way: each element's result depends
+        only on that element, so no rank needs another rank's data.
+
         Raises:
-            ValueError: If x is a partial sum. SiLU is not linear, so
-                silu(a) + silu(b) != silu(a + b): the parts must be summed
+            ValueError: If x is a partial sum. None of the formulas is
+                linear, so f(a) + f(b) != f(a + b): the parts must be summed
                 first.
         """
 

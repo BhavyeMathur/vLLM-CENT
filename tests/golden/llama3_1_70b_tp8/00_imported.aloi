@@ -21,7 +21,7 @@ func @forward(%input_layernorm.weight: tensor<8192xbf16>, %self_attn.q_proj.weig
   %post_attention_layernorm = aloi.rms_norm(%add, %post_attention_layernorm.weight) {eps = 1e-05} : tensor<1x1x8192xbf16>
   %mlp.gate_proj = aloi.linear(%post_attention_layernorm, %mlp.gate_proj.weight) : tensor<1x1x28672xbf16>
   %mlp.up_proj = aloi.linear(%post_attention_layernorm, %mlp.up_proj.weight) : tensor<1x1x28672xbf16>
-  %mlp.silu = aloi.silu(%mlp.gate_proj) : tensor<1x1x28672xbf16>
+  %mlp.silu = aloi.activation(%mlp.gate_proj) {function = silu} : tensor<1x1x28672xbf16>
   %mlp.mul = aloi.mul(%mlp.silu, %mlp.up_proj) : tensor<1x1x28672xbf16>
   %mlp.down_proj = aloi.linear(%mlp.mul, %mlp.down_proj.weight) : tensor<1x1x8192xbf16>
   %add_1 = aloi.add(%add, %mlp.down_proj) : tensor<1x1x8192xbf16>

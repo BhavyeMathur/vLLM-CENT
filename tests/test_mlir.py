@@ -2,42 +2,86 @@
 
 import importlib.util
 import unittest
-from dataclasses import replace
 from unittest.mock import patch
 
-from vllm_cent.ir_mlir import from_mlir, optimize_mlir, to_mlir
-from vllm_cent.pipeline.ir import (
-    ScalarType,
-    SemanticGraph,
+from vllm_cent.ir import (
+    AddOp,
+    DType,
+    Function,
+    MulOp,
+    RMSNormOp,
     TensorType,
     Value,
+    print_function,
+    value_names,
 )
-from vllm_cent.pipeline.operations import (
-    AddOperation,
-    MultiplyOperation,
-    RmsNormOperation,
-)
+from vllm_cent.ir_mlir import from_mlir, optimize_mlir, to_mlir
+from vllm_cent.pipeline import CompiledArtifact
 
 
-def _graph() -> SemanticGraph:
+def _arguments() -> tuple[Value, Value]:
+    """Create the two named three-element fp32 inputs shared by these graphs.
+
+    Returns:
+        ``left`` and ``right`` arguments, in that order.
+    """
+    tensor = TensorType(shape=(3,), dtype=DType.FP32)
+    return Value(type=tensor, name="left"), Value(type=tensor, name="right")
+
+
+def _graph() -> Function:
     """Build sum = left + right with a model-block label to preserve on export.
 
     Returns:
-        One addition on three-element F32 tensors, labelled decoder.0.
+        Function ``main`` with one addition on three-element fp32 tensors. Its
+        result is named ``decoder.0.sum``: the ``decoder.0`` prefix is the
+        model-block label, and the whole name travels as ``cent.name``.
     """
-    tensor = TensorType((3,), ScalarType.F32)
-    return SemanticGraph(
-        inputs=(Value("left", tensor), Value("right", tensor)),
-        operations=(
-            AddOperation(
-                name="residual",
-                inputs=("left", "right"),
-                output=Value("sum", tensor),
-                block="decoder.0",
-            ),
-        ),
-        outputs=("sum",),
+    left, right = _arguments()
+    residual = AddOp(operands=(left, right), name_hint="decoder.0.sum")
+    return Function(
+        name="main",
+        operands=(left, right),
+        operations=(residual,),
+        results=residual.results,
     )
+
+
+def _assert_same_artifact(
+    test: unittest.TestCase, actual: CompiledArtifact, expected: CompiledArtifact
+) -> None:
+    """Check that two compilations produced the same program from equal sources.
+
+    IR values compare by identity, so two separately built functions are never
+    equal objects even when they describe the same calculation. Compare their
+    printed text instead, then every other compiled field exactly.
+
+    Args:
+        test: Test case that reports the failed assertion.
+        actual: Artifact compiled through the MLIR frontend.
+        expected: Artifact compiled directly from the Python IR function.
+    """
+    actual_request = actual.target_ir.request
+    expected_request = expected.target_ir.request
+    test.assertEqual(
+        print_function(actual_request.graph.source),
+        print_function(expected_request.graph.source),
+    )
+    test.assertEqual(actual_request.graph.ranks, expected_request.graph.ranks)
+    test.assertEqual(
+        actual_request.graph.capabilities, expected_request.graph.capabilities
+    )
+    test.assertEqual(actual_request.target, expected_request.target)
+    test.assertEqual(actual_request.constraints, expected_request.constraints)
+    test.assertEqual(actual.target_ir.mapping, expected.target_ir.mapping)
+    test.assertEqual(actual.target_ir.commands, expected.target_ir.commands)
+    test.assertEqual(
+        actual.target_ir.reference_workspace, expected.target_ir.reference_workspace
+    )
+    test.assertEqual(actual.version, expected.version)
+    test.assertEqual(actual.inputs, expected.inputs)
+    test.assertEqual(actual.outputs, expected.outputs)
+    test.assertEqual(actual.executable, expected.executable)
 
 
 class MlirDependencyTests(unittest.TestCase):
@@ -62,26 +106,28 @@ class NativeMlirTests(unittest.TestCase):
         text = to_mlir(_graph())
         self.assertIn("arith.addf", text)
         self.assertIn("tensor<3xf32>", text)
-        self.assertEqual(from_mlir(text), _graph())
+        self.assertIn('cent.name = "decoder.0.sum"', text)
+        self.assertIn('cent.input_names = ["left", "right"]', text)
+        imported = from_mlir(text)
+        self.assertEqual(print_function(imported), print_function(_graph()))
+        self.assertEqual(imported.operations[0].name_hint, "decoder.0.sum")
 
     def test_multiplication_roundtrip_and_fastmath_rejection(self) -> None:
         """Preserve multiplication and reject unsupported floating-point promises."""
-        graph = _graph()
-        graph = replace(
-            graph,
-            operations=(
-                MultiplyOperation(
-                    name="product",
-                    inputs=("left", "right"),
-                    output=graph.operations[0].output,
-                    block="decoder.0",
-                ),
-            ),
+        left, right = _arguments()
+        product = MulOp(operands=(left, right), name_hint="decoder.0.product")
+        graph = Function(
+            name="main",
+            operands=(left, right),
+            operations=(product,),
+            results=product.results,
         )
         text = to_mlir(graph)
         self.assertIn("arith.mulf", text)
-        self.assertEqual(from_mlir(text), graph)
-        self.assertEqual(from_mlir(optimize_mlir(text)), graph)
+        self.assertEqual(print_function(from_mlir(text)), print_function(graph))
+        self.assertEqual(
+            print_function(from_mlir(optimize_mlir(text))), print_function(graph)
+        )
         relaxed = text.replace(
             "arith.mulf %arg0, %arg1", "arith.mulf %arg0, %arg1 fastmath<fast>"
         )
@@ -90,7 +136,10 @@ class NativeMlirTests(unittest.TestCase):
 
     def test_native_pass_pipeline_preserves_semantics(self) -> None:
         """Run native simplification passes and recover the same single-addition graph."""
-        self.assertEqual(from_mlir(optimize_mlir(to_mlir(_graph()))), _graph())
+        self.assertEqual(
+            print_function(from_mlir(optimize_mlir(to_mlir(_graph())))),
+            print_function(_graph()),
+        )
 
     def test_import_without_cent_metadata(self) -> None:
         """Give ordinary MLIR inputs and results stable names when CENT attributes are absent."""
@@ -101,38 +150,53 @@ class NativeMlirTests(unittest.TestCase):
           }
         }"""
         graph = from_mlir(text)
-        self.assertEqual(graph.inputs[0].name, "arg0")
-        self.assertEqual(graph.operations[0].inputs, ("arg0", "arg1"))
-        self.assertEqual(graph.outputs, ("value0",))
+        names = value_names(graph)
+        self.assertEqual(
+            tuple(names[value] for value in graph.operands), ("arg0", "arg1")
+        )
+        self.assertEqual(graph.operations[0].operands, graph.operands)
+        self.assertEqual(graph.operations[0].name_hint, "value0")
+        self.assertEqual(tuple(names[value] for value in graph.results), ("value0",))
 
     def test_partial_metadata_keeps_generated_names_unique(self) -> None:
         """Reserve later explicit names before naming unannotated inputs and results."""
+        # The later results claim "value0" and "arg0", the names the importer
+        # would otherwise generate for the first result and the input. Both
+        # generated names therefore take the first free suffix, "_0".
         text = """module {
           func.func @main(%a: tensor<3xf32>) -> tensor<3xf32> {
             %x = arith.addf %a, %a : tensor<3xf32>
-            %y = arith.addf %x, %a {cent.output = "arg0", cent.name = "add0"}
-              : tensor<3xf32>
-            return %y : tensor<3xf32>
+            %y = arith.addf %x, %a {cent.name = "value0"} : tensor<3xf32>
+            %z = arith.addf %y, %a {cent.name = "arg0"} : tensor<3xf32>
+            return %z : tensor<3xf32>
           }
         }"""
         graph = from_mlir(text)
-        self.assertEqual(graph.inputs[0].name, "arg0_0")
-        self.assertEqual(graph.operations[0].name, "add0_0")
-        self.assertEqual(graph.operations[1].name, "add0")
-        self.assertEqual(graph.outputs, ("arg0",))
+        names = value_names(graph)
+        self.assertEqual(names[graph.operands[0]], "arg0_0")
+        self.assertEqual(
+            [names[operation.results[0]] for operation in graph.operations],
+            ["value0_0", "value0", "arg0"],
+        )
+        self.assertEqual(tuple(names[value] for value in graph.results), ("arg0",))
+        # An explicit input name also reserves the generated result name.
         annotated = to_mlir(_graph()).replace(
             '["left", "right"]', '["value0", "right"]'
         )
-        annotated = annotated.replace(', cent.output = "sum"', "")
-        self.assertEqual(from_mlir(annotated).outputs, ("value0_0",))
+        annotated = annotated.replace(' {cent.name = "decoder.0.sum"}', "")
+        imported = from_mlir(annotated)
+        self.assertEqual(
+            tuple(value_names(imported)[value] for value in imported.results),
+            ("value0_0",),
+        )
 
     def test_rejects_explicit_rounding_metadata(self) -> None:
         """Do not erase rounding choices that the semantic arithmetic cannot retain."""
         # Pinned IREE predates native arith rounding-mode attributes. A plain
         # attribute exercises the import guard without depending on a newer parser.
         text = to_mlir(_graph()).replace(
-            'cent.name = "residual"',
-            'roundingmode = "toward_zero", cent.name = "residual"',
+            'cent.name = "decoder.0.sum"',
+            'roundingmode = "toward_zero", cent.name = "decoder.0.sum"',
         )
         with self.assertRaisesRegex(ValueError, "rounding"):
             from_mlir(text)
@@ -162,10 +226,26 @@ class NativeMlirTests(unittest.TestCase):
 
     def test_native_canonicalization_removes_dead_addition(self) -> None:
         """Remove the addition when the function returns only an unchanged input."""
-        graph = replace(_graph(), outputs=("left",))
+        graph = _graph()
+        graph = Function(
+            name=graph.name,
+            operands=graph.operands,
+            operations=graph.operations,
+            results=graph.operands[:1],
+        )
         optimized = optimize_mlir(to_mlir(graph))
         self.assertNotIn("arith.addf", optimized)
-        self.assertEqual(from_mlir(optimized), replace(graph, operations=()))
+        self.assertEqual(
+            print_function(from_mlir(optimized)),
+            print_function(
+                Function(
+                    name=graph.name,
+                    operands=graph.operands,
+                    operations=(),
+                    results=graph.operands[:1],
+                )
+            ),
+        )
 
     def test_rejects_fastmath_assumptions(self) -> None:
         """Do not silently erase floating-point assumptions during import."""
@@ -177,15 +257,17 @@ class NativeMlirTests(unittest.TestCase):
 
     def test_rejects_unsupported_export(self) -> None:
         """Reject normalization until native export and device lowering support it."""
-        graph = _graph()
-        operation = RmsNormOperation(
-            name="norm",
-            inputs=("left", "right"),
-            output=graph.operations[0].output,
-            epsilon=1e-5,
+        left, right = _arguments()
+        # ``right`` serves as the learned per-element scale of length three.
+        norm = RMSNormOp(operands=(left, right), eps=1e-5, name_hint="norm")
+        graph = Function(
+            name="main",
+            operands=(left, right),
+            operations=(norm,),
+            results=norm.results,
         )
         with self.assertRaisesRegex(ValueError, "addition and multiplication"):
-            to_mlir(replace(graph, operations=(operation,)))
+            to_mlir(graph)
 
     def test_rejects_dynamic_and_scalar_mlir_types(self) -> None:
         """Reject unknown tensor dimensions and bare scalar types instead of tensor types."""
@@ -244,7 +326,10 @@ class MlirExecutionTests(unittest.TestCase):
             ),
         )
         artifact = compile_mlir(to_mlir(_graph()), target)
-        self.assertEqual(artifact, compile_graph(_graph(), target))
+        _assert_same_artifact(self, artifact, compile_graph(_graph(), target))
+        # The result name's parent path survives MLIR as the device block label.
+        (operation,) = artifact.target_ir.request.graph.ranks[0].operations
+        self.assertEqual(operation.block, "decoder.0")
         self.assertEqual(
             artifact.execute(
                 (
@@ -252,7 +337,7 @@ class MlirExecutionTests(unittest.TestCase):
                     CentNamedScalars(name="right", values=(10.0, 20.0, -30.0)),
                 )
             ),
-            (CentNamedScalars(name="sum", values=(11.0, 18.0, -27.0)),),
+            (CentNamedScalars(name="decoder.0.sum", values=(11.0, 18.0, -27.0)),),
         )
 
     def test_mlir_multiply_add_chain_executes(self) -> None:
@@ -261,24 +346,17 @@ class MlirExecutionTests(unittest.TestCase):
         from vllm_cent.runtime import CentNamedScalars
         from tests.test_pipeline import target
 
-        graph = _graph()
-        product = Value("product", graph.inputs[0].type)
-        graph = replace(
-            graph,
-            operations=(
-                MultiplyOperation(
-                    name="multiply", inputs=("left", "right"), output=product
-                ),
-                AddOperation(
-                    name="add",
-                    inputs=("product", "left"),
-                    output=graph.operations[0].output,
-                ),
-            ),
-            outputs=("sum", "left"),
+        left, right = _arguments()
+        product = MulOp(operands=(left, right), name_hint="product")
+        total = AddOp(operands=(product.results[0], left), name_hint="sum")
+        graph = Function(
+            name="main",
+            operands=(left, right),
+            operations=(product, total),
+            results=(total.results[0], left),
         )
         artifact = compile_mlir(to_mlir(graph), target())
-        self.assertEqual(artifact, compile_graph(graph, target()))
+        _assert_same_artifact(self, artifact, compile_graph(graph, target()))
         self.assertEqual(
             artifact.execute(
                 (

@@ -21,7 +21,7 @@ func @forward(%input_layernorm.weight: tensor<8192xbf16, role=weight, axes=[hidd
   %post_attention_layernorm = aloi.rms_norm(%add, %post_attention_layernorm.weight) {eps = 1e-05} : tensor<1x1x8192xbf16, axes=[batch, seq_len, hidden]>
   %mlp.gate_proj = aloi.linear(%post_attention_layernorm, %mlp.gate_proj.weight) : tensor<1x1x28672xbf16, axes=[batch, seq_len, intermediate]>
   %mlp.up_proj = aloi.linear(%post_attention_layernorm, %mlp.up_proj.weight) : tensor<1x1x28672xbf16, axes=[batch, seq_len, intermediate]>
-  %mlp.silu = aloi.silu(%mlp.gate_proj) : tensor<1x1x28672xbf16, axes=[batch, seq_len, intermediate]>
+  %mlp.silu = aloi.activation(%mlp.gate_proj) {function = silu} : tensor<1x1x28672xbf16, axes=[batch, seq_len, intermediate]>
   %mlp.mul = aloi.mul(%mlp.silu, %mlp.up_proj) : tensor<1x1x28672xbf16, axes=[batch, seq_len, intermediate]>
   %mlp.down_proj = aloi.linear(%mlp.mul, %mlp.down_proj.weight) : tensor<1x1x8192xbf16, axes=[batch, seq_len, hidden]>
   %add_1 = aloi.add(%add, %mlp.down_proj) : tensor<1x1x8192xbf16, axes=[batch, seq_len, hidden]>

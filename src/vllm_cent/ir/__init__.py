@@ -3,17 +3,20 @@
 from .annotate import AnnotateRolesAndAxes, TensorAnnotation
 from .base import Function, Module, Operation, Value, clone_function, rebuild_function
 from .passes import ClonePass, FunctionPass, Pass, PassManager
-from .printer import format_type, print_function, print_module
+from .printer import format_type, print_function, print_module, value_names
 from .semantic import (
+    ActivationOp,
     AddOp,
     AllReduceOp,
+    CopyOp,
     LinearOp,
     MulOp,
+    ReshapeOp,
     RMSNormOp,
-    SiluOp,
     SoftmaxOp,
 )
 from .transformer import (
+    AttentionOp,
     GqaQKOp,
     GqaSVOp,
     KvUpdateOp,
@@ -35,10 +38,13 @@ from .types import (
 )
 
 __all__ = [
+    "ActivationOp",
     "AddOp",
     "AllReduceOp",
     "AnnotateRolesAndAxes",
+    "AttentionOp",
     "ClonePass",
+    "CopyOp",
     "DType",
     "Function",
     "FunctionPass",
@@ -56,9 +62,9 @@ __all__ = [
     "Placement",
     "RMSNormOp",
     "Replicate",
+    "ReshapeOp",
     "RopeOp",
     "Shard",
-    "SiluOp",
     "SoftmaxOp",
     "SplitHeadsOp",
     "TensorAnnotation",
@@ -73,4 +79,5 @@ __all__ = [
     "print_function",
     "print_module",
     "rebuild_function",
+    "value_names",
 ]

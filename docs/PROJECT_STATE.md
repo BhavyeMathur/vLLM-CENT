@@ -1,6 +1,6 @@
 # Project state
 
-Last synchronized: 2026-10-15
+Last synchronized: 2026-10-17
 
 ## Goal
 
@@ -11,10 +11,15 @@ See [MULTI_LEVEL_COMPILER.md](MULTI_LEVEL_COMPILER.md) for the stages and API ex
 
 ## What works
 
-- The Python graph API separates tensor math, splitting tensors across devices,
-  selecting supported device operations, assigning storage, and emitting CENT
-  instructions. Each stage checks its input. Manual mappings and the default
-  mapper use the same checks.
+- One IR (`vllm_cent.ir`) serves every frontend. The compiler separates tensor
+  math, tensor-parallel splitting, selecting supported device operations,
+  assigning storage, and emitting CENT instructions. Each stage checks its
+  input. Manual mappings and the default mapper use the same checks.
+- A PyTorch frontend exports models written with `aloi` layers and ops through
+  `torch.export` and imports them into the IR. Models annotate semantic axes;
+  a per-model parallel plan splits them into one SPMD program with derived
+  all-reduces. `aloi-compile --model <config.json> --run <run.yaml>` prints the
+  IR of each stage for the example Llama 2 / 3.1 70B decoder layer.
 - Addition, elementwise multiplication, copy, and contiguous reshape compile and
   execute on logical device zero. Shapes are static, and addition/multiplication
   require equal shapes. Storage reuse preserves requested inputs and intermediate
@@ -42,15 +47,17 @@ See [MULTI_LEVEL_COMPILER.md](MULTI_LEVEL_COMPILER.md) for the stages and API ex
   value. Its Python-float results validate data flow, not hardware precision or
   timing.
 - Optional native MLIR parsing, verification, and optimization support addition
-  and multiplication through registered `func`/`arith` dialects. Imported graphs
-  use the same Python compilation stages as directly constructed graphs.
+  and multiplication through registered `func`/`arith` dialects. Imported
+  functions use the same compilation stages as PyTorch-imported and directly
+  constructed ones.
 - The older typed CENT instructions, structural Llama compiler, and AiM timing
   serializer remain available. A structurally valid Llama trace is not evidence
   of an executable numerical model.
 
-Validation: **334 tests pass**, including independent scalar oracles, native MLIR,
-and the external PyTorch SDPA oracle. Branch-enabled coverage is **98%**. Ruff
-lint/format, strict mypy, and whitespace checks pass. These checks cover the
+Validation: **600 tests pass**, including independent scalar oracles, native
+MLIR, and the external PyTorch SDPA oracle (the MLIR and SDPA tests skip when
+IREE or the torch interpreter is unavailable). Strict mypy passes. Coverage and
+format checks were not re-run after the IR merge. These checks cover the
 supported reference calculations, not physical hardware or complete model decode.
 
 ## What does not work yet
@@ -63,9 +70,9 @@ supported reference calculations, not physical hardware or complete model decode
 - No persistent weights, KV-cache updates, dynamic shapes, worker integration,
   or complete model decode are implemented. Current scratch owns DRAM row zero;
   it must not be mixed with long-lived DRAM data without a shared allocator.
-- Addition, multiplication, and copy can be verified with tensors split across
-  ranks, but execution is single-device. Collectives and distributed execution
-  are not implemented. Reshape and reference operations remain single-rank.
+- Tensor-parallel IR is produced, but execution is single-device: `legalize()`
+  lowers one rank's program, and all-reduce has no device lowering. Distributed
+  execution is not implemented.
 - There are no general semantic broadcasting, reduction, transpose, or strided
   view operations. Internal reference helpers provide only the specific steps
   needed by the supported operations. Batched Linear repeats GEMV; it is not
@@ -73,8 +80,11 @@ supported reference calculations, not physical hardware or complete model decode
 - Attention does not include Q/K/V projections, RoPE, cache management, head
   merging, or the output projection. The feed-forward and attention graphs do
   not yet form a complete transformer block.
-- Native device/target MLIR dialects and a maintained `torch.export` frontend
-  are not implemented. Device and target passes remain typed Python.
+- PyTorch-imported functions reach CENT instructions only when every operation
+  has a device lowering and every tensor is fp32. RoPE, KV-cache update, and the
+  decomposed GQA attention steps have no device lowering yet.
+- Native device/target MLIR dialects are not implemented. Device and target
+  passes remain typed Python.
 
 ## Next work
 
@@ -87,6 +97,8 @@ supported reference calculations, not physical hardware or complete model decode
    before exporting reference operations to hardware. Keep the column-address
    units audit from the
    [SK hynix research](research/sk-hynix-aim.md) explicit.
-4. Add native device/target MLIR passes and the maintained PyTorch frontend.
+4. Lower RoPE, KV-cache update, and the decomposed attention steps so the
+   imported Llama decoder layer compiles end to end; then add native
+   device/target MLIR passes.
 5. Connect the external mapper through `MappingProvider` once a numerically
    correct baseline can be measured. Cost models and search belong to that team.

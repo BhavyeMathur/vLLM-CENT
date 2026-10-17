@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum, auto
+from math import prod
 from typing import assert_never
 
 class DType(StrEnum):
@@ -223,6 +224,12 @@ class TensorType:
     @property
     def rank(self) -> int:
         return len(self.shape)
+
+    @property
+    def numel(self) -> int:
+        """Number of elements; a scalar (shape ``()``) has one."""
+
+        return prod(self.shape)
 
     def dim_of(self, axis: str) -> int:
         """Return the dimension that `axis` splits: named `axis`, or packed with `axis` outermost."""

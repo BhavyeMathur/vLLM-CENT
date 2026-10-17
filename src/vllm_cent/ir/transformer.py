@@ -18,6 +18,7 @@ tensor parallelism is applied), like the ops in semantic.py.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from math import isfinite
 
 from .base import Operation, Value
 from .types import (
@@ -33,6 +34,7 @@ from .types import (
 )
 
 __all__ = [
+    "AttentionOp",
     "GqaQKOp",
     "GqaSVOp",
     "KvUpdateOp",
@@ -571,5 +573,83 @@ class GqaSVOp(Operation):
                 axes=axes,
                 global_shape=global_shape,
                 placement=placement,
+            ),
+        )
+
+
+@dataclass(frozen=True, eq=False, slots=True)
+class AttentionOp(Operation):
+    """Fused scaled dot-product attention in batch/head/sequence/feature order.
+
+    ``q [B, Hq, L, D]``, ``k [B, Hkv, S, D]``, ``v [B, Hkv, S, Dv]`` and an
+    optional additive ``mask`` (``[L, S]`` or ``[B, Hq, L, S]``) give
+    ``[B, Hq, L, Dv]``. Query head h reads KV head ``h // (Hq // Hkv)``. With
+    ``causal``, query row i sees keys up to ``query_position_offset + i``.
+
+    This is the form the staged CENT pipeline lowers today. The decomposed
+    gqa_qk -> softmax -> gqa_sv form stays the frontend's form; an adaptor
+    fuses it into this op for that backend.
+
+    AttentionOp(operands=(q, k, v), scale=0.125)
+
+    Attributes:
+        causal: Hide keys after each query's position.
+        query_position_offset: Position of query row 0.
+        scale: Score multiplier; None means ``1 / sqrt(D)``.
+    """
+
+    NAME = "aloi.attention"
+    NUM_OPERANDS = (3, 4)
+
+    causal: bool = False
+    query_position_offset: int = 0
+    scale: float | None = None
+
+    def infer_result_types(self) -> tuple[TensorType, ...]:
+        """The result is ``[B, Hq, L, Dv]``.
+
+        Raises:
+            ValueError: For invalid attributes, shapes that do not fit, heads
+                that do not group, a mask of another shape, mixed dtypes, or
+                any tensor that is not whole on every rank.
+        """
+
+        if self.query_position_offset < 0:
+            raise ValueError(f"{self.NAME}: query_position_offset must be >= 0")
+        if self.scale is not None and not isfinite(self.scale):
+            raise ValueError(f"{self.NAME}: scale must be finite")
+        types = [operand.type for operand in self.operands]
+        q, k, v = types[:3]
+        if any(t.rank != _ATTENTION_RANK for t in (q, k, v)):
+            raise ValueError(f"{self.NAME}: q, k and v must be rank 4")
+        if any(t.dtype != q.dtype for t in types):
+            raise ValueError(f"{self.NAME}: all operands need one dtype")
+        batch, heads, queries, width = q.shape
+        if not (
+            k.shape[0] == v.shape[0] == batch
+            and k.shape[1] == v.shape[1]
+            and heads % k.shape[1] == 0
+            and k.shape[3] == width
+            and k.shape[2] == v.shape[2]
+        ):
+            raise ValueError(
+                f"{self.NAME}: q {q.shape}, k {k.shape}, v {v.shape} do not fit"
+            )
+        if len(types) == 4 and types[3].shape not in (
+            (queries, k.shape[2]),
+            (batch, heads, queries, k.shape[2]),
+        ):
+            raise ValueError(f"{self.NAME}: mask must be [L, S] or [B, Hq, L, S]")
+        # TODO(attention TP): Head-split q/k/v would follow the gqa ops' rule
+        # (whole head groups per rank); not needed by the backend yet.
+        if any(not isinstance(t.placement, Replicate) for t in types):
+            raise ValueError(f"{self.NAME}: only whole tensors are supported")
+
+        axes: tuple[str, ...] = ()
+        if q.axes and v.axes:
+            axes = (*q.axes[:3], v.axes[3])
+        return (
+            TensorType(
+                shape=(batch, heads, queries, v.shape[3]), dtype=q.dtype, axes=axes
             ),
         )

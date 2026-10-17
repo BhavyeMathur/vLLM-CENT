@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 import unittest
+from collections.abc import Callable
 from unittest import mock
 
 import torch
@@ -120,20 +121,20 @@ class _RmsNormWithoutEps(nn.Module):
         return result
 
 
-class _Relu(nn.Module):
+class _Cosine(nn.Module):
     """Uses an aten op the importer has no converter for."""
 
     def forward(self, x: Tensor) -> Tensor:
-        """Apply ReLU.
+        """Apply cosine.
 
         Args:
             x: Any tensor.
 
         Returns:
-            ``relu(x)``.
+            ``cos(x)``.
         """
 
-        return torch.relu(x)
+        return torch.cos(x)
 
 
 class CustomOpTest(unittest.TestCase):
@@ -430,8 +431,8 @@ class ImporterTest(unittest.TestCase):
     def test_unknown_op_is_rejected(self) -> None:
         """An aten op without a converter names itself in the error."""
 
-        with self.assertRaisesRegex(NotImplementedError, r"aten\.relu\.default"):
-            _import(_Relu(), _meta_input(1, 16))
+        with self.assertRaisesRegex(NotImplementedError, r"aten\.cos\.default"):
+            _import(_Cosine(), _meta_input(1, 16))
 
     def test_dynamic_shape_is_rejected(self) -> None:
         """A symbolic dimension is not silently specialized.
@@ -610,6 +611,46 @@ class _ConstantScale(nn.Module):
         return x * self.scale
 
 
+class _Unary(nn.Module):
+    """Applies one plain PyTorch function to its input."""
+
+    def __init__(self, function: Callable[[Tensor], Tensor]) -> None:
+        """Remember the function to apply.
+
+        Args:
+            function: Called on the forward input, e.g. ``F.silu``.
+        """
+
+        super().__init__()
+        self.function = function
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Apply the function.
+
+        Args:
+            x: Any tensor.
+
+        Returns:
+            ``function(x)``.
+        """
+
+        return self.function(x)
+
+
+def _op_line(function: Callable[[Tensor], Tensor], *shape: int) -> str:
+    """Import ``function`` applied to an input of ``shape``; return its op line.
+
+    Args:
+        function: Plain PyTorch function of one tensor.
+        shape: Input shape.
+
+    Returns:
+        The single op's printed line, without indentation.
+    """
+
+    return _import(_Unary(function), _meta_input(*shape)).splitlines()[3].strip()
+
+
 class ConverterTest(unittest.TestCase):
     """aten elementwise ops, argument defaults and result names."""
 
@@ -628,10 +669,60 @@ class ConverterTest(unittest.TestCase):
             lines,
             [
                 "  %block.proj = aloi.linear(%x, %block.proj.w) : tensor<1x16xfp32>",
-                "  %block.silu = aloi.silu(%block.proj) : tensor<1x16xfp32>",
+                "  %block.silu = aloi.activation(%block.proj) {function = silu} "
+                ": tensor<1x16xfp32>",
                 "  %block.mul = aloi.mul(%block.silu, %x) : tensor<1x16xfp32>",
                 "  %block.add = aloi.add(%block.mul, %x) : tensor<1x16xfp32>",
             ],
+        )
+
+    def test_aten_activations_become_one_op(self) -> None:
+        """Every aten activation imports as aloi.activation with its kind."""
+
+        cases = (
+            (F.silu, "silu", "silu"),
+            (torch.relu, "relu", "relu"),
+            (torch.sigmoid, "sigmoid", "sigmoid"),
+            (torch.tanh, "tanh", "tanh"),
+            (F.gelu, "gelu", "gelu_erf"),
+        )
+        for function, node, kind in cases:
+            with self.subTest(kind=kind):
+                self.assertEqual(
+                    _op_line(function, 1, 4),
+                    f"%{node} = aloi.activation(%x) {{function = {kind}}} "
+                    ": tensor<1x4xfp32>",
+                )
+
+    def test_gelu_approximation_picks_the_formula(self) -> None:
+        """approximate="tanh" is a different formula from the default erf."""
+
+        line = _op_line(lambda x: F.gelu(x, approximate="tanh"), 1, 4)
+        self.assertIn("{function = gelu_tanh}", line)
+
+    def test_clone_becomes_copy(self) -> None:
+        """x.clone() keeps the shape and the row-major element order."""
+
+        self.assertEqual(
+            _op_line(torch.clone, 2, 3), "%clone = aloi.copy(%x) : tensor<2x3xfp32>"
+        )
+
+    def test_clone_that_reorders_memory_is_rejected(self) -> None:
+        """channels_last stores a 4-d tensor in another element order."""
+
+        with self.assertRaisesRegex(NotImplementedError, "memory_format"):
+            _op_line(lambda x: x.clone(memory_format=torch.channels_last), 1, 2, 2, 2)
+
+    def test_view_and_reshape_become_reshape(self) -> None:
+        """view(-1, 3) on six elements resolves -1 to 2."""
+
+        self.assertEqual(
+            _op_line(lambda x: x.view(-1, 3), 6),
+            "%view = aloi.reshape(%x) {shape = [2, 3]} : tensor<2x3xfp32>",
+        )
+        self.assertEqual(
+            _op_line(lambda x: x.reshape(3, 2), 6),
+            "%reshape = aloi.reshape(%x) {shape = [3, 2]} : tensor<3x2xfp32>",
         )
 
     def test_add_with_alpha_is_rejected(self) -> None:

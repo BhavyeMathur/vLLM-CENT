@@ -2,10 +2,10 @@
 
 import math
 import unittest
-from dataclasses import replace
 from random import Random
 
 from vllm_cent.cent import CentHardwareSpec
+from vllm_cent.ir import Function, LinearOp, value_names
 from vllm_cent.models.llama import LlamaModelSpec, build_feed_forward_graph
 from vllm_cent.pipeline import (
     AccumulatorPlacement,
@@ -15,8 +15,6 @@ from vllm_cent.pipeline import (
     ValuePlacement,
     compile_graph,
 )
-from vllm_cent.pipeline.ir import SemanticGraph, verify_semantic
-from vllm_cent.pipeline.operations import LinearOperation
 from vllm_cent.runtime import CentNamedScalars
 from vllm_cent.simulator import execute_functionally
 
@@ -44,8 +42,31 @@ def _target() -> CentTargetProfile:
     )
 
 
-def _manual(graph: SemanticGraph) -> MappingPlan:
+def _with_results(graph: Function, *names: str) -> Function:
+    """Return the same calculation with a different list of returned values.
+
+    Args:
+        graph: Function whose arguments and operations are reused unchanged.
+        names: Printed names of the values to return, in result order. Each
+            may name an argument or an operation result.
+
+    Returns:
+        Function sharing ``graph``'s values and operations, returning ``names``.
+    """
+    by_name = {name: value for value, name in value_names(graph).items()}
+    return Function(
+        name=graph.name,
+        operands=graph.operands,
+        operations=graph.operations,
+        results=tuple(by_name[name] for name in names),
+    )
+
+
+def _manual(graph: Function) -> MappingPlan:
     """Assign distinct buffers and a nonzero register without baseline mapper helpers.
+
+    Device operations are named after their results, so the schedule and the
+    accumulator choices list result names such as ``feed_forward.gate``.
 
     Args:
         graph: Feed-forward operations in dependency order.
@@ -53,16 +74,17 @@ def _manual(graph: SemanticGraph) -> MappingPlan:
     Returns:
         Complete mapping that deliberately forgoes buffer reuse.
     """
-    values = (*graph.inputs, *(op.output for op in graph.operations))
+    names = value_names(graph)
     return MappingPlan(
         placements=tuple(
-            ValuePlacement(value=v.name, storage=f"buffer_{v.name}") for v in values
+            ValuePlacement(value=name, storage=f"buffer_{name}")
+            for name in names.values()
         ),
-        schedule=tuple(op.name for op in graph.operations),
+        schedule=tuple(names[op.results[0]] for op in graph.operations),
         accumulators=tuple(
-            AccumulatorPlacement(operation=op.name, register=1)
+            AccumulatorPlacement(operation=names[op.results[0]], register=1)
             for op in graph.operations
-            if isinstance(op, LinearOperation)
+            if isinstance(op, LinearOp)
         ),
     )
 
@@ -129,7 +151,10 @@ class LlamaSemanticGraphTests(unittest.TestCase):
             )
             graph = build_feed_forward_graph(model, epsilon=0.125, batch_shape=batch)
             # Expose intermediate outputs to make storage preservation observable.
-            graph = replace(graph, outputs=("output", "x", "normalized"))
+            # The default block label prefixes every result name.
+            graph = _with_results(
+                graph, "feed_forward.output", "x", "feed_forward.normalized"
+            )
             for mapping in (None, _manual(graph)):
                 with self.subTest(
                     shape=(hidden, intermediate, batch), manual=mapping is not None
@@ -140,7 +165,7 @@ class LlamaSemanticGraphTests(unittest.TestCase):
                             v.name: tuple(
                                 random.randrange(-4, 5) / 4 for _ in range(v.type.numel)
                             )
-                            for v in graph.inputs
+                            for v in graph.operands
                         }
                         if run:
                             inputs["x"] = (0.0,) * hidden + inputs["x"][hidden:]
@@ -177,17 +202,33 @@ class LlamaSemanticGraphTests(unittest.TestCase):
             hidden_size=3, num_attention_heads=1, num_kv_heads=1, intermediate_size=5
         )
         graph = build_feed_forward_graph(model, epsilon=1e-5, block="decoder.ffn")
-        verify_semantic(graph)
+        graph.verify()
         self.assertEqual(
-            tuple(v.name for v in graph.inputs),
+            tuple(v.name for v in graph.operands),
             ("x", "norm_weight", "gate_weight", "up_weight", "down_weight"),
         )
         self.assertEqual(
-            [v.type.shape for v in graph.inputs], [(3,), (3,), (5, 3), (5, 3), (3, 5)]
+            [v.type.shape for v in graph.operands],
+            [(3,), (3,), (5, 3), (5, 3), (3, 5)],
         )
-        self.assertEqual(len(graph.operations), 7)
-        self.assertTrue(all(op.block == "decoder.ffn" for op in graph.operations))
-        self.assertEqual(graph.outputs, ("output",))
+        # One operation per step of x + down(SiLU(gate(n)) * up(n)), n = RMSNorm(x).
+        # Each result is named under the block label, as a module path would be.
+        self.assertEqual(
+            tuple(op.name_hint for op in graph.operations),
+            (
+                "decoder.ffn.normalized",
+                "decoder.ffn.gate",
+                "decoder.ffn.up",
+                "decoder.ffn.activated_gate",
+                "decoder.ffn.gated",
+                "decoder.ffn.projected",
+                "decoder.ffn.output",
+            ),
+        )
+        names = value_names(graph)
+        self.assertEqual(
+            tuple(names[value] for value in graph.results), ("decoder.ffn.output",)
+        )
         for epsilon in (0.0, -1.0, math.inf, math.nan):
             with self.subTest(epsilon=epsilon), self.assertRaises(ValueError):
                 build_feed_forward_graph(model, epsilon=epsilon)

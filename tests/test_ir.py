@@ -54,6 +54,19 @@ class _Identity(Operation):
 
 
 @dataclass(frozen=True, eq=False)
+class _OneOrTwo(Operation):
+    """One or two operands; the result has the first operand's type."""
+
+    NAME = "test.one_or_two"
+    NUM_OPERANDS = (1, 2)
+
+    def infer_result_types(self) -> tuple[TensorType, ...]:
+        """Pass the first operand's type through unchanged."""
+
+        return (self.operands[0].type,)
+
+
+@dataclass(frozen=True, eq=False)
 class _Scale(Operation):
     """One operand plus one typed attribute that has a default value."""
 
@@ -475,6 +488,25 @@ class OperationTest(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             _Identity(operands=(Value(type=VECTOR), Value(type=VECTOR)))
+
+    def test_tuple_lists_the_allowed_operand_counts(self) -> None:
+        """A tuple NUM_OPERANDS accepts exactly the listed counts."""
+
+        # 1 and 2 are listed, so both build and infer a result.
+        for count in (1, 2):
+            with self.subTest(count=count):
+                operands = tuple(Value(type=VECTOR) for _ in range(count))
+                op = _OneOrTwo(operands=operands)
+                self.assertEqual(op.results[0].type, VECTOR)
+
+        # 0 and 3 are not listed, so construction fails.
+        for count in (0, 3):
+            with self.subTest(count=count):
+                operands = tuple(Value(type=VECTOR) for _ in range(count))
+                with self.assertRaisesRegex(
+                    ValueError, rf"expects \(1, 2\) operands, got {count}"
+                ):
+                    _OneOrTwo(operands=operands)
 
     def test_inference_errors_raise_during_construction(self) -> None:
         """An ill-typed operation cannot be created at all."""

@@ -20,7 +20,9 @@ class Value:
 class Operation(ABC):
 
     NAME: ClassVar[str]
-    NUM_OPERANDS: ClassVar[int]
+    # Exact operand count, or the allowed counts when trailing operands
+    # are optional (e.g. attention's mask).
+    NUM_OPERANDS: ClassVar[int | tuple[int, ...]]
 
     name_hint: str | None = field(default = None, kw_only = True)
     operands: tuple[Value, ...]
@@ -31,7 +33,12 @@ class Operation(ABC):
         # could still be changed by the caller after construction.
         object.__setattr__(self, "operands", tuple(self.operands))
 
-        if len(self.operands) != self.NUM_OPERANDS:
+        allowed = (
+            self.NUM_OPERANDS
+            if isinstance(self.NUM_OPERANDS, tuple)
+            else (self.NUM_OPERANDS,)
+        )
+        if len(self.operands) not in allowed:
             raise ValueError(
                 f"{self.NAME} expects {self.NUM_OPERANDS} operands, "
                 f"got {len(self.operands)}"

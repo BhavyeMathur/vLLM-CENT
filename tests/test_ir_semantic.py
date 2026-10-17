@@ -1,17 +1,24 @@
-"""Tests for the generic semantic ops: linear, rms_norm, all_reduce, elementwise."""
+"""Tests for the generic semantic ops: linear, norm, all_reduce, elementwise, reshape."""
 
 from __future__ import annotations
 
 import unittest
+from collections.abc import Callable
+from dataclasses import FrozenInstanceError
+from math import prod
 
-from vllm_cent.ir.base import Value
+from vllm_cent.activations import ActivationKind
+from vllm_cent.ir.base import Function, Operation, Value
+from vllm_cent.ir.printer import print_function
 from vllm_cent.ir.semantic import (
+    ActivationOp,
     AddOp,
     AllReduceOp,
+    CopyOp,
     LinearOp,
     MulOp,
+    ReshapeOp,
     RMSNormOp,
-    SiluOp,
     SoftmaxOp,
 )
 from vllm_cent.ir.types import (
@@ -211,6 +218,18 @@ class LinearOpTest(unittest.TestCase):
 
         op = LinearOp(operands=(_value(HIDDEN_SIZE), _value(KV_WIDTH, HIDDEN_SIZE)))
         self.assertEqual(op.results[0].type.shape, (KV_WIDTH,))
+
+    def test_keeps_every_leading_dimension(self) -> None:
+        """Only the last dimension changes: (2, 4, 6) times a (5, 6) weight is (2, 4, 5).
+
+        The leading sizes 2 and 4 differ from 1, so a result that dropped or
+        reordered them would have a different shape.
+        """
+
+        op = LinearOp(operands=(_value(2, 4, 6), _value(5, 6)))
+        self.assertEqual(
+            op.results[0].type, TensorType(shape=(2, 4, 5), dtype=DType.FP16)
+        )
 
     def test_rejects_in_features_mismatch(self) -> None:
         """The last dimension of x must equal weight.shape[1]."""
@@ -458,11 +477,34 @@ class RMSNormOpTest(unittest.TestCase):
         op = RMSNormOp(operands=(_value(1, HIDDEN_SIZE), _value(HIDDEN_SIZE)), eps=1e-5)
         self.assertEqual(op.attributes(), {"eps": 1e-5})
 
+    def test_eps_defaults_to_none(self) -> None:
+        """Omitting eps records None; the backend later picks a dtype default."""
+
+        op = RMSNormOp(operands=(_value(1, HIDDEN_SIZE), _value(HIDDEN_SIZE)))
+        self.assertEqual(op.attributes(), {"eps": None})
+
+    def test_eps_cannot_change_after_construction(self) -> None:
+        """Ops are frozen, so eps stays the value the result type was checked with."""
+
+        op = RMSNormOp(operands=(_value(1, HIDDEN_SIZE), _value(HIDDEN_SIZE)), eps=1e-5)
+        with self.assertRaises(FrozenInstanceError):
+            op.eps = 1e-4  # type: ignore[misc]
+        self.assertEqual(op.eps, 1e-5)
+
     def test_rejects_non_positive_eps(self) -> None:
         """The eps term keeps the square root away from zero, so it must be > 0."""
 
         for eps in (0.0, -1e-5):
             with self.subTest(eps=eps), self.assertRaises(ValueError):
+                RMSNormOp(
+                    operands=(_value(1, HIDDEN_SIZE), _value(HIDDEN_SIZE)), eps=eps
+                )
+
+    def test_rejects_non_finite_eps(self) -> None:
+        """A NaN or infinite eps would make every normalized value NaN or zero."""
+
+        for eps in (float("nan"), float("inf"), -float("inf")):
+            with self.subTest(eps=eps), self.assertRaisesRegex(ValueError, "finite"):
                 RMSNormOp(
                     operands=(_value(1, HIDDEN_SIZE), _value(HIDDEN_SIZE)), eps=eps
                 )
@@ -616,8 +658,43 @@ class AllReduceOpTest(unittest.TestCase):
                     AllReduceOp(operands=(operand,))
 
 
+def _unary_ops() -> tuple[tuple[str, Callable[[Value], Operation]], ...]:
+    """Return a builder for each one-operand op that keeps its operand's type.
+
+    ActivationOp needs a ``function`` argument and the others do not, so a
+    test loops over builders rather than op classes.
+
+    Returns:
+        ``(label, build)`` pairs; ``build(x)`` returns the op applied to x.
+    """
+
+    return (
+        (
+            "activation",
+            lambda x: ActivationOp(operands=(x,), function=ActivationKind.SILU),
+        ),
+        ("softmax", lambda x: SoftmaxOp(operands=(x,))),
+    )
+
+
+def _print_one(op: Operation) -> str:
+    """Return the printed line of ``op``, as the only op of a function.
+
+    Args:
+        op: An op whose operands are function arguments.
+
+    Returns:
+        The op's line, without indentation.
+    """
+
+    function = Function(
+        name="f", operands=op.operands, operations=(op,), results=op.results
+    )
+    return print_function(function).splitlines()[1].strip()
+
+
 class UnaryElementwiseOpTest(unittest.TestCase):
-    """silu and softmax keep the operand's type, except the role."""
+    """activation and softmax keep the operand's type, except the role."""
 
     def test_type_is_kept(self) -> None:
         """A sharded tensor stays sharded; a weight-typed input becomes activation.
@@ -632,31 +709,133 @@ class UnaryElementwiseOpTest(unittest.TestCase):
             Shard("q_head"),
             global_shape=(1, 1, 64, 2048),
         )
-        for op_class in (SiluOp, SoftmaxOp):
-            with self.subTest(op=op_class.NAME):
-                op = op_class(operands=(scores,))
-                self.assertEqual(op.results[0].type, scores.type)
+        for label, build in _unary_ops():
+            with self.subTest(op=label):
+                self.assertEqual(build(scores).results[0].type, scores.type)
                 weight = _placed((4,), (HIDDEN,), Replicate(), role=TensorRole.WEIGHT)
-                result = op_class(operands=(weight,)).results[0].type
+                result = build(weight).results[0].type
                 self.assertIs(result.role, TensorRole.ACTIVATION)
 
     def test_rejects_partial_sum(self) -> None:
         """Neither op is linear, so the ranks must add their parts first."""
 
         partial = _placed((1, 1, HIDDEN_SIZE), (*TOKEN_AXES, HIDDEN), Partial())
-        for op_class in (SiluOp, SoftmaxOp):
-            with self.subTest(op=op_class.NAME):
+        for label, build in _unary_ops():
+            with self.subTest(op=label):
                 with self.assertRaisesRegex(ValueError, "partial sum"):
-                    op_class(operands=(partial,))
+                    build(partial)
 
     def test_softmax_needs_whole_last_dimension(self) -> None:
-        """The softmax sum runs over the last dimension; SiLU has no such need."""
+        """Softmax sums over the last dimension; an activation needs no other element."""
 
         split_last = _sharded_heads()  # q_head*head_dim split on the last dim
         with self.assertRaisesRegex(ValueError, "whole dimension"):
             SoftmaxOp(operands=(split_last,))
         with self.assertRaisesRegex(ValueError, "dimension to normalize"):
             SoftmaxOp(operands=(_value(),))
+        activation = ActivationOp(operands=(split_last,), function=ActivationKind.SILU)
+        self.assertEqual(activation.results[0].type, split_last.type)
+
+
+class ActivationOpTest(unittest.TestCase):
+    """One op covers every activation formula; the kind is an attribute."""
+
+    def test_every_kind_keeps_the_type(self) -> None:
+        """The formula does not change the shape, axes or placement rules."""
+
+        x = _sharded_heads()
+        for kind in ActivationKind:
+            with self.subTest(kind=kind):
+                op = ActivationOp(operands=(x,), function=kind)
+                self.assertEqual(op.results[0].type, x.type)
+                self.assertEqual(op.attributes(), {"function": kind})
+
+    def test_prints_the_kind_without_quotes(self) -> None:
+        """ActivationKind is a str enum; the printer writes its value bare."""
+
+        op = ActivationOp(
+            operands=(_value(1, 4, name="x"),),
+            function=ActivationKind.GELU_TANH,
+            name_hint="act",
+        )
+        self.assertEqual(
+            _print_one(op),
+            "%act = aloi.activation(%x) {function = gelu_tanh} : tensor<1x4xfp16>",
+        )
+
+
+class CopyOpTest(unittest.TestCase):
+    """copy produces a new value with the operand's type."""
+
+    def test_type_is_kept(self) -> None:
+        """A shard stays a shard, and the result is an activation."""
+
+        x = _sharded_heads()
+        self.assertEqual(CopyOp(operands=(x,)).results[0].type, x.type)
+        weight = _placed((4,), (HIDDEN,), Replicate(), role=TensorRole.WEIGHT)
+        self.assertIs(
+            CopyOp(operands=(weight,)).results[0].type.role, TensorRole.ACTIVATION
+        )
+
+    def test_accepts_partial_sum(self) -> None:
+        """Copying is linear: copy(a) + copy(b) == copy(a + b)."""
+
+        partial = _placed((1, 1, HIDDEN_SIZE), (*TOKEN_AXES, HIDDEN), Partial())
+        self.assertEqual(CopyOp(operands=(partial,)).results[0].type, partial.type)
+
+
+class ReshapeOpTest(unittest.TestCase):
+    """reshape reinterprets the same row-major elements with a new shape."""
+
+    def test_same_element_count(self) -> None:
+        """(2, 3) holds six elements, so (6,) and (3, 2) are both valid."""
+
+        x = _value(2, 3)
+        for shape in ((6,), (3, 2), (1, 2, 3)):
+            with self.subTest(shape=shape):
+                op = ReshapeOp(operands=(x,), shape=shape)
+                self.assertEqual(
+                    op.results[0].type, TensorType(shape=shape, dtype=DType.FP16)
+                )
+
+    def test_one_element_becomes_scalar(self) -> None:
+        """A (1,) tensor and a scalar both hold one element, so either fits the other."""
+
+        op = ReshapeOp(operands=(_value(1),), shape=())
+        self.assertEqual(op.results[0].type, TensorType(shape=(), dtype=DType.FP16))
+
+    def test_drops_axes(self) -> None:
+        """[batch, seq_len, hidden] -> [batch, hidden] has no per-dim names."""
+
+        x = _annotated((1, 1, HIDDEN_SIZE), (*TOKEN_AXES, HIDDEN))
+        result = ReshapeOp(operands=(x,), shape=(1, HIDDEN_SIZE)).results[0].type
+        self.assertEqual(result.axes, ())
+
+    def test_rejects_different_element_count(self) -> None:
+        """Six elements cannot fill four or eight."""
+
+        for shape in ((4,), (2, 4), (-2, -3)):
+            with self.subTest(shape=shape):
+                with self.assertRaisesRegex(ValueError, "cannot reshape"):
+                    ReshapeOp(operands=(_value(2, 3),), shape=shape)
+
+    def test_rejects_split_and_partial(self) -> None:
+        """A reshape can merge the split dimension, so only whole tensors qualify."""
+
+        partial = _placed((1, 1, HIDDEN_SIZE), (*TOKEN_AXES, HIDDEN), Partial())
+        for x in (_sharded_heads(), partial):
+            with self.subTest(placement=x.type.placement):
+                with self.assertRaisesRegex(ValueError, "only whole tensors"):
+                    ReshapeOp(operands=(x,), shape=(prod(x.type.shape),))
+
+    def test_prints_the_shape(self) -> None:
+        """The shape attribute prints as a list."""
+
+        x = _value(2, 3, name="x")
+        op = ReshapeOp(operands=(x,), shape=(6,), name_hint="flat")
+        self.assertEqual(
+            _print_one(op), "%flat = aloi.reshape(%x) {shape = [6]} : tensor<6xfp16>"
+        )
 
 
 class BinaryElementwiseOpTest(unittest.TestCase):
@@ -670,6 +849,25 @@ class BinaryElementwiseOpTest(unittest.TestCase):
         gated = MulOp(operands=(_sharded_heads(), _sharded_heads()))
         self.assertEqual(gated.results[0].type, _sharded_heads().type)
         self.assertEqual((AddOp.NAME, MulOp.NAME), ("aloi.add", "aloi.mul"))
+
+    def test_same_value_twice_and_scalars(self) -> None:
+        """Squaring reads one value twice, and two scalars combine into a scalar."""
+
+        x = _value(2, 3)
+        scalar = _value()
+        for op_class in (AddOp, MulOp):
+            with self.subTest(op=op_class.NAME):
+                self.assertEqual(op_class(operands=(x, x)).results[0].type, x.type)
+                self.assertEqual(
+                    op_class(operands=(scalar, _value())).results[0].type,
+                    scalar.type,
+                )
+
+    def test_rejects_normalization_epsilon(self) -> None:
+        """Only RMSNormOp owns eps; passing it to an addition is a TypeError."""
+
+        with self.assertRaisesRegex(TypeError, "eps"):
+            AddOp(operands=(_value(3), _value(3)), eps=1e-5)  # type: ignore[call-arg]
 
     def test_unannotated_operand_gives_unannotated_result(self) -> None:
         """Axes are only kept when both operands have them."""

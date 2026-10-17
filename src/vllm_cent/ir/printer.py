@@ -24,7 +24,7 @@ from enum import Enum
 from .base import Function, Module, Operation, Value
 from .types import Partial, Shard, TensorRole, TensorType
 
-__all__ = ["format_type", "print_function", "print_module"]
+__all__ = ["format_type", "print_function", "print_module", "value_names"]
 
 _INDENT = "  "
 
@@ -100,6 +100,33 @@ def print_function(function: Function) -> str:
         "}",
     ]
     return "\n".join(lines)
+
+
+def value_names(function: Function) -> dict[Value, str]:
+    """Return the name every value of ``function`` gets when printed.
+
+    The same rules as print_function: an argument's own name, else the
+    defining op's name_hint, else a number; repeated names get ``_1``. Exports
+    use these names so that another representation matches the dump.
+
+    Args:
+        function: The function.
+
+    Returns:
+        Each argument and op result mapped to its printed name (without %).
+    """
+
+    namer = _Namer()
+    # The namer returns printed references such as "%q_proj"; drop the "%".
+    names = {
+        argument: namer.define(argument, argument.name).removeprefix("%")
+        for argument in function.operands
+    }
+    for op in function.operations:
+        for result in op.results:
+            hint = result.name if result.name is not None else op.name_hint
+            names[result] = namer.define(result, hint).removeprefix("%")
+    return names
 
 
 def print_module(module: Module) -> str:
@@ -222,7 +249,7 @@ class _Namer:
 
         Args:
             value: Function argument or op result being defined.
-            hint: Preferred name, or None to use the next free number.
+            hint: Preferred name, or None (or "") to use the next free number.
 
         Returns:
             The value's name, including the leading ``%``.
@@ -234,7 +261,8 @@ class _Namer:
         if value in self._names:
             raise ValueError(f"value %{self._names[value]} is defined twice")
 
-        if hint is None:
+        # An empty hint would print as a bare "%", so it counts as no hint.
+        if not hint:
             # Skip numbers that an earlier hint already claimed, for example
             # a value explicitly named "0".
             while str(self._next_number) in self._used:

@@ -6,8 +6,9 @@ A dialect is a family of operations: ``func`` supplies functions and returns, an
 native MLIR Python bindings used here to construct, parse, and verify them.
 
 This bridge preserves known tensor shapes and F32 types. It does not define
-CENT dialects or convert device instructions inside MLIR. After import, the
-existing Python passes choose storage and emit CENT commands.
+CENT dialects or convert device instructions inside MLIR. Import produces a
+``vllm_cent.ir`` function; the existing Python passes then choose storage and
+emit CENT commands.
 """
 
 from __future__ import annotations
@@ -20,15 +21,16 @@ if TYPE_CHECKING:
     from iree.compiler.ir import Module, Type  # type: ignore[import-not-found]
     from iree.compiler.ir import Operation as NativeOperation
 
-from vllm_cent.pipeline.ir import (
+from vllm_cent.ir import (
+    AddOp,
+    DType,
+    Function,
+    MulOp,
     Operation,
-    ScalarType,
-    SemanticGraph,
     TensorType,
     Value,
-    verify_semantic,
+    value_names,
 )
-from vllm_cent.pipeline.operations import AddOperation, MultiplyOperation
 
 __all__ = ["from_mlir", "optimize_mlir", "to_mlir"]
 
@@ -70,21 +72,24 @@ def _tensor_type(ir: ModuleType, native_type: Type) -> TensorType:
         native_type: MLIR type to inspect while its owning context is still alive.
 
     Returns:
-        Python ``TensorType`` with the same dimensions and F32 element format.
+        Python ``TensorType`` with the same dimensions and fp32 element format.
 
     Raises:
         ValueError: If the type is not a ranked tensor, has unknown dimensions,
             uses another element format, or contains a zero/negative dimension.
 
     Examples:
-        ``tensor<2x3xf32>`` becomes ``shape=(2, 3)`` with ``dtype=ScalarType.F32``.
+        ``tensor<2x3xf32>`` becomes ``shape=(2, 3)`` with ``dtype=DType.FP32``.
     """
     if not isinstance(native_type, ir.RankedTensorType):
         raise ValueError("MLIR bridge requires ranked tensors")
     ranked = ir.RankedTensorType(native_type)
     if not ranked.has_static_shape or not isinstance(ranked.element_type, ir.F32Type):
         raise ValueError("MLIR bridge requires static f32 tensors")
-    return TensorType(tuple(ranked.shape), ScalarType.F32)
+    shape = tuple(ranked.shape)
+    if any(dim <= 0 for dim in shape):
+        raise ValueError("Tensor dimensions must be positive")
+    return TensorType(shape=shape, dtype=DType.FP32)
 
 
 def _string(ir: ModuleType, operation: NativeOperation, key: str, default: str) -> str:
@@ -93,7 +98,7 @@ def _string(ir: ModuleType, operation: NativeOperation, key: str, default: str) 
     Args:
         ir: Loaded MLIR module used to read string attributes.
         operation: Native operation that may carry the requested attribute.
-        key: Attribute name, such as ``cent.name`` or ``cent.block``.
+        key: Attribute name, such as ``cent.name``.
         default: Fallback string for ordinary MLIR with no CENT naming information.
 
     Returns:
@@ -127,102 +132,96 @@ def _fresh_name(preferred: str, reserved: set[str]) -> str:
     return candidate
 
 
-def to_mlir(graph: SemanticGraph) -> str:
-    """Build an MLIR function for the graph, verify it, and return its text.
+def to_mlir(graph: Function) -> str:
+    """Build an MLIR function for the IR function, verify it, and return its text.
 
-    Each graph input becomes a function argument. Addition becomes ``arith.addf``
-    and multiplication becomes ``arith.mulf``. The function returns the graph's
-    requested outputs. Extra ``cent.*`` attributes
-    preserve original tensor names, operation names, and model-block labels when
-    that text is later imported back into Python.
+    Each argument becomes a function argument. Addition becomes ``arith.addf``
+    and multiplication becomes ``arith.mulf``. The function returns the same
+    results. Extra ``cent.*`` attributes preserve the argument and result
+    names, as the IR printer shows them, when that text is later imported back
+    into Python.
 
     Args:
-        graph: Named tensor inputs, additions, and multiplications with known
-            shapes and F32 types.
-            Operations must read only inputs or previously produced results.
+        graph: Function of additions and multiplications over fp32 tensors
+            with known shapes.
 
     Returns:
         Text printed by native MLIR for one function named ``main``.
 
     Raises:
         RuntimeError: If the optional native MLIR toolchain is unavailable.
-        ValueError: If graph verification fails or an operation/type is unsupported.
+        ValueError: If verification fails or an operation/type is unsupported.
     """
-    verify_semantic(graph)
+    graph.verify()
     ir, func, arith = _bindings()
-    if any(
-        not isinstance(op, (AddOperation, MultiplyOperation)) for op in graph.operations
-    ):
+    if any(not isinstance(op, (AddOp, MulOp)) for op in graph.operations):
         raise ValueError("Native MLIR supports only addition and multiplication")
-    all_values = (*graph.inputs, *(op.output for op in graph.operations))
-    if any(value.type.dtype is not ScalarType.F32 for value in all_values):
+    all_values = (
+        *graph.operands,
+        *(result for op in graph.operations for result in op.results),
+    )
+    if any(value.type.dtype is not DType.FP32 for value in all_values):
         raise ValueError("Native MLIR proof slice supports only f32 tensors")
+    names = value_names(graph)
     # Native objects belong to a context. Construct and print them while it is
     # alive; return text rather than objects tied to this temporary context.
     with ir.Context(), ir.Location.unknown():
-        types = {
-            value.name: ir.RankedTensorType.get(value.type.shape, ir.F32Type.get())
-            for value in all_values
-        }
+
+        def native_type(value: Value) -> object:
+            """Return the MLIR tensor type with ``value``'s shape."""
+            return ir.RankedTensorType.get(value.type.shape, ir.F32Type.get())
+
         module = ir.Module.create()
         with ir.InsertionPoint(module.body):
             function = func.FuncOp(
                 "main",
                 (
-                    [types[value.name] for value in graph.inputs],
-                    [types[name] for name in graph.outputs],
+                    [native_type(value) for value in graph.operands],
+                    [native_type(value) for value in graph.results],
                 ),
             )
             # MLIR may print arguments as %arg0, %arg1, etc. Keep the caller's
             # tensor names separately so importing the text recovers them.
             function.attributes["cent.input_names"] = ir.ArrayAttr.get(
-                [ir.StringAttr.get(value.name) for value in graph.inputs]
+                [ir.StringAttr.get(names[value]) for value in graph.operands]
             )
             block = function.add_entry_block()
-            values = dict(
-                zip(
-                    (value.name for value in graph.inputs), block.arguments, strict=True
-                )
-            )
+            # Keys are IR values (compared by identity), mapped to the native
+            # values that stand for them.
+            natives = dict(zip(graph.operands, block.arguments, strict=True))
             # An insertion point tells native builders where new operations go.
-            # Graph order ensures each operand already exists in the value table.
+            # Function order ensures each operand already exists in the table.
             with ir.InsertionPoint(block):
                 for operation in graph.operations:
                     # Both native operations require matching tensor shapes;
-                    # semantic verification has already checked that contract.
-                    native_type = (
-                        arith.AddFOp
-                        if isinstance(operation, AddOperation)
-                        else arith.MulFOp
+                    # IR verification has already checked that contract.
+                    native_class = (
+                        arith.AddFOp if isinstance(operation, AddOp) else arith.MulFOp
                     )
-                    native = native_type(*(values[name] for name in operation.inputs))
-                    for key, value in (
-                        ("cent.name", operation.name),
-                        ("cent.output", operation.output.name),
-                        ("cent.block", operation.block),
-                    ):
-                        native.attributes[key] = ir.StringAttr.get(value)
-                    values[operation.output.name] = native.result
-                func.ReturnOp([values[name] for name in graph.outputs])
+                    native = native_class(*(natives[v] for v in operation.operands))
+                    (result,) = operation.results
+                    native.attributes["cent.name"] = ir.StringAttr.get(names[result])
+                    natives[result] = native.result
+                func.ReturnOp([natives[value] for value in graph.results])
         module.operation.verify()
         return str(module)
 
 
-def from_mlir(text: str) -> SemanticGraph:
-    """Parse an MLIR function and recover its elementwise arithmetic graph.
+def from_mlir(text: str) -> Function:
+    """Parse an MLIR function and recover its elementwise arithmetic.
 
     Native MLIR first checks syntax and its own operation rules. The importer
     then rejects features the CENT path cannot represent, rather than silently
-    dropping them. The final Python graph is verified too.
+    dropping them. The final IR function is verified too.
 
     Args:
         text: MLIR assembly containing a single function with one body block,
             supported tensor additions/multiplications, and a return.
 
     Returns:
-        ``SemanticGraph`` with the same calculations, shapes, and result order.
-        Original names and model-block labels are recovered when ``cent.*`` attributes
-        are present; otherwise the importer generates names.
+        IR function with the same calculations, shapes, and result order.
+        Original names are recovered when ``cent.*`` attributes are present;
+        otherwise the importer generates names.
 
     Raises:
         RuntimeError: If the optional native MLIR toolchain is unavailable.
@@ -235,17 +234,17 @@ def from_mlir(text: str) -> SemanticGraph:
             module = ir.Module.parse(text)
             module.operation.verify()
             graph = _import_module(ir, module)
-            verify_semantic(graph)
+            graph.verify()
             return graph
         except ir.MLIRError as error:
             raise ValueError(f"Native MLIR verification failed: {error}") from error
 
 
-def _import_module(ir: ModuleType, module: Module) -> SemanticGraph:
-    """Walk a verified MLIR function and rebuild its Python graph objects.
+def _import_module(ir: ModuleType, module: Module) -> Function:
+    """Walk a verified MLIR function and rebuild it as an IR function.
 
-    Track each native argument or result in a name table. When an operation reads
-    one of those native values, use the corresponding Python tensor name. This
+    Track the IR value that stands for each native argument or result. When
+    an operation reads one of those native values, use that IR value. This
     preserves connections between calculations even if textual names differ.
 
     Args:
@@ -253,7 +252,7 @@ def _import_module(ir: ModuleType, module: Module) -> SemanticGraph:
         module: Parsed, verified native module, whose context remains alive.
 
     Returns:
-        Input tensors, ordered arithmetic operations, and output names for the Python graph.
+        Arguments, ordered arithmetic operations, and results of the function.
 
     Raises:
         ValueError: If the module has multiple functions/body blocks, unsupported
@@ -270,12 +269,7 @@ def _import_module(ir: ModuleType, module: Module) -> SemanticGraph:
     block = blocks[0]
     # Partial provenance is legal. Reserve all explicit names before generating
     # any fallback: a later result called arg0 must not collide with input zero.
-    value_names_reserved = {
-        _string(ir, native, "cent.output", "")
-        for native in block.operations
-        if "cent.output" in native.attributes
-    }
-    operation_names_reserved = {
+    reserved = {
         _string(ir, native, "cent.name", "")
         for native in block.operations
         if "cent.name" in native.attributes
@@ -287,62 +281,58 @@ def _import_module(ir: ModuleType, module: Module) -> SemanticGraph:
         ]
         if len(names) != len(block.arguments):
             raise ValueError("cent.input_names must match function arguments")
-        value_names_reserved.update(names)
+        reserved.update(names)
     else:
         names = [
-            _fresh_name(f"arg{index}", value_names_reserved)
+            _fresh_name(f"arg{index}", reserved)
             for index in range(len(block.arguments))
         ]
-    inputs = tuple(
-        Value(name, _tensor_type(ir, argument.type))
+    arguments = tuple(
+        Value(type=_tensor_type(ir, argument.type), name=name)
         for name, argument in zip(names, block.arguments, strict=True)
     )
     # Keys are native values, not their printed names. This follows actual
     # operand connections even when the printer chooses different SSA names.
-    value_names = dict(zip(block.arguments, names, strict=True))
+    values = dict(zip(block.arguments, arguments, strict=True))
     operations: list[Operation] = []
-    outputs: tuple[str, ...] = ()
+    results: tuple[Value, ...] = ()
     for native in block.operations:
         kind = native.operation.name
         if kind == "func.return":
-            outputs = tuple(value_names[value] for value in native.operands)
+            results = tuple(values[value] for value in native.operands)
         elif kind in ("arith.addf", "arith.mulf"):
-            # Fast-math flags permit assumptions such as ignoring NaNs. Our
-            # Python graph has no field for these promises, so accepting them
-            # would silently lose part of the operation's meaning.
+            # Fast-math flags permit assumptions such as ignoring NaNs. The IR
+            # has no field for these promises, so accepting them would
+            # silently lose part of the operation's meaning.
             if (
                 "fastmath" in native.attributes
                 and str(native.attributes["fastmath"]) != "#arith.fastmath<none>"
             ):
                 raise ValueError("MLIR bridge does not support fastmath assumptions")
-            # The semantic graph has no explicit rounding-mode operand. Reject
-            # one even when a newer MLIR runtime can parse and verify it.
+            # The IR has no explicit rounding-mode operand. Reject one even
+            # when a newer MLIR runtime can parse and verify it.
             if "roundingmode" in native.attributes:
                 raise ValueError("MLIR bridge does not support explicit rounding modes")
-            output_name = (
-                _string(ir, native, "cent.output", "")
-                if "cent.output" in native.attributes
-                else _fresh_name(f"value{len(operations)}", value_names_reserved)
+            name = (
+                _string(ir, native, "cent.name", "")
+                if "cent.name" in native.attributes
+                else _fresh_name(f"value{len(operations)}", reserved)
             )
-            operation_type = AddOperation if kind == "arith.addf" else MultiplyOperation
-            prefix = "add" if kind == "arith.addf" else "multiply"
-            operation = operation_type(
-                name=(
-                    _string(ir, native, "cent.name", "")
-                    if "cent.name" in native.attributes
-                    else _fresh_name(
-                        f"{prefix}{len(operations)}", operation_names_reserved
-                    )
-                ),
-                inputs=tuple(value_names[value] for value in native.operands),
-                output=Value(output_name, _tensor_type(ir, native.result.type)),
-                block=_string(ir, native, "cent.block", ""),
+            operation_class = AddOp if kind == "arith.addf" else MulOp
+            operation = operation_class(
+                operands=tuple(values[value] for value in native.operands),
+                name_hint=name,
             )
+            # The IR infers the result type; MLIR states it. Both must agree.
+            if operation.results[0].type != _tensor_type(ir, native.result.type):
+                raise ValueError(f"MLIR result type of {name} differs from the IR's")
             operations.append(operation)
-            value_names[native.result] = output_name
+            values[native.result] = operation.results[0]
         else:
             raise ValueError(f"Unsupported MLIR operation: {kind}")
-    return SemanticGraph(inputs=inputs, operations=tuple(operations), outputs=outputs)
+    return Function(
+        name="main", operands=arguments, operations=tuple(operations), results=results
+    )
 
 
 def optimize_mlir(text: str) -> str:

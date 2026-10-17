@@ -10,7 +10,7 @@ from dataclasses import dataclass
 
 from ..runtime import CentExecutable, CentNamedScalars
 from ..simulator import CentExecutionRequest, execute_functionally
-from .ir import Value
+from .ir import NameValue
 from .target import TargetProgram, emit_program
 
 __all__ = ["CompiledArtifact", "compile_target"]
@@ -46,8 +46,8 @@ class CompiledArtifact:
     """
 
     version: int
-    inputs: tuple[Value, ...]
-    outputs: tuple[Value, ...]
+    inputs: tuple[NameValue, ...]
+    outputs: tuple[NameValue, ...]
     target_ir: TargetProgram
     executable: CentExecutable
 

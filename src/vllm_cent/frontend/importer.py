@@ -20,9 +20,19 @@ from torch.fx import Node
 # Imported for its side effect: registering torch.ops.aloi.*, which the
 # converter table below refers to.
 from . import aloi  # noqa: F401
+from ..activations import ActivationKind
 from ..ir.base import Function, Module, Operation, Value
 from ..ir.printer import format_type
-from ..ir.semantic import AddOp, LinearOp, MulOp, RMSNormOp, SiluOp, SoftmaxOp
+from ..ir.semantic import (
+    ActivationOp,
+    AddOp,
+    CopyOp,
+    LinearOp,
+    MulOp,
+    ReshapeOp,
+    RMSNormOp,
+    SoftmaxOp,
+)
 from ..ir.transformer import (
     GqaQKOp,
     GqaSVOp,
@@ -325,6 +335,98 @@ def _convert_rope(
     )
 
 
+def _activation(function: ActivationKind) -> _Converter:
+    """Make a converter for a one-operand aten activation.
+
+    Args:
+        function: The formula this aten op computes.
+    """
+
+    def convert(
+        node: Node, env: dict[Node, Value], name_hint: str | None
+    ) -> Operation:
+        """Build an ``ActivationOp`` that applies ``function``."""
+
+        arguments = _arguments(node)
+        return ActivationOp(
+            operands=(_value(env, arguments["self"]),),
+            function=function,
+            name_hint=name_hint,
+        )
+
+    return convert
+
+
+# aten.gelu's ``approximate`` string -> formula. Any other string is a
+# formula the IR does not have.
+_GELU_FORMULAS: dict[str, ActivationKind] = {
+    "none": ActivationKind.GELU_ERF,
+    "tanh": ActivationKind.GELU_TANH,
+}
+
+
+def _convert_gelu(
+    node: Node, env: dict[Node, Value], name_hint: str | None
+) -> Operation:
+    """Convert ``aten.gelu(self, *, approximate="none")``.
+
+    The ``approximate`` string picks the formula, so one aten op becomes
+    either of two ActivationOp kinds.
+
+    Raises:
+        NotImplementedError: If ``approximate`` names another formula.
+    """
+
+    arguments = _arguments(node)
+    approximate = arguments["approximate"]
+    # _arguments returns plain objects; only a str can be a key of the table.
+    function = (
+        _GELU_FORMULAS.get(approximate) if isinstance(approximate, str) else None
+    )
+    if function is None:
+        raise NotImplementedError(f"gelu with approximate={approximate!r}")
+    return ActivationOp(
+        operands=(_value(env, arguments["self"]),),
+        function=function,
+        name_hint=name_hint,
+    )
+
+
+def _convert_clone(
+    node: Node, env: dict[Node, Value], name_hint: str | None
+) -> Operation:
+    """Convert ``aten.clone(self, *, memory_format=None)`` into a ``CopyOp``.
+
+    Raises:
+        NotImplementedError: If ``memory_format`` reorders the elements in
+            memory (e.g. channels_last); CopyOp keeps the row-major order.
+    """
+
+    arguments = _arguments(node)
+    memory_format = arguments["memory_format"]
+    if memory_format not in (None, torch.contiguous_format):
+        raise NotImplementedError(f"clone with memory_format={memory_format}")
+    return CopyOp(operands=(_value(env, arguments["self"]),), name_hint=name_hint)
+
+
+def _convert_reshape(
+    node: Node, env: dict[Node, Value], name_hint: str | None
+) -> Operation:
+    """Convert ``aten.view(self, size)`` or ``aten.reshape(self, shape)``.
+
+    The target shape comes from the node's recorded result type, not from the
+    size argument: the argument may contain -1 (``x.view(-1, 4)``), while the
+    recorded shape is fully resolved.
+    """
+
+    arguments = _arguments(node)
+    return ReshapeOp(
+        operands=(_value(env, arguments["self"]),),
+        shape=_tensor_type(node).shape,
+        name_hint=name_hint,
+    )
+
+
 def _convert_gqa_qk(
     node: Node, env: dict[Node, Value], name_hint: str | None
 ) -> Operation:
@@ -357,8 +459,9 @@ def _convert_add(
 
 
 # Supporting a new op means one converter and one entry here. The aloi::*
-# custom ops come from the model; the aten ops are the plain PyTorch
-# elementwise ops a model writes as F.silu(x), a * b and a + b.
+# custom ops come from the model; the aten ops are the plain PyTorch ops a
+# model writes as F.silu(x), a * b, a + b, x.clone() and x.view(...).
+# Several aten activations map to one ActivationOp with different kinds.
 _CONVERTERS: dict[OpOverload, _Converter] = {
     torch.ops.aloi.linear.default: _tensor_op(LinearOp, "x", "weight"),
     torch.ops.aloi.rms_norm.default: _convert_rms_norm,
@@ -371,9 +474,16 @@ _CONVERTERS: dict[OpOverload, _Converter] = {
     torch.ops.aloi.gqa_qk.default: _convert_gqa_qk,
     torch.ops.aloi.softmax.default: _tensor_op(SoftmaxOp, "x"),
     torch.ops.aloi.gqa_sv.default: _tensor_op(GqaSVOp, "probs", "v_cache"),
-    torch.ops.aten.silu.default: _tensor_op(SiluOp, "self"),
+    torch.ops.aten.silu.default: _activation(ActivationKind.SILU),
+    torch.ops.aten.relu.default: _activation(ActivationKind.RELU),
+    torch.ops.aten.sigmoid.default: _activation(ActivationKind.SIGMOID),
+    torch.ops.aten.tanh.default: _activation(ActivationKind.TANH),
+    torch.ops.aten.gelu.default: _convert_gelu,
     torch.ops.aten.mul.Tensor: _tensor_op(MulOp, "self", "other"),
     torch.ops.aten.add.Tensor: _convert_add,
+    torch.ops.aten.clone.default: _convert_clone,
+    torch.ops.aten.view.default: _convert_reshape,
+    torch.ops.aten.reshape.default: _convert_reshape,
 }
 
 

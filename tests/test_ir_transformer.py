@@ -6,6 +6,7 @@ import unittest
 
 from vllm_cent.ir.base import Value
 from vllm_cent.ir.transformer import (
+    AttentionOp,
     GqaQKOp,
     GqaSVOp,
     KvUpdateOp,
@@ -414,6 +415,52 @@ class GqaOpsTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "context"):
             GqaSVOp(operands=(probs, _cache()))
+
+
+class AttentionOpTest(unittest.TestCase):
+    """aloi.attention: the fused BHSD form the CENT pipeline lowers."""
+
+    def _bhsd(self, *shape: int) -> Value:
+        """Return a whole fp32 tensor of the given shape."""
+
+        return _value(shape, dtype=DType.FP32)
+
+    def test_shapes_with_and_without_mask(self) -> None:
+        """Query [1, 4, 2, 3], key [1, 2, 5, 3], value [1, 2, 5, 7] give [1, 4, 2, 7]."""
+
+        q, k, v = self._bhsd(1, 4, 2, 3), self._bhsd(1, 2, 5, 3), self._bhsd(1, 2, 5, 7)
+        for mask in ((), (self._bhsd(2, 5),), (self._bhsd(1, 4, 2, 5),)):
+            with self.subTest(mask=[m.type.shape for m in mask]):
+                op = AttentionOp(operands=(q, k, v, *mask), causal=True, scale=0.5)
+                self.assertEqual(op.results[0].type.shape, (1, 4, 2, 7))
+        self.assertEqual(
+            AttentionOp(operands=(q, k, v)).attributes(),
+            {"causal": False, "query_position_offset": 0, "scale": None},
+        )
+
+    def test_rejections(self) -> None:
+        """Bad attributes, shapes, groups, masks, or split tensors."""
+
+        q, k, v = self._bhsd(1, 4, 2, 3), self._bhsd(1, 2, 5, 3), self._bhsd(1, 2, 5, 7)
+        split_q = _value(
+            (1, 2, 2, 3),
+            ("batch", "q_head", "seq_len", "head_dim"),
+            Shard("q_head"),
+            (1, 4, 2, 3),
+            dtype=DType.FP32,
+        )
+        cases: dict[str, tuple[tuple[Value, ...], dict[str, object], str]] = {
+            "negative offset": ((q, k, v), {"query_position_offset": -1}, ">= 0"),
+            "infinite scale": ((q, k, v), {"scale": float("inf")}, "finite"),
+            "too few operands": ((q, k), {}, "expects"),
+            "heads do not group": ((self._bhsd(1, 3, 2, 3), k, v), {}, "do not fit"),
+            "key width differs": ((q, self._bhsd(1, 2, 5, 4), v), {}, "do not fit"),
+            "bad mask": ((q, k, v, self._bhsd(5, 2)), {}, "mask must be"),
+            "split query": ((split_q, k, v), {}, "only whole tensors"),
+        }
+        for name, (operands, attributes, message) in cases.items():
+            with self.subTest(case=name), self.assertRaisesRegex(ValueError, message):
+                AttentionOp(operands=operands, **attributes)  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":
