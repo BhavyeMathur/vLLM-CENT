@@ -16,12 +16,17 @@ __all__ = ["CentProgram"]
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CentProgram:
-    """An immutable sequence of instructions for one CENT device.
+    """Store one device's ordered commands and check their storage bounds.
+
+    Creating this object validates instruction shapes and addresses against
+    ``hardware``. It does not load input values or establish that each operation
+    has executable numerical semantics. A runtime executable adds input and
+    output bindings separately.
 
     Attributes:
         hardware: Device on which the instructions will run.
-        instructions: Commands in the order in which they should run. The tuple
-            must contain at least one command.
+        instructions: Commands in execution order. An empty tuple is valid when
+            input/output bindings alone implement an identity or reshape.
     """
 
     hardware: CentHardwareSpec
@@ -31,13 +36,9 @@ class CentProgram:
         """Check that the program contains valid instructions for its device.
 
         Raises:
-            ValueError: If the program is empty or an instruction is
-                incompatible with the hardware.
+            TypeError: If an instruction has no supported validation rules.
+            ValueError: If an instruction is incompatible with the hardware.
         """
-
-        # An empty program usually means the compiler forgot to emit work.
-        if not self.instructions:
-            raise ValueError("a CENT program cannot be empty")
 
         # Instruction constructors check rules shared by every target. Validate
         # again here for limits that depend on this program's hardware. This also

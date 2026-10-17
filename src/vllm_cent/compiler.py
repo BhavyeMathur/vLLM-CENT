@@ -1,4 +1,4 @@
-"""Model-dispatching public compiler API."""
+"""Select the legacy block compiler that matches the requested model family."""
 
 from .cent import CentProgram
 from .models.llama import LlamaModelSpec, compile_llama_transformer_block
@@ -17,7 +17,8 @@ def compile_transformer_block(request: CompileRequest) -> CentProgram:
     """Compile one supported model block into CENT commands.
 
     Args:
-        request: Model, hardware, placement, and decode-step information.
+        request: Model architecture, device capacities, channels per block,
+            and token counts used to plan memory and choose the emitted commands.
 
     Returns:
         An ordered CENT instruction program that passes structural validation.

@@ -1,8 +1,15 @@
-"""Check Llama dimensions and assign DRAM rows to block tensors."""
+"""Choose memory layouts and operation plans for one Llama block.
+
+Planning first checks that the model fits the supported layouts, then reserves
+DRAM rows and Shared Buffer slots, and finally connects them to operation plans.
+The lowerers consume these choices instead of deciding new layouts themselves.
+These legacy plans support structural instruction generation; the missing
+numerical steps documented in the lowerers are not supplied by allocating space.
+"""
 
 from dataclasses import dataclass
 from ...cent import (
-    BANKS_PER_PU,
+    BANKS_PER_GROUP,
     CentBlockPlacementSpec,
     CentChannelSet,
     CentHardwareSpec,
@@ -49,7 +56,10 @@ __all__: list[str] = []
 
 @dataclass(frozen=True, slots=True)
 class _LlamaCompileContext:
-    """Sizes and hardware information shared by all Llama compiler steps.
+    """Keep the model sizes and derived counts used throughout block planning.
+
+    Keeping these counts together avoids confusing the smaller cache width
+    with the full block width.
 
     Attributes:
         model: Sizes of the Llama block being compiled.
@@ -66,6 +76,11 @@ class _LlamaCompileContext:
             ``channels_per_block * num_banks``.
         activation_capacity: FFN values handled by one activation pass. The
             current lowering supports no more than two passes.
+
+    Examples:
+        Eight query heads and two key/value heads give ``repeat_count=4``.
+        With 16 values per head, the query has 128 values while each key or value
+        projection has only 32.
     """
 
     model: LlamaModelSpec
@@ -83,8 +98,9 @@ class _LlamaCompileContext:
 class _LlamaRowCounts:
     """Number of DRAM rows needed for each kind of Llama tensor.
 
-    Tensors with the same shape reuse a row-count field, but receive different
-    row ranges later.
+    Each count is a row depth within a selected bank, not the total number of
+    rows summed across banks. Tensors with the same shape can use the same count
+    while receiving separate row ranges.
 
     Attributes:
         x: Rows for an input or residual vector copied across channels.
@@ -102,6 +118,10 @@ class _LlamaRowCounts:
         intermediate_vector: Rows for one expanded FFN vector.
         ffn_vector: Rows for the gated FFN product.
         w2: Rows for the FFN down-projection weights.
+
+    Examples:
+        A weight output spread over three rows requires six rows in a bank
+        assigned two such outputs.
     """
 
     x: int
@@ -125,8 +145,9 @@ class _LlamaRowCounts:
 class _LlamaMemoryLayout:
     """Starting DRAM row assigned to every tensor in one Llama block.
 
-    The row ranges are consecutive and do not overlap. ``end`` is the first row
-    after all allocations.
+    Every integer below is a starting row number, not a byte address or a row
+    count. The separate ``_LlamaRowCounts`` supplies lengths. Ranges are consecutive
+    and do not overlap within a bank; ``end`` is the first unallocated row.
 
     Attributes:
         x: Input vector and first residual value.
@@ -187,8 +208,11 @@ class _LlamaMemoryLayout:
 class _LlamaBufferLayout:
     """Shared Buffer spans used by one Llama block.
 
-    Q, K, and V use separate spans because attention needs all three. FFN spans
-    may reuse earlier attention storage after those values are no longer live.
+    The query (Q), key (K), and value (V) need separate spans because attention
+    uses them together. The feed-forward network (FFN) runs later and reuses
+    attention slots once their old values are no longer needed. These spans
+    reserve capacity; they do not initialize the values or fix missing packing
+    between raw accumulator results and logical vectors.
 
     Attributes:
         input: Slots containing the block input during the first RMSNorm.
@@ -226,7 +250,11 @@ class _LlamaBufferLayout:
 
 @dataclass(frozen=True, slots=True)
 class _LlamaSelfAttentionPlan:
-    """Collect the generic operation plans used by Llama self-attention.
+    """Connect normalization, attention, and the first residual addition.
+
+    A residual addition adds the block's original input back to the attention
+    result. That input must survive while projections and attention reuse other
+    workspaces. The result is saved in DRAM before the feed-forward stage.
 
     Attributes:
         normalization: RMS normalization applied to the block input.
@@ -251,7 +279,11 @@ class _LlamaSelfAttentionPlan:
 
 @dataclass(frozen=True, slots=True)
 class _LlamaFeedForwardPlan:
-    """Collect the generic operation plans used by Llama's FFN.
+    """Connect the two expanding projections, their gate, and the final addition.
+
+    The feed-forward network (FFN) forms ``gate = W1 * x`` and ``up = W3 * x``, multiplies
+    ``SiLU(gate)`` by ``up``, and uses W2 to return to hidden width. Its residual input
+    is restored from DRAM before the final addition.
 
     Attributes:
         normalization: RMS normalization applied to the attention residual.
@@ -274,7 +306,12 @@ class _LlamaFeedForwardPlan:
 
 @dataclass(frozen=True, slots=True)
 class _LlamaCompilePlan:
-    """All checked inputs and placements needed to lower one Llama block.
+    """Collect the dimensions, reserved memory, and operation order for one block.
+
+    This is the handoff from planning to instruction generation. Every lowerer
+    receives its own smaller plan, but all plans refer to these shared memory
+    allocations. Successful planning establishes sizes and addresses, not
+    numerical completeness of the unfinished operations.
 
     Attributes:
         context: Derived model, hardware, and decode dimensions.
@@ -362,7 +399,7 @@ def _create_context(request: CompileRequest) -> _LlamaCompileContext:
         # values during an activation pass.
         activation_capacity=(
             request.placement.channels_per_block
-            * (request.hardware.num_banks // BANKS_PER_PU)
+            * (request.hardware.num_banks // BANKS_PER_GROUP)
             * request.hardware.dram_columns
         ),
     )
@@ -438,13 +475,15 @@ def _row_counts(context: _LlamaCompileContext) -> _LlamaRowCounts:
     hidden_rows_per_output = ceil_div(hidden, columns)
     intermediate_rows_per_output = ceil_div(intermediate, columns)
 
-    # Reserve caches for the maximum token count. Keys cycle tokens through
-    # banks; scores and values put token positions across row columns.
+    # Reserve caches for the maximum token count, not just today's context.
+    # Keys cycle tokens through banks; scores and values put token positions
+    # across columns. With ten tokens and four banks, keys need three groups
+    # of rows; with eight columns, a value dimension needs two rows.
     sequence_bank_groups = ceil_div(max_sequence, context.total_banks)
     sequence_rows = ceil_div(max_sequence, columns)
     query_head_slots_per_pu = ceil_div(
         model.num_attention_heads,
-        context.total_banks // BANKS_PER_PU,
+        context.total_banks // BANKS_PER_GROUP,
     )
     kv_heads_per_channel = ceil_div(
         model.num_kv_heads,
@@ -453,10 +492,10 @@ def _row_counts(context: _LlamaCompileContext) -> _LlamaRowCounts:
     head_slices_across_banks = ceil_div(context.head_size, banks)
 
     # Normalization and rotary lowering place hidden vectors across four-bank
-    # PU groups. Their row ranges must fit the largest piece held by one group.
+    # bank groups. Their row ranges must fit the largest piece held by one group.
     query_layout = plan_partitioned_vector(
         hidden,
-        context.total_banks // BANKS_PER_PU,
+        context.total_banks // BANKS_PER_GROUP,
         hardware.burst_length,
     )
     projection_rows = ceil_div(
@@ -556,30 +595,31 @@ def _plan_memory(context: _LlamaCompileContext) -> _LlamaMemoryLayout:
 
 
 def _plan_shared_buffer(context: _LlamaCompileContext) -> _LlamaBufferLayout:
-    """Assign Shared Buffer spans according to Llama value lifetimes.
+    """Reserve buffer slots and reuse them only after earlier values are no longer needed.
 
     Args:
         context: Checked Llama dimensions and target hardware.
 
     Returns:
-        Named spans used by attention and feed-forward lowering.
+        Named slot ranges for simultaneous inputs and intermediate results,
+        with attention and feed-forward workspaces sharing space where planned.
 
     Raises:
         ValueError: If the target Shared Buffer cannot hold the live spans.
     """
 
     burst_length = context.hardware.burst_length
-    pu_groups = context.total_banks // BANKS_PER_PU
+    bank_groups = context.total_banks // BANKS_PER_GROUP
 
     hidden_layout = plan_partitioned_vector(
-        context.model.hidden_size, pu_groups, burst_length
+        context.model.hidden_size, bank_groups, burst_length
     )
     hidden_slots = hidden_layout.slot_count
     kv_slots = plan_partitioned_vector(
-        context.kv_width, pu_groups, burst_length
+        context.kv_width, bank_groups, burst_length
     ).slot_count
     intermediate_slots = plan_partitioned_vector(
-        context.model.intermediate_size, pu_groups, burst_length
+        context.model.intermediate_size, bank_groups, burst_length
     ).slot_count
     intermediate_result_slots = ceil_div(
         context.model.intermediate_size, context.total_banks
@@ -686,31 +726,35 @@ def _create_rotary_embedding_plan(
     rows: TransformerAttentionRows,
     buffers: TransformerAttentionBuffers,
 ) -> RotaryEmbeddingPlan:
-    """Plan how query and key values occupy CENT PU groups.
+    """Split query and key values among four-bank processing units.
 
     Args:
-        context: Derived Llama and hardware dimensions.
-        spec: Logical dimensions of the attention operation.
-        rows: DRAM regions assigned to attention tensors.
-        buffers: Shared Buffer regions assigned to attention tensors.
+        context: Checked model sizes and device capacities used to calculate
+            how many banks, rows, and transfer bursts each stage needs.
+        spec: Head widths and counts, visible token count, and reserved cache
+            length; these define the logical values the plan must accommodate.
+        rows: Reserved row ranges for queries, keys, scores, and caches; the
+            returned plan determines which banks and channels access them.
+        buffers: Reserved Shared Buffer slots through which attention stages
+            receive inputs, stage transfers, and expose raw results.
 
     Returns:
         Explicit query and key partitions used by rotary lowering.
     """
 
     hardware = context.hardware
-    pu_groups = context.total_banks // BANKS_PER_PU
+    bank_groups = context.total_banks // BANKS_PER_GROUP
 
-    # The baseline layout uses every available four-bank PU group. A future
+    # The baseline layout uses every available four-bank group. A future
     # optimizer can create a different plan without changing the lowerer.
     query_layout = plan_partitioned_vector(
         spec.hidden_size,
-        pu_groups,
+        bank_groups,
         hardware.burst_length,
     )
     key_layout = plan_partitioned_vector(
         spec.kv_width,
-        pu_groups,
+        bank_groups,
         hardware.burst_length,
     )
     return RotaryEmbeddingPlan(
@@ -735,10 +779,14 @@ def _create_kv_cache_update_plan(
     """Plan where the current token's key and value enter the KV cache.
 
     Args:
-        context: Derived Llama and hardware dimensions.
-        spec: Logical dimensions of the attention operation.
-        rows: DRAM regions assigned to attention tensors.
-        buffers: Shared Buffer regions assigned to attention tensors.
+        context: Checked model sizes and device capacities used to calculate
+            how many banks, rows, and transfer bursts each stage needs.
+        spec: Head widths and counts, visible token count, and reserved cache
+            length; these define the logical values the plan must accommodate.
+        rows: Reserved row ranges for queries, keys, scores, and caches; the
+            returned plan determines which banks and channels access them.
+        buffers: Reserved Shared Buffer slots through which attention stages
+            receive inputs, stage transfers, and expose raw results.
 
     Returns:
         Physical key and value cache placement for the current token.
@@ -748,6 +796,8 @@ def _create_kv_cache_update_plan(
     channels_per_block = context.placement.channels_per_block
     sequence_index = spec.sequence_length - 1
 
+    # Token 6 with four assigned banks uses bank 2 in row group 1:
+    # remainder chooses the bank, quotient chooses the next group of key rows.
     # Each equal-sized channel region receives the same key-cache layout.
     replica_channel_offsets = tuple(
         copy * channels_per_block
@@ -786,13 +836,17 @@ def _create_score_gemv_plan(
     rows: TransformerAttentionRows,
     buffers: TransformerAttentionBuffers,
 ) -> ScoreGemvPlan:
-    """Plan the query-by-key-cache matrix-vector multiplication.
+    """Select channels for comparing each query head with every cached token.
 
     Args:
-        context: Derived Llama and hardware dimensions.
-        spec: Logical dimensions of the attention operation.
-        rows: DRAM regions assigned to attention tensors.
-        buffers: Shared Buffer regions assigned to attention tensors.
+        context: Checked model sizes and device capacities used to calculate
+            how many banks, rows, and transfer bursts each stage needs.
+        spec: Head widths and counts, visible token count, and reserved cache
+            length; these define the logical values the plan must accommodate.
+        rows: Reserved row ranges for queries, keys, scores, and caches; the
+            returned plan determines which banks and channels access them.
+        buffers: Reserved Shared Buffer slots through which attention stages
+            receive inputs, stage transfers, and expose raw results.
 
     Returns:
         Key-cache row geometry and channel schedule for score lowering.
@@ -845,12 +899,18 @@ def _create_score_transfer_plan(
     """Plan one direction of score movement for a softmax pass.
 
     Args:
-        context: Derived Llama and hardware dimensions.
-        spec: Logical dimensions of the attention operation.
-        rows: DRAM regions assigned to attention tensors.
-        buffers: Shared Buffer regions assigned to attention tensors.
-        instruction_type: Direction of movement between DRAM and the buffer.
-        bank_group: Bank position used within every four-bank PU group.
+        context: Checked model sizes and device capacities used to calculate
+            how many banks, rows, and transfer bursts each stage needs.
+        spec: Head widths and counts, visible token count, and reserved cache
+            length; these define the logical values the plan must accommodate.
+        rows: Reserved row ranges for queries, keys, scores, and caches; the
+            returned plan determines which banks and channels access them.
+        buffers: Reserved Shared Buffer slots through which attention stages
+            receive inputs, stage transfers, and expose raw results.
+        instruction_type: ``WriteSingleBank`` to store scores in DRAM, or
+            ``ReadSingleBank`` to bring them back to the Shared Buffer.
+        bank_group: Position within each four-bank processing unit: operand
+            positions 0 and 1 or result position 2.
 
     Returns:
         Explicit score banks and channel replicas for one transfer.
@@ -869,9 +929,9 @@ def _create_score_transfer_plan(
         ),
         heads_per_bank=ceil_div(
             spec.num_attention_heads,
-            context.total_banks // BANKS_PER_PU,
+            context.total_banks // BANKS_PER_GROUP,
         ),
-        logical_banks=tuple(range(bank_group, context.total_banks, BANKS_PER_PU)),
+        logical_banks=tuple(range(bank_group, context.total_banks, BANKS_PER_GROUP)),
         replica_channel_offsets=tuple(
             copy * channels_per_block
             for copy in range(context.hardware.num_channels // channels_per_block)
@@ -888,10 +948,14 @@ def _create_softmax_plan(
     """Plan score placement for the currently supported softmax passes.
 
     Args:
-        context: Derived Llama and hardware dimensions.
-        spec: Logical dimensions of the attention operation.
-        rows: DRAM regions assigned to attention tensors.
-        buffers: Shared Buffer regions assigned to attention tensors.
+        context: Checked model sizes and device capacities used to calculate
+            how many banks, rows, and transfer bursts each stage needs.
+        spec: Head widths and counts, visible token count, and reserved cache
+            length; these define the logical values the plan must accommodate.
+        rows: Reserved row ranges for queries, keys, scores, and caches; the
+            returned plan determines which banks and channels access them.
+        buffers: Reserved Shared Buffer slots through which attention stages
+            receive inputs, stage transfers, and expose raw results.
 
     Returns:
         Ordered multiply passes and the transfers surrounding each pass.
@@ -946,13 +1010,17 @@ def _create_attention_output_plan(
     rows: TransformerAttentionRows,
     buffers: TransformerAttentionBuffers,
 ) -> AttentionOutputPlan:
-    """Plan the score-by-value-cache matrix-vector multiplication.
+    """Lay out the weighted sums over cached values for each output dimension.
 
     Args:
-        context: Derived Llama and hardware dimensions.
-        spec: Logical dimensions of the attention operation.
-        rows: DRAM regions assigned to attention tensors.
-        buffers: Shared Buffer regions assigned to attention tensors.
+        context: Checked model sizes and device capacities used to calculate
+            how many banks, rows, and transfer bursts each stage needs.
+        spec: Head widths and counts, visible token count, and reserved cache
+            length; these define the logical values the plan must accommodate.
+        rows: Reserved row ranges for queries, keys, scores, and caches; the
+            returned plan determines which banks and channels access them.
+        buffers: Reserved Shared Buffer slots through which attention stages
+            receive inputs, stage transfers, and expose raw results.
 
     Returns:
         Value-cache row geometry and channel placement for output lowering.
@@ -990,13 +1058,15 @@ def _create_attention_plan(
     """Convert Llama dimensions and placements into attention operands.
 
     Args:
-        context: Derived Llama and hardware dimensions.
+        context: Checked model sizes and device capacities used to calculate
+            how many banks, rows, and transfer bursts each stage needs.
         row_counts: DRAM space required by each tensor kind.
         memory: DRAM row assigned to every Llama tensor.
         buffers: Shared Buffer spans used by the Llama block.
 
     Returns:
-        Complete physical plan for every transformer attention stage.
+        Row ranges, buffer spans, and per-stage operation plans. The plans
+        retain the numerical limitations of the individual attention lowerers.
     """
 
     spec = TransformerAttentionSpec(
@@ -1047,7 +1117,11 @@ def _create_silu_product_plan(
     memory: _LlamaMemoryLayout,
     buffers: _LlamaBufferLayout,
 ) -> _SiluProductPlan:
-    """Plan the bank partitions used by Llama's gated FFN product.
+    """Split the expanded feed-forward vector into one or two multiplication passes.
+
+    Each processing unit handles one DRAM row of values per pass. A vector that
+    exceeds the combined capacity uses a second workspace for the remainder;
+    context validation rejects vectors requiring a third pass.
 
     Args:
         context: Derived model dimensions and target hardware.
@@ -1073,10 +1147,10 @@ def _create_silu_product_plan(
             ),
         )
 
-    available_partitions = context.total_banks // BANKS_PER_PU
+    available_partitions = context.total_banks // BANKS_PER_GROUP
     chunks: list[_SiluProductChunkPlan] = []
     for row, value_count in chunk_specs:
-        # The baseline policy uses as many nonempty PU groups as possible. A
+        # The baseline policy uses as many nonempty bank groups as possible. A
         # future optimizer can replace this plan without changing the lowerer.
         values_per_partition = ceil_div(value_count, available_partitions)
         partition_count = ceil_div(value_count, values_per_partition)
@@ -1098,7 +1172,7 @@ def _create_silu_product_plan(
             range(
                 ElementwiseMultiply.RESULT_BANK,
                 context.hardware.num_banks,
-                BANKS_PER_PU,
+                BANKS_PER_GROUP,
             )
         ),
     )
@@ -1115,7 +1189,11 @@ def _create_rms_norm_plan(
     partial_sum_buffer: CentSharedBufferSpan,
     output_buffer: CentSharedBufferSpan,
 ) -> CentRmsNormPlan:
-    """Plan one hidden-width RMS-normalization operation.
+    """Connect the partial square-sum and scale-multiply layouts for RMSNorm.
+
+    Both stages read the same input slots, so their partition padding must
+    agree. The scale is still an external input: this plan does not add the
+    missing reduction, epsilon, or reciprocal-square-root calculations.
 
     Args:
         context: Derived model dimensions and target hardware.
@@ -1128,14 +1206,15 @@ def _create_rms_norm_plan(
         output_buffer: Slots receiving the normalized vector.
 
     Returns:
-        Explicit neighboring-pair and four-bank-group normalization layouts.
+        Plans for computing partial squares in neighboring bank pairs and
+        applying the supplied scale and learned weights in four-bank groups.
     """
 
     value_count = context.model.hidden_size
     burst_length = context.hardware.burst_length
     pu_layout = plan_partitioned_vector(
         value_count,
-        context.total_banks // BANKS_PER_PU,
+        context.total_banks // BANKS_PER_GROUP,
         burst_length,
     )
     # Both stages read the same Shared Buffer span. Use the PU partition count
@@ -1198,7 +1277,7 @@ def _create_self_attention_lowering_plan(
     hidden_size = context.model.hidden_size
     hidden_layout = plan_partitioned_vector(
         hidden_size,
-        context.total_banks // BANKS_PER_PU,
+        context.total_banks // BANKS_PER_GROUP,
         hardware.burst_length,
     )
     input_vector = CentSharedBufferVector(
@@ -1330,7 +1409,7 @@ def _create_feed_forward_lowering_plan(
     intermediate_size = context.model.intermediate_size
     hidden_layout = plan_partitioned_vector(
         hidden_size,
-        context.total_banks // BANKS_PER_PU,
+        context.total_banks // BANKS_PER_GROUP,
         hardware.burst_length,
     )
     normalized_vector = CentSharedBufferVector(
@@ -1343,7 +1422,7 @@ def _create_feed_forward_lowering_plan(
     )
     intermediate_layout = plan_partitioned_vector(
         intermediate_size,
-        context.total_banks // BANKS_PER_PU,
+        context.total_banks // BANKS_PER_GROUP,
         hardware.burst_length,
     )
     ffn_product_vector = CentSharedBufferVector(
@@ -1436,7 +1515,8 @@ def _create_compile_plan(request: CompileRequest) -> _LlamaCompilePlan:
         request: Llama model, hardware, block placement, and decode sizes.
 
     Returns:
-        Complete immutable plan consumed by the Llama block compiler.
+        Model dimensions, memory reservations, and connected operation plans
+        consumed by the block compiler. Existing numerical TODOs still apply.
 
     Raises:
         ValueError: If the model does not fit the selected target.

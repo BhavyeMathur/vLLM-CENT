@@ -12,3 +12,4 @@ coverage.xml
 htmlcov/
 presentations
 docs/impl_plan
+.venv-mlir/

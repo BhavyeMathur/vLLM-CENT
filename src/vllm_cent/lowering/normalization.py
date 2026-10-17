@@ -1,9 +1,17 @@
-"""Lower reusable normalization operations to CENT instructions."""
+"""Emit the implemented pieces of vector normalization.
+
+The intended calculation combines squared values into a scalar scale, then
+multiplies every input by that scale and, for RMSNorm, a learned weight.
+Only the partial dot products and multiplication passes are implemented here.
+The caller must supply the repeated scale; this module does not calculate it.
+The staged ``pipeline`` package has a separate complete reference RMSNorm path.
+These older model-specific call sites have not migrated to that path.
+"""
 
 from dataclasses import dataclass
 
 from ..cent import (
-    BANKS_PER_PU,
+    BANKS_PER_GROUP,
     CentProgramBuilder,
     CopyBankToGlobalBuffer,
     CopyGlobalBufferToBank,
@@ -40,14 +48,22 @@ __all__ = [
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CentSumOfSquaresPlan:
-    """Bind a sum-of-squares layout to its working memory.
+    """Plan partial sums of squared values using pairs of neighboring banks.
+
+    Each pair produces a separate partial result. Combining all pairs and
+    channels into one scalar is still an unimplemented later step.
 
     Attributes:
         input_rows: DRAM workspace used for two copies of the input vector.
         input_buffer: Zero-padded input vector in the Shared Buffer.
         partial_sum_buffer: Slot receiving the accumulator results.
         layout: Vector split across neighboring bank pairs.
-        accumulation_register: Register used to collect squared partial sums.
+        accumulation_register: Register index used for the dot product in each
+            active bank; it is reused across the rows of that bank's input.
+
+    Examples:
+        Copying ``[a, b]`` into both banks lets a dot product calculate
+        ``a*a + b*b`` for that pair.
     """
 
     input_rows: CentDramRowRange
@@ -71,13 +87,18 @@ class CentSumOfSquaresPlan:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CentL2NormPlan:
-    """Describe the supported L2-normalization dataflow.
+    """Plan squared partial sums and multiplication by a caller-supplied scale.
+
+    L2 normalization would divide each input by ``sqrt(sum(x*x))``. The current
+    lowerer does not form that scalar; ``scale_buffer`` must already repeat the
+    desired multiplier in every logical input position.
 
     Attributes:
         sum_of_squares: Plan that produces the squared partial sums.
         work_rows: DRAM workspace receiving the input and normalization scale.
-        scale_buffer: Zero-padded repeated scale in the Shared Buffer.
-        layout: Vector split across four-bank PU groups.
+        scale_buffer: Slots already containing the same multiplier at each
+            logical vector position and zero in every padding position.
+        layout: Vector split across four-bank groups.
     """
 
     sum_of_squares: CentSumOfSquaresPlan
@@ -110,7 +131,11 @@ class CentL2NormPlan:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CentRmsNormPlan:
-    """Describe the supported RMS-normalization dataflow.
+    """Plan the implemented multiplication stages of RMS normalization.
+
+    RMSNorm intends to compute ``x * weight / sqrt(mean(x*x) + epsilon)``.
+    This plan supplies the learned weights and destinations, but the shared
+    prefix still requires its scale to be provided rather than calculated.
 
     Attributes:
         l2_norm: Shared sum-of-squares and scaling prefix.
@@ -144,7 +169,8 @@ def lower_sum_of_squares(
 
     Args:
         builder: Program builder that receives the instructions.
-        plan: Neighbor-bank vector layout and its memory bindings.
+        plan: How to split the input among neighboring bank pairs, where to
+            copy both operands, and where to read the partial sums.
 
     Raises:
         ValueError: If a size is invalid or a memory region is too small.
@@ -155,7 +181,9 @@ def lower_sum_of_squares(
     # MAC_ABK produces one partial sum for each active neighboring bank pair.
     # RD_MAC exposes those values, but this function does not yet combine the
     # pairs within one channel or combine the channels holding one vector. We
-    # first need the RD_MAC destination layout and the exact RED semantics.
+    # first need the RD_MAC destination layout. RED sums within each slot;
+    # combining multiple slot results and handling unused output lanes still
+    # need explicit lowering and an execution contract.
 
     # TODO(runtime): Initialize the first MAC values to zero.
     #
@@ -238,15 +266,17 @@ def lower_l2_norm(
     builder: CentProgramBuilder,
     plan: CentL2NormPlan,
 ) -> None:
-    """Emit the supported path that scales a vector by its norm.
+    """Emit partial square sums and multiply the input by the supplied scale.
 
-    The normalized vector remains in bank group two of ``work_rows``. This
+    The scaled vector remains in bank position two of each four-bank group
+    within ``work_rows``. This
     location lets a following operation consume the result without returning
     it to the Shared Buffer first.
 
     Args:
         builder: Program builder that receives the instructions.
-        plan: Normalization layouts and their memory bindings.
+        plan: Input and scale locations, the partial-sum plan, and the DRAM
+            workspace that receives their elementwise product.
 
     Raises:
         ValueError: If a size is invalid or a memory region is too small.
@@ -258,9 +288,9 @@ def lower_l2_norm(
     # combine results from every bank and channel or calculate a square root.
     # The caller must currently provide the repeated scale in ``scale_buffer``.
 
-    # TODO(ISA): Define how unused PU groups are disabled.
+    # TODO(ISA): Define how unused bank groups are disabled.
     #
-    # A layout can transfer data into fewer PU groups, but EW_MUL selects whole
+    # A layout can transfer data into fewer bank groups, but EW_MUL selects whole
     # channels. The remaining groups still execute unless their input banks are
     # initialized to harmless values or the hardware provides another mask.
 
@@ -268,9 +298,9 @@ def lower_l2_norm(
     vector_layout = plan.layout
     if vector_layout.burst_length != hardware.burst_length:
         raise ValueError("layout burst_length does not match the target")
-    group_count = builder.total_banks // BANKS_PER_PU
+    group_count = builder.total_banks // BANKS_PER_GROUP
     if vector_layout.partition_count > group_count:
-        raise ValueError("layout uses more PU groups than the block owns")
+        raise ValueError("layout uses more bank groups than the block owns")
 
     row_operation_sizes = _row_operation_sizes(
         vector_layout.physical_values_per_partition,
@@ -329,7 +359,8 @@ def lower_rms_norm(
 
     Args:
         builder: Program builder that receives the instructions.
-        plan: RMS-normalization layouts and their memory bindings.
+        plan: Partial-sum and scale-multiply stages, learned-weight rows, and
+            Shared Buffer destination for the final multiplication.
 
     Raises:
         ValueError: If a size is invalid or a memory region is too small.
@@ -358,7 +389,7 @@ def lower_rms_norm(
     )
     lower_l2_norm(builder, plan.l2_norm)
 
-    # EW_MUL leaves one result in bank two of each four-bank PU group. AiM's
+    # EW_MUL leaves one result in bank two of each four-bank group. AiM's
     # copy instructions name one physical bank, so move every result bank
     # through the Global Buffer into bank one beside the learned weights in
     # bank zero.
@@ -366,7 +397,7 @@ def lower_rms_norm(
         for result_bank in range(
             ElementwiseMultiply.RESULT_BANK,
             hardware.num_banks,
-            BANKS_PER_PU,
+            BANKS_PER_GROUP,
         ):
             group_start_bank = result_bank - ElementwiseMultiply.RESULT_BANK
             second_operand_bank = (

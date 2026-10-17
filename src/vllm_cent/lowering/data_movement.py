@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 
 from ..cent import (
-    BANKS_PER_PU,
+    BANKS_PER_GROUP,
     CentProgramBuilder,
     ReadSingleBank,
     WriteSingleBank,
@@ -21,7 +21,10 @@ __all__ = [
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CentBankGroupVectorTransferPlan:
-    """Bind one zero-padded vector in DRAM and the Shared Buffer.
+    """Describe both ends of a vector copy between DRAM and the Shared Buffer.
+
+    The copy keeps the same partition order and copies padding too. It does not
+    rearrange values to convert between different layouts.
 
     Attributes:
         dram: Partitioned DRAM representation of the vector.
@@ -52,7 +55,8 @@ def _lower_bank_group_vector_transfer(
     Args:
         builder: Program builder that receives the transfer instructions.
         plan: Checked vector layout and its memory bindings.
-        instruction_type: Direction of the transfer.
+        instruction_type: ``WriteSingleBank`` copies from the buffer to DRAM;
+            ``ReadSingleBank`` copies from DRAM to the buffer.
 
     Raises:
         ValueError: If the plan is incompatible with the target hardware or a
@@ -63,7 +67,7 @@ def _lower_bank_group_vector_transfer(
     if layout.burst_length != builder.hardware.burst_length:
         raise ValueError("layout burst_length does not match the target")
 
-    available_groups = builder.total_banks // BANKS_PER_PU
+    available_groups = builder.total_banks // BANKS_PER_GROUP
     if layout.partition_count > available_groups:
         raise ValueError("layout uses more bank groups than the block owns")
 
@@ -73,7 +77,7 @@ def _lower_bank_group_vector_transfer(
     )
     _require_dram_row_capacity("rows", plan.dram.rows, required_rows)
 
-    # Each used PU group receives one consecutive partition. The builder maps
+    # Each used bank group receives one consecutive partition. The builder maps
     # those partitions to channels and banks and advances the buffer slot.
     builder.emit_bank_group_transfer(
         instruction_type,

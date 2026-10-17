@@ -1,4 +1,12 @@
-"""Plan and lower model-independent matrix-vector multiplication to CENT."""
+"""Plan weight-matrix multiplication and emit its current CENT command sequence.
+
+Each output is a dot product between one matrix row and the input vector.
+The plans choose banks and working memory; the lowerer follows that choice.
+Accumulator initialization and result packing remain unresolved, so this path
+currently describes command structure rather than a complete numerical GEMV
+(general matrix-vector multiplication). The staged ``pipeline`` package has a
+separate executable reference path with explicit accumulator access and packing.
+"""
 
 from dataclasses import dataclass
 
@@ -32,17 +40,25 @@ __all__ = ["CentWeightGemvPlan", "lower_weight_gemv", "plan_weight_gemv"]
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CentWeightGemvPlan:
-    """Describe one matrix-vector multiplication and its physical layout.
+    """Describe where the inputs and partial results of ``weights @ input`` live.
+
+    Matrix rows are divided among banks. A bank can calculate several output
+    values, but only a limited group at once because each unfinished dot product
+    needs an accumulator register. Wider inputs require several DRAM rows and
+    continue those same dot products across rows.
 
     Attributes:
-        weights: DRAM rows containing the distributed weight matrix.
+        weights: Consecutive row numbers holding the matrix pieces in each
+            selected bank; every output occupies one or more of those rows.
         input_buffer: Zero-padded Shared Buffer input vector.
         output_buffer: Slots receiving raw matrix results and partial sums.
         vector_size: Number of values in the input vector.
         output_size: Number of values produced by the matrix.
-        outputs_per_bank: Output rows assigned to each used DRAM bank.
-        accumulator_group_size: Outputs calculated before accumulator registers
-            are reused for the next group.
+        outputs_per_bank: Number of output dot products reserved in each bank;
+            the final bank may have fewer logical outputs.
+        accumulator_group_size: Dot products handled together in one bank,
+            each in a separate accumulator register. Registers are reused for
+            the next group after their results have been read.
         channels: Physical channels that execute the matrix operation.
         activated_output_buffer: Separate slots receiving sigmoid results. A
             value of ``None`` disables activation lowering.
@@ -110,7 +126,7 @@ def plan_weight_gemv(
     output_size: int,
     activated_output_buffer: CentSharedBufferSpan | None = None,
 ) -> CentWeightGemvPlan:
-    """Create the baseline maximum-parallelism GEMV plan.
+    """Divide matrix outputs among the available banks and accumulator registers.
 
     The policy spreads outputs across all block-local banks, then divides each
     bank's outputs into groups that fit its accumulator registers.
@@ -118,7 +134,8 @@ def plan_weight_gemv(
     Args:
         hardware: CENT device that will execute the plan.
         placement: Number of device channels assigned to the model block.
-        weights: DRAM rows containing the distributed weight matrix.
+        weights: Consecutive row numbers holding the matrix pieces in each
+            selected bank; every output occupies one or more of those rows.
         input_buffer: Shared Buffer slots containing the input vector.
         output_buffer: Slots receiving raw matrix results and partial sums.
         vector_size: Number of values in the input vector.
@@ -127,7 +144,8 @@ def plan_weight_gemv(
             value of ``None`` disables activation lowering.
 
     Returns:
-        Immutable GEMV plan that preserves the baseline lowering policy.
+        Plan naming the selected channels, outputs per bank, register group
+        size, and memory used by the multiplication.
 
     Raises:
         ValueError: If a dimension or target capacity is invalid.
@@ -184,7 +202,11 @@ def lower_weight_gemv(
     builder: CentProgramBuilder,
     plan: CentWeightGemvPlan,
 ) -> None:
-    """Multiply a Shared Buffer vector by a weight matrix in DRAM.
+    """Emit the planned command sequence for a weight-matrix multiplication.
+
+    This is not yet a complete numerical multiplication: the TODOs below track
+    initial accumulator values, physical register selection, and the ordering of
+    results read from several banks and channels.
 
     The matrix is distributed according to ``plan``. Output values at the same
     bank position use consecutive DRAM rows.
@@ -198,10 +220,14 @@ def lower_weight_gemv(
             region is too small.
     """
 
-    # TODO(ISA): Define how a dot product continues across input rows.
+    # TODO(target ABI): Encode the register selected by this restore sequence.
     #
-    # RD_MAC reads a partial sum and WR_BIAS writes it back. WR_BIAS has no
-    # register operand, so the paper does not say which register receives it.
+    # The original functional MAC continues its selected latch across rows;
+    # Hynix JSSC p296 also documents MRS-selected accumulation latches. This
+    # older path instead reads and restores a partial sum through WR_BIAS.
+    # Its physical adapter still needs the bias-write selector and read layout.
+    # See docs/research/execution-contracts.md; the new pipeline avoids this
+    # ambiguity by keeping selected-register access explicit in reference IR.
 
     # TODO(dataflow): Define how RD_MAC packs results selected by CHmask.
     #
@@ -288,6 +314,9 @@ def lower_weight_gemv(
 
             for local_output in range(output_count):
                 output_index = first_output + local_output
+                # Each output owns a consecutive run of weight rows. For two
+                # rows per output, output 3 occupies offsets 6 and 7; the input
+                # slice selects which row of that run to multiply now.
                 weight_row_offset = output_index * rows_per_output + vector_row
                 builder.append(
                     MacAllBanks(

@@ -1,4 +1,8 @@
-"""Tests for model-independent CENT lowering components."""
+"""Check reusable layout planning and the instructions emitted for each plan.
+
+Array-packing tests check concrete values. Instruction-list tests check
+addresses and ordering; they do not prove hardware arithmetic or result packing.
+"""
 
 import unittest
 from dataclasses import replace
@@ -73,7 +77,8 @@ def make_builder(
         num_banks: DRAM banks available in the test channel.
 
     Returns:
-        Empty builder for one channel containing four banks.
+        Empty builder for one channel containing ``num_banks`` banks, with
+        128 rows per bank and 64 Shared Buffer slots.
     """
 
     hardware = CentHardwareSpec(
@@ -104,7 +109,8 @@ def make_buffer_vector(
         layout: Logical partitioning and zero-padding positions.
 
     Returns:
-        Zero-padded vector binding used by a lowering test.
+        Address and layout description covering exactly the required slots.
+        This helper records the padding rule; it does not initialize values.
     """
 
     return CentSharedBufferVector(
@@ -126,7 +132,10 @@ def make_gemv_plan(
     output_size: int,
     activated_output_buffer: CentSharedBufferSpan | None = None,
 ) -> CentWeightGemvPlan:
-    """Create the baseline GEMV plan used by lowering tests.
+    """Plan a general matrix-vector product (GEMV) for the test target.
+
+    The planner chooses how to distribute matrix rows among banks. Each
+    resulting scalar is one matrix row multiplied by the input vector.
 
     Args:
         builder: Builder whose hardware and placement constrain the plan.
@@ -207,10 +216,14 @@ def make_l2_norm_plan(
     partial_sum_buffer: CentSharedBufferSpan,
     value_count: int,
 ) -> CentL2NormPlan:
-    """Create the baseline L2-normalization plan used by tests.
+    """Describe input squaring and scaling for an L2-normalization test.
+
+    L2 normalization divides a vector by its Euclidean length. This fixture
+    only plans the supported stages and records a caller-supplied scale; it
+    does not compute that scale or prove the full numerical operation.
 
     Args:
-        builder: Builder whose target determines available PU groups.
+        builder: Builder whose target determines available bank groups.
         input_rows: DRAM workspace used by sum of squares.
         work_rows: DRAM workspace used by scale multiplication.
         input_buffer: Slots containing the input vector.
@@ -219,7 +232,7 @@ def make_l2_norm_plan(
         value_count: Values in the vector.
 
     Returns:
-        L2-normalization plan with separate pair and PU-group layouts.
+        L2-normalization plan with separate pair and bank-group layouts.
     """
 
     layout = plan_partitioned_vector(
@@ -270,7 +283,8 @@ def make_rms_norm_plan(
         value_count: Values in the vector.
 
     Returns:
-        Complete RMS-normalization operation plan.
+        Plan connecting the normalization stages to learned weights and an
+        output region. It is not an executed or numerically verified result.
     """
 
     l2_norm = make_l2_norm_plan(
@@ -329,6 +343,8 @@ class LoweringUtilityTests(unittest.TestCase):
     def test_row_operation_sizes_split_only_at_row_boundaries(self) -> None:
         """Represent exact, partial, and multirow operation counts."""
 
+        # A sixteen-value row holds four bursts. Twenty values need those four
+        # bursts plus one burst in the next row; the tuple counts bursts per row.
         self.assertEqual(_row_operation_sizes(16, 16, 4), (4,))
         self.assertEqual(_row_operation_sizes(20, 16, 4), (4, 1))
         for values, width, burst in ((0, 16, 4), (4, 0, 4), (4, 10, 4)):
@@ -343,7 +359,7 @@ class PartitionedVectorLayoutTests(unittest.TestCase):
     def test_baseline_planner_preserves_the_maximum_partition_policy(
         self,
     ) -> None:
-        """Use the old even split while making its choice explicit."""
+        """Choose as many balanced vector pieces as the requested limit allows."""
 
         # Ten values over at most four partitions reserve three values in each
         # partition. Four-value bursts make every partition occupy one slot.
@@ -429,6 +445,9 @@ class PartitionedVectorLayoutTests(unittest.TestCase):
     def test_layout_identifies_internal_partition_padding(self) -> None:
         """Distinguish trailing padding from gaps inside a packed vector."""
 
+        # Two four-value pieces have no gap. Two three-value pieces instead
+        # leave padding after the first piece, between logical values. A single
+        # five-value piece needs eight lanes but has padding only at the end.
         exact = CentPartitionedVectorLayout(
             value_count=8,
             partition_count=2,
@@ -549,7 +568,7 @@ class LoweringBindingTests(unittest.TestCase):
                     )
 
     def test_dram_vector_rejects_an_invalid_bank_group(self) -> None:
-        """Keep logical vector bindings inside one four-bank PU group."""
+        """Keep logical vector bindings inside one four-bank group."""
 
         with self.assertRaisesRegex(ValueError, "bank_group"):
             CentDramVector(
@@ -884,6 +903,8 @@ class LinearLoweringTests(unittest.TestCase):
             ),
         )
 
+        # Preserve the raw result at slot 12 before applying activation ID 3.
+        # The activated result goes to slot 18 so it cannot overwrite the raw one.
         result_instructions = [
             instruction
             for instruction in builder.instructions
@@ -912,6 +933,10 @@ class LinearLoweringTests(unittest.TestCase):
 
     def test_gemv_rejects_regions_that_are_too_small(self) -> None:
         """Reject bindings that cannot contain an operand or result."""
+
+        # Sixteen inputs require four slots, so three is too few. Eight matrix
+        # rows spread over four banks require two DRAM rows per bank. Raw slots
+        # [10:12] and activated slots [11:13] overlap at slot 11.
 
         builder = make_builder()
         weights = CentDramRowRange(start_row=0, row_count=2)
@@ -1308,7 +1333,7 @@ class NormalizationLoweringTests(unittest.TestCase):
         )
 
     def test_l2_norm_obeys_fewer_planned_bank_partitions(self) -> None:
-        """Use one bank pair and one PU group on a larger target."""
+        """Use one bank pair and one bank group on a larger target."""
 
         builder = make_builder(num_banks=8)
         vector = CentPartitionedVectorLayout(
@@ -1336,7 +1361,7 @@ class NormalizationLoweringTests(unittest.TestCase):
                 start_slot=12,
                 layout=vector,
             ),
-            # Eight banks also provide two PU groups. Selecting one proves the
+            # Eight banks also provide two bank groups. Selecting one proves the
             # lowerer does not silently restore the baseline two-way split.
             layout=vector,
         )
@@ -1431,7 +1456,7 @@ class NormalizationLoweringTests(unittest.TestCase):
                     input_buffer=full,
                     scale_buffer=full,
                     partial_sum_buffer=partial,
-                    # This target has one four-bank PU, so all 16 values occupy
+                    # This target has one four-bank group, so all 16 values occupy
                     # its selected bank. Two DRAM rows are required.
                     value_count=16,
                 ),
@@ -1626,7 +1651,12 @@ class NormalizationLoweringTests(unittest.TestCase):
             )
 
     def test_normalization_rejects_incompatible_explicit_layouts(self) -> None:
-        """Reject mismatched vectors, bursts, pairs, and PU groups."""
+        """Reject mismatched vectors, bursts, pairs, and bank groups."""
+
+        # These cases separate agreement between plans from target limits.
+        # Equal vector lengths are insufficient if piece boundaries, padding
+        # positions, or burst widths differ. Four banks provide two neighboring
+        # pairs but only one four-bank group for the multiplication stage.
 
         builder = make_builder()
         rows = CentDramRowRange(start_row=0, row_count=8)
@@ -1797,7 +1827,7 @@ class NormalizationLoweringTests(unittest.TestCase):
                     layout=wrong_burst_layout,
                 ),
             )
-        with self.assertRaisesRegex(ValueError, "more PU groups"):
+        with self.assertRaisesRegex(ValueError, "more bank groups"):
             lower_l2_norm(
                 builder,
                 replace(
@@ -1824,6 +1854,10 @@ class DataMovementLoweringTests(unittest.TestCase):
 
     def test_store_and_load_use_the_requested_bank_position(self) -> None:
         """Move the whole vector in each direction with explicit bindings."""
+
+        # Sixteen values use four slots starting at slot 6. The store targets
+        # bank 1 and the load reads bank 2, both at row 9. This checks transfer
+        # addresses; it does not claim the two banks contain the same data.
 
         builder = make_builder()
         rows = CentDramRowRange(start_row=9, row_count=1)
@@ -1930,10 +1964,10 @@ class DataMovementLoweringTests(unittest.TestCase):
             )
 
     def test_transfer_obeys_a_supplied_lower_partition_layout(self) -> None:
-        """Use one PU group even when the target provides two groups."""
+        """Use one bank group even when the target provides two groups."""
 
         builder = make_builder(num_banks=8)
-        # The baseline planner would use both PU groups. Selecting one here
+        # The baseline planner would use both bank groups. Selecting one here
         # proves that lowering consumes the plan instead of recomputing it.
         layout = CentPartitionedVectorLayout(
             value_count=16,
@@ -2025,7 +2059,7 @@ class DataMovementLoweringTests(unittest.TestCase):
                         rows=rows,
                         layout=multirow_layout,
                     ),
-                    # One PU group receives all 32 values. Sixteen values fit in
+                    # One bank group receives all 32 values. Sixteen values fit in
                     # one row, so the declared row range is insufficient.
                     buffer=make_buffer_vector(
                         start_slot=0,
@@ -2036,7 +2070,7 @@ class DataMovementLoweringTests(unittest.TestCase):
             )
 
     def test_transfer_requires_matching_zero_padded_layouts(self) -> None:
-        """Reject DRAM and Shared Buffer bindings with different padding lanes."""
+        """Reject different partition layouts even when their total sizes match."""
 
         with self.assertRaisesRegex(ValueError, "layouts must match"):
             CentBankGroupVectorTransferPlan(
@@ -2064,6 +2098,9 @@ class ElementwiseLoweringTests(unittest.TestCase):
 
     def test_accumulate_uses_explicit_vector_spans(self) -> None:
         """Add two vectors from the requested Shared Buffer addresses."""
+
+        # Sixteen values occupy four four-lane slots. The single ACC therefore
+        # reads slots [20:24] and adds into slots [7:11].
 
         builder = make_builder()
         layout = plan_partitioned_vector(16, 1, 4)
@@ -2119,7 +2156,11 @@ class ElementwiseLoweringTests(unittest.TestCase):
         )
 
     def test_accumulate_rejects_different_vector_layouts(self) -> None:
-        """Reject operands whose zero-padding lanes do not line up."""
+        """Require identical partition rules and the target's lane count."""
+
+        # Both eight-value layouts below occupy two slots without padding, but
+        # one describes a single piece and the other describes two. The API
+        # requires matching layouts, not merely equal physical lane counts.
 
         builder = make_builder()
         contiguous = CentPartitionedVectorLayout(

@@ -34,9 +34,15 @@ from vllm_cent.cent import (
     validate_aim_hardware,
 )
 
+from vllm_cent.cent.reference import ReferenceFill
+
 
 def aim_hardware() -> CentHardwareSpec:
     """Create the fixed geometry accepted by the AiM trace adapter.
+
+    The channel, bank, and burst counts match the timing adapter. Smaller row
+    counts keep addresses easy to inspect. Activation ID 3 is a test choice,
+    not a verified numeric code for sigmoid.
 
     Returns:
         Thirty-two-channel, sixteen-bank target with 256-bit transfers.
@@ -72,6 +78,20 @@ def program_with(instruction: CentInstruction) -> CentProgram:
 
 class AimTraceRenderingTests(unittest.TestCase):
     """Test exact trace records accepted by AiM's parser."""
+
+    def test_reference_services_use_the_compatibility_error(self) -> None:
+        """Let callers handle every unsupported export with the documented error."""
+        instruction = ReferenceFill(
+            destination=CentSharedBufferAddress(slot=0), value_count=1
+        )
+        with self.assertRaisesRegex(
+            AimSimulatorCompatibilityError, "reference services"
+        ):
+            render_aim_instruction(instruction)
+        with self.assertRaisesRegex(
+            AimSimulatorCompatibilityError, "reference services"
+        ):
+            render_aim_trace(program_with(instruction))
 
     def test_channel_mask_uses_simulator_physical_bit_order(self) -> None:
         """Map channel zero to bit 31 and channel 31 to bit zero."""
@@ -173,7 +193,10 @@ class AimTraceRenderingTests(unittest.TestCase):
         program = CentProgram(hardware=aim_hardware(), instructions=instructions)
 
         # WR_SBK expands into two one-burst records because AiM's grammar has
-        # no OPsize field. MAC mode and AFid become explicit CFR writes.
+        # no OPsize field. Slots 5 and 6 become the two source-register fields.
+        # Configuration register CFR0 selects the MAC input (0: Global Buffer,
+        # 1: next bank); CFR2 selects activation ID 3. These records configure
+        # timing commands; they do not verify transferred tensor values.
         expected = """AiM WR_SBK 5 0x80000000 2 3
 AiM WR_SBK 6 0x80000000 2 3
 AiM RD_SBK 7 0x80000000 2 3
@@ -236,7 +259,7 @@ class AimTraceCompatibilityTests(unittest.TestCase):
                     validate_aim_hardware(changed)
 
     def test_rejects_unencoded_columns_and_registers(self) -> None:
-        """Fail instead of silently dropping target-invisible operands."""
+        """Reject operands with no field in the timing trace format."""
 
         cases = (
             WriteGlobalBuffer(

@@ -15,7 +15,7 @@ __all__ = [
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CentPartitionedVectorLayout:
-    """Describe a vector divided into equal-width physical partitions.
+    """Describe how a vector is split into pieces and padded for memory transfers.
 
     A partition is the piece assigned to one selected bank or bank group. Every
     partition occupies complete Shared Buffer slots. Logical values come first
@@ -23,8 +23,16 @@ class CentPartitionedVectorLayout:
 
     Attributes:
         value_count: Number of logical values in the vector.
-        partition_count: Number of physical partitions selected by the plan.
-        burst_length: Number of values carried by one Shared Buffer slot.
+        partition_count: Number of pieces assigned to separate banks or groups.
+            This determines where zeros must be inserted between pieces.
+        burst_length: Scalar values carried by one Shared Buffer slot, used to
+            round each partition up to complete transfers.
+
+    Examples:
+        Five values split into two partitions have logical lengths three and two.
+        With four values per slot, their memory contents are ``[a, b, c, 0]`` and
+        ``[d, e, 0, 0]``. Both pieces occupy one whole slot, so zeros appear between
+        partitions as well as at the end of the vector.
     """
 
     value_count: int
@@ -47,7 +55,7 @@ class CentPartitionedVectorLayout:
 
     @property
     def values_per_partition(self) -> int:
-        """Return the logical capacity reserved for each partition.
+        """Return the size of the largest piece before adding slot padding.
 
         Returns:
             Largest logical value count assigned to any partition, before the
@@ -57,7 +65,7 @@ class CentPartitionedVectorLayout:
         return ceil_div(self.value_count, self.partition_count)
 
     def logical_values_in_partition(self, partition: int) -> int:
-        """Return the logical values assigned to one partition.
+        """Count the actual vector values assigned to one partition.
 
         Values are balanced across the selected partitions. Earlier partitions
         receive one extra value when the vector does not divide evenly.
@@ -66,7 +74,7 @@ class CentPartitionedVectorLayout:
             partition: Zero-based partition index.
 
         Returns:
-            Logical values stored before padding in that partition.
+            Number of actual values stored before padding in that partition.
 
         Raises:
             ValueError: If ``partition`` is outside the layout.
@@ -134,7 +142,7 @@ class CentPartitionedVectorLayout:
 
     @property
     def is_contiguously_packed(self) -> bool:
-        """Return whether partition padding occurs only after the vector.
+        """Check whether the stored values can be read as one uninterrupted vector.
 
         Returns:
             ``True`` when joining the partition slots produces the logical
@@ -152,10 +160,10 @@ class CentPartitionedVectorLayout:
 
 
 def pack_zero_padded_vector[ValueT](
-        values: Sequence[ValueT],
-        layout: CentPartitionedVectorLayout,
-        *,
-        zero: ValueT,
+    values: Sequence[ValueT],
+    layout: CentPartitionedVectorLayout,
+    *,
+    zero: ValueT,
 ) -> tuple[ValueT, ...]:
     """Pack logical values and overwrite every padding lane with zero.
 
@@ -178,8 +186,7 @@ def pack_zero_padded_vector[ValueT](
 
     if len(values) != layout.value_count:
         raise ValueError(
-            f"layout contains {layout.value_count} values, but received "
-            f"{len(values)}"
+            f"layout contains {layout.value_count} values, but received {len(values)}"
         )
 
     packed: list[ValueT] = []
@@ -199,26 +206,32 @@ def pack_zero_padded_vector[ValueT](
 
 
 def plan_partitioned_vector(
-        value_count: int,
-        maximum_partition_count: int,
-        burst_length: int,
+    value_count: int,
+    maximum_partition_count: int,
+    burst_length: int,
 ) -> CentPartitionedVectorLayout:
-    """Choose the baseline even layout for a vector.
+    """Choose how many equal-capacity pieces will hold a vector.
 
     This simple policy spreads values across as many useful partitions as the
     supplied limit permits. More advanced planners can construct
-    :class:`CentPartitionedVectorLayout` directly and choose a different count.
+    ``CentPartitionedVectorLayout`` directly and choose a different count.
 
     Args:
         value_count: Number of logical values in the vector.
         maximum_partition_count: Most partitions this operation may use.
-        burst_length: Number of values carried by one Shared Buffer slot.
+        burst_length: Scalar values carried by one Shared Buffer slot, used to
+            round each partition up to complete transfers.
 
     Returns:
         Even vector layout selected by the baseline policy.
 
     Raises:
         ValueError: If any argument is less than one.
+
+    Examples:
+        For ten values and at most four partitions, the policy chooses capacity
+        three, then four partitions. The layout balances the logical lengths as
+        three, three, two, and two; slot padding is calculated afterwards.
     """
 
     require_positive("value_count", value_count)

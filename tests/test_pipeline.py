@@ -1,326 +1,443 @@
-"""Tests for the compiler driver: registry, run specs, loader, aloi-compile."""
+"""Run compiled graphs and test their storage, padding, and input checks."""
 
-from __future__ import annotations
-
-import contextlib
-import io
-import json
-import sys
-import tempfile
-import textwrap
 import unittest
-from pathlib import Path
+from dataclasses import replace
+from random import Random
+from unittest.mock import Mock
 
+from vllm_cent.cent import Accumulate, CentHardwareSpec
 from vllm_cent.pipeline import (
-    STAGES,
-    Phase,
-    RunSpec,
-    compile_stages,
-    get_registration,
-    load_model,
-    load_run_spec,
-    parse_run_spec,
-    register_model,
+    CentTargetProfile,
+    MappingPlan,
+    MappingRequest,
+    ValuePlacement,
+    baseline_mapping,
+    compile_graph,
+    lower_target,
+    verify_mapping,
 )
-from vllm_cent.pipeline import registry as registry_module
-from vllm_cent.pipeline.cli import main
+from vllm_cent.pipeline.ir import (
+    CapabilityProfile,
+    ParallelPlan,
+    SemanticGraph,
+    TensorType,
+    Value,
+    legalize,
+    shard,
+)
+from vllm_cent.pipeline.operations import AddOperation
+from vllm_cent.runtime import CentNamedScalars
 
-# registry.py of a tiny model family: one projection whose output dimension
-# ("out", width from the config) is split by tp. MODEL_TYPE is replaced per
-# test so registrations do not collide.
-_TINY_REGISTRY = textwrap.dedent(
+
+def graph(*, fanout: bool = False) -> SemanticGraph:
+    """Build z = x + y followed by out = z + y on three-element vectors.
+
+    Args:
+        fanout: If True, also return x so its original contents must survive
+            both additions. Otherwise x can be overwritten after its last read.
+
+    Returns:
+        Two-addition graph returning out, and optionally x. With the test target's
+        two lanes per slot, each tensor will need one trailing padding lane.
     """
-    import torch
-    from torch import nn
-
-    from vllm_cent.frontend import aloi
-    from vllm_cent.ir import TensorAnnotation, TensorRole
-    from vllm_cent.pipeline import register_model
-
-
-    class Projection(nn.Module):
-        def __init__(self, width):
-            super().__init__()
-            self.proj = aloi.Linear(16, width)
-
-        def forward(self, x):
-            return self.proj(x)
-
-
-    def build(width):
-        with torch.device("meta"):
-            return Projection(width)
-
-
-    register_model(
-        "MODEL_TYPE",
-        parse_config=lambda hf: hf["width"],
-        build_model=build,
-        example_inputs=lambda width, batch, context_len: (
-            torch.empty(batch, 16, device="meta"),
+    kind = TensorType(shape=(3,))
+    return SemanticGraph(
+        inputs=(Value(name="x", type=kind), Value(name="y", type=kind)),
+        operations=(
+            AddOperation(
+                name="first",
+                inputs=("x", "y"),
+                output=Value(name="z", type=kind),
+                block="block0",
+            ),
+            AddOperation(
+                name="second",
+                inputs=("z", "y"),
+                output=Value(name="out", type=kind),
+                block="block1",
+            ),
         ),
-        annotations=lambda width: {
-            "x": TensorAnnotation(TensorRole.ACTIVATION, ("batch", "hidden")),
-            "proj.weight": TensorAnnotation(TensorRole.WEIGHT, ("out", "hidden")),
-        },
-        axis_sizes=lambda width: {},
+        outputs=("out", "x") if fanout else ("out",),
     )
+
+
+def target(*, tile: int = 2, capacity: int = 16) -> CentTargetProfile:
+    """Build a small reference target.
+
+    Args:
+        tile: Maximum slots per emitted ACC command.
+        capacity: Available Shared Buffer slots.
+
+    Returns:
+        Target with two lanes per slot and four slots per DRAM row.
     """
-)
+    return CentTargetProfile(
+        name="tiny",
+        hardware=CentHardwareSpec(
+            num_channels=1,
+            num_banks=4,
+            dram_rows=2,
+            dram_columns=8,
+            burst_length=2,
+            accumulator_slots_per_bank=2,
+            sigmoid_activation_function_id=0,
+            shared_buffer_slots=capacity,
+        ),
+        max_accumulate_slots=tile,
+    )
 
-_TP2_RUN = "parallel:\n  tp: 2\n  split: [out]\nworkload:\n  batch: 3\n"
+
+def request(*, fanout: bool = False) -> MappingRequest:
+    """Build the device graph and target needed to test mapping independently.
+
+    Args:
+        fanout: Whether the graph also returns x, requiring its original contents
+            to remain available through execution.
+
+    Returns:
+        Single-device mapping request for graph() on the small test target.
+    """
+    device = legalize(shard(graph(fanout=fanout), ParallelPlan()), CapabilityProfile())
+    return MappingRequest(graph=device, target=target())
 
 
-class _ModelDirectoryTestCase(unittest.TestCase):
-    """A fresh model directory: tiny.json (width 8), registry.py, run.yaml."""
+class PipelineTests(unittest.TestCase):
+    """Exercise whole-graph planning, code generation, and request reuse."""
 
-    def setUp(self) -> None:
-        """Write the files; undo the import and the registration afterwards."""
-
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        # A unique directory name makes registry.py a fresh top-level module
-        # name; it is not a package, so it imports as "registry".
-        self.directory = Path(directory.name)
-        self.model_type = f"tiny_{id(self)}"
-        (self.directory / "registry.py").write_text(
-            _TINY_REGISTRY.replace("MODEL_TYPE", self.model_type)
+    def test_add_chain_reuses_dead_left_and_preserves_padding(self) -> None:
+        """Two adds need two allocations and no copy when x dies at first use."""
+        artifact = compile_graph(graph(), target())
+        # x becomes z, then out, in the same buffer. Only the two ACC commands
+        # remain because neither addition needs a preservation copy.
+        self.assertEqual(len(artifact.executable.program.instructions), 2)
+        self.assertTrue(
+            all(
+                isinstance(i, Accumulate)
+                for i in artifact.executable.program.instructions
+            )
         )
-        self.config = self.directory / "tiny.json"
-        self.config.write_text(json.dumps({"model_type": self.model_type, "width": 8}))
-        self.run_path = self.directory / "run.yaml"
-        self.run_path.write_text(_TP2_RUN)
-        self.addCleanup(sys.modules.pop, "registry", None)
-        self.addCleanup(registry_module._REGISTRY.pop, self.model_type, None)
-        self.addCleanup(self._remove_from_path)
-
-    def _remove_from_path(self) -> None:
-        """Undo the loader's sys.path entry for the temporary directory."""
-
-        if str(self.directory) in sys.path:
-            sys.path.remove(str(self.directory))
-
-
-class RegistryTest(unittest.TestCase):
-    """register_model and get_registration."""
-
-    def test_register_and_look_up(self) -> None:
-        """A registration is found by its model_type."""
-
-        registration = register_model(
-            "registry_test",
-            parse_config=dict,
-            build_model=lambda config: None,  # type: ignore[arg-type, return-value]
-            example_inputs=lambda config, batch, context_len: (),
-            annotations=lambda config: {},
-            axis_sizes=lambda config: {},
+        values = (
+            CentNamedScalars(name="x", values=(1.0, 2.0, 3.0)),
+            CentNamedScalars(name="y", values=(10.0, 20.0, 30.0)),
         )
-        self.addCleanup(registry_module._REGISTRY.pop, "registry_test", None)
-        self.assertIs(get_registration("registry_test"), registration)
-        with self.assertRaisesRegex(ValueError, "already registered"):
-            register_model(
-                "registry_test",
-                **{
-                    name: getattr(registration, name)
-                    for name in (
-                        "parse_config",
-                        "build_model",
-                        "example_inputs",
-                        "annotations",
-                        "axis_sizes",
-                    )
-                },
+        self.assertEqual(
+            artifact.execute(values),
+            (CentNamedScalars(name="out", values=(21.0, 42.0, 63.0)),),
+        )
+        # Three logical values fill two two-lane slots, so the fourth lane is zero.
+        packed = artifact.bind(values)
+        self.assertEqual(packed.inputs[0].values, (1.0, 2.0, 3.0, 0.0))
+        self.assertEqual(artifact.execute(values), artifact.execute(values))
+
+    def test_fanout_copies_before_accumulating(self) -> None:
+        """Preserve an input requested as output by performing addition in another buffer."""
+        artifact = compile_graph(graph(fanout=True), target())
+        values = (
+            CentNamedScalars(name="x", values=(1.0, -2.0, 3.0)),
+            CentNamedScalars(name="y", values=(2.0, 3.0, -4.0)),
+        )
+        self.assertEqual(
+            artifact.execute(values),
+            (
+                CentNamedScalars(name="out", values=(5.0, 4.0, -5.0)),
+                CentNamedScalars(name="x", values=(1.0, -2.0, 3.0)),
+            ),
+        )
+        # Preserving x adds one DRAM write/read pair to the two ACC commands.
+        self.assertEqual(len(artifact.executable.program.instructions), 4)
+
+    def test_target_tiling_and_manual_mapping_match(self) -> None:
+        """A stricter target splits two slots into separate ACC commands."""
+        original = compile_graph(graph(), target())
+        tiled = compile_graph(graph(), target(tile=1))
+        self.assertEqual(len(tiled.executable.program.instructions), 4)
+        req = request()
+        manual = baseline_mapping(req)
+        self.assertEqual(compile_graph(graph(), target(), mapping=manual), original)
+
+    def test_invalid_mapping_is_rejected(self) -> None:
+        """Reject plans that overwrite a needed input, omit storage, or run uses first."""
+        req = request(fanout=True)
+        plan = baseline_mapping(req)
+        bad = tuple(
+            replace(p, storage="x") if p.value == "z" else p for p in plan.placements
+        )
+        with self.assertRaisesRegex(ValueError, "live|alias|storage"):
+            verify_mapping(req, replace(plan, placements=bad))
+        with self.assertRaisesRegex(ValueError, "placement"):
+            verify_mapping(req, replace(plan, placements=plan.placements[:-1]))
+        with self.assertRaisesRegex(ValueError, "schedule"):
+            verify_mapping(req, replace(plan, schedule=tuple(reversed(plan.schedule))))
+
+    def test_capacity_and_bindings_fail_before_execution(self) -> None:
+        """Small targets and malformed logical inputs fail explicitly."""
+        with self.assertRaisesRegex(ValueError, "capacity"):
+            compile_graph(graph(), target(capacity=3))
+        artifact = compile_graph(graph(), target())
+        with self.assertRaisesRegex(ValueError, "input"):
+            artifact.bind(())
+        with self.assertRaisesRegex(ValueError, "count"):
+            artifact.bind(
+                (
+                    CentNamedScalars(name="x", values=(1.0,)),
+                    CentNamedScalars(name="y", values=(1.0, 2.0, 3.0)),
+                )
             )
 
-    def test_unknown_model_type(self) -> None:
-        """The error lists what is registered."""
+    def test_target_ir_has_symbolic_storage(self) -> None:
+        """Keep buffer names in target commands until a later pass assigns slot addresses."""
+        req = request()
+        plan = baseline_mapping(req)
+        symbolic = lower_target(req, plan)
+        self.assertEqual(symbolic.mapping, plan)
+        self.assertEqual(symbolic.commands[0].destination, "x")
+        self.assertIsInstance(plan, MappingPlan)
+        self.assertIsInstance(plan.placements[0], ValuePlacement)
 
-        with self.assertRaisesRegex(KeyError, "no model registered"):
-            get_registration("no_such_model")
 
+class MappingBoundaryTests(unittest.TestCase):
+    """Check manual placements and when buffers can safely hold new values."""
 
-class RunSpecTest(unittest.TestCase):
-    """YAML run specs."""
-
-    def test_defaults(self) -> None:
-        """An empty document is tp=1, decode, batch 1, context 2048, 1 layer."""
-
-        self.assertEqual(parse_run_spec({}), RunSpec())
-        self.assertIs(RunSpec().workload.phase, Phase.DECODE)
-
-    def test_full_document_builds_the_plan(self) -> None:
-        """Every setting reaches the ParallelPlan."""
-
-        spec = parse_run_spec(
-            {
-                "parallel": {
-                    "tp": 8,
-                    "split": ["q_head", "kv_head"],
-                    "replicate": ["k_proj.weight"],
-                    "split_only": {"hidden": ["lm_head.weight"]},
-                },
-                "workload": {"phase": "decode", "batch": 4, "context_len": 4096},
-                "scope": {"layers": 1},
-            }
+    def test_manual_constraints_and_external_provider(self) -> None:
+        """A manual storage name can equal another input's logical name."""
+        req = replace(request(), constraints=(ValuePlacement(value="x", storage="y"),))
+        plan = baseline_mapping(req)
+        self.assertEqual(plan.placements[0].storage, "y")
+        self.assertEqual(plan.placements[1].storage, "y.0")
+        provider = Mock(return_value=plan)
+        artifact = compile_graph(
+            graph(), target(), constraints=req.constraints, mapper=provider
         )
-        plan = spec.parallel.build_plan()
-        self.assertEqual((plan.tp, plan.split_axes), (8, ("q_head", "kv_head")))
-        self.assertEqual(set(plan.exceptions), {"k_proj.weight", "lm_head.weight"})
-        self.assertEqual((spec.workload.batch, spec.workload.context_len), (4, 4096))
+        self.assertEqual(artifact.target_ir.mapping, plan)
+        provider.assert_called_once()
+        invalid_constraints = (
+            (ValuePlacement(value="absent", storage="x"),),
+            (ValuePlacement(value="x", storage="x"),) * 2,
+        )
+        for constraints in invalid_constraints:
+            with self.subTest(constraints=constraints), self.assertRaises(ValueError):
+                baseline_mapping(replace(req, constraints=constraints))
+        with self.assertRaisesRegex(ValueError, "constraint"):
+            verify_mapping(req, baseline_mapping(request()))
 
-    def test_rejections(self) -> None:
-        """Typos and invalid values are reported, not ignored."""
-
-        cases: dict[str, dict[str, object]] = {
-            "unknown section": {"paralel": {}},
-            "unknown key": {"parallel": {"tpp": 8}},
-            "zero ranks": {"parallel": {"tp": 0}},
-            "split not a list": {"parallel": {"split": "q_head"}},
-            "unknown phase": {"workload": {"phase": "train"}},
-            "negative batch": {"workload": {"batch": -1}},
-        }
-        for name, data in cases.items():
-            with self.subTest(case=name), self.assertRaises(ValueError):
-                parse_run_spec(data)
-
-
-class LoaderTest(_ModelDirectoryTestCase):
-    """load_model imports the registry.py next to the config."""
-
-    def test_loads_family_and_config(self) -> None:
-        """The module name is the config's stem; parse_config ran."""
-
-        model = load_model(self.config)
-        self.assertEqual(model.name, "tiny")
-        self.assertEqual(model.config, 8)
-        self.assertEqual(model.registration.model_type, self.model_type)
-
-    def test_example_package_keeps_relative_imports(self) -> None:
-        """The Llama registry.py uses relative imports inside its package."""
-
-        root = Path(__file__).resolve().parents[1]
-        model = load_model(root / "examples" / "llama_70b" / "llama3_1_70b.json")
+    def test_dead_storage_and_self_add(self) -> None:
+        """Self-add reads initialized lanes; later values may reuse expired space."""
+        original = graph()
+        single = replace(
+            original,
+            operations=(replace(original.operations[0], inputs=("x", "x")),),
+            outputs=("z",),
+        )
+        artifact = compile_graph(single, target())
         self.assertEqual(
-            (model.name, model.registration.model_type), ("llama3_1_70b", "llama")
-        )
-
-    def test_rejections(self) -> None:
-        """Missing files, no model_type, or an unregistered model_type."""
-
-        no_type = self.directory / "no_type.json"
-        no_type.write_text("{}")
-        unknown = self.directory / "unknown.json"
-        unknown.write_text(json.dumps({"model_type": "not_registered"}))
-        other = tempfile.TemporaryDirectory()
-        self.addCleanup(other.cleanup)
-        other_dir = Path(other.name)
-        lonely = other_dir / "lonely.json"
-        lonely.write_text(json.dumps({"model_type": self.model_type}))
-        cases = {
-            "missing config": (self.directory / "missing.json", FileNotFoundError),
-            "no registry.py": (lonely, FileNotFoundError),
-            "no model_type": (no_type, ValueError),
-            "unregistered": (unknown, KeyError),
-        }
-        for name, (path, error) in cases.items():
-            with self.subTest(case=name), self.assertRaises(error):
-                load_model(path)
-
-
-class CompileStagesTest(_ModelDirectoryTestCase):
-    """compile_stages runs every stage as the run spec says."""
-
-    def test_stages_follow_the_run_spec(self) -> None:
-        """8 output rows over tp=2 leave 4 per rank; batch 3 is kept."""
-
-        texts = compile_stages(load_model(self.config), load_run_spec(self.run_path))
-        self.assertEqual(tuple(texts), STAGES)
-        self.assertIn(
-            "%proj = aloi.linear(%x, %proj.weight) : tensor<3x8xfp32>",
-            texts["00_imported"],
-        )
-        self.assertIn(
-            "%proj = aloi.linear(%x, %proj.weight) : tensor<3x4xfp32, "
-            "axes=[batch, out], global_shape=3x8, placement=shard(out)>",
-            texts["02_sharded"],
-        )
-
-    def test_unsupported_runs(self) -> None:
-        """Prefill and more than one layer are not compiled yet."""
-
-        model = load_model(self.config)
-        for data in ({"workload": {"phase": "prefill"}}, {"scope": {"layers": 2}}):
-            with self.subTest(run=data), self.assertRaises(NotImplementedError):
-                compile_stages(model, parse_run_spec(data))
-
-
-class CommandLineTest(_ModelDirectoryTestCase):
-    """aloi-compile --model <config.json> --run <run.yaml>."""
-
-    def _run(self, *args: str) -> tuple[int, str, str]:
-        """Run main() and capture its output.
-
-        Args:
-            *args: Command-line arguments.
-
-        Returns:
-            ``(exit status, stdout, stderr)``.
-        """
-
-        stdout, stderr = io.StringIO(), io.StringIO()
-        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            try:
-                status = main(list(args))
-            except SystemExit as exit_:
-                status = int(exit_.code or 0)
-        return status, stdout.getvalue(), stderr.getvalue()
-
-    def test_prints_every_stage(self) -> None:
-        """Without --out-dir, each stage follows a header line."""
-
-        status, out, _ = self._run(
-            "--model", str(self.config), "--run", str(self.run_path)
-        )
-        self.assertEqual(status, 0)
-        headers = [line for line in out.splitlines() if line.startswith("// =====")]
-        self.assertEqual(headers, [f"// ===== {stage} =====" for stage in STAGES])
-
-    def test_writes_stage_files(self) -> None:
-        """--out-dir gets one .aloi file per stage, equal to compile_stages."""
-
-        out_dir = self.directory / "ir"
-        status, _, _ = self._run(
-            "--model",
-            str(self.config),
-            "--run",
-            str(self.run_path),
-            "--out-dir",
-            str(out_dir),
-        )
-        expected = compile_stages(load_model(self.config), load_run_spec(self.run_path))
-        self.assertEqual(status, 0)
-        for stage in STAGES:
-            self.assertEqual((out_dir / f"{stage}.aloi").read_text(), expected[stage])
-
-    def test_bad_inputs_are_usage_errors(self) -> None:
-        """One-line message and exit status 2 instead of a traceback."""
-
-        bad_run = self.directory / "bad.yaml"
-        bad_run.write_text("parallel:\n  tpp: 8\n")
-        cases = {
-            "missing model": (
-                self.directory / "missing.json",
-                self.run_path,
-                "not found",
+            artifact.execute(
+                (
+                    CentNamedScalars(name="x", values=(1.0, 2.0, 3.0)),
+                    CentNamedScalars(name="y", values=(99.0, 99.0, 99.0)),
+                )
             ),
-            "bad run spec": (self.config, bad_run, "unknown keys"),
-        }
-        for name, (model, run, message) in cases.items():
-            with self.subTest(case=name):
-                status, _, err = self._run("--model", str(model), "--run", str(run))
-                self.assertEqual(status, 2)
-                self.assertIn(message, err)
+            (CentNamedScalars(name="z", values=(2.0, 4.0, 6.0)),),
+        )
+        # x is retained; unused y dies at entry and becomes z's destination.
+        retained = replace(single, outputs=("z", "x"))
+        plan = compile_graph(retained, target()).target_ir.mapping
+        self.assertEqual(plan.placements[-1].storage, "y")
+
+    def test_rejects_invalid_plan_forms(self) -> None:
+        """Reject incomplete plans, repeated inputs sharing storage, and unsafe result reuse."""
+        req = request()
+        plan = baseline_mapping(req)
+        forms = (
+            replace(plan, schedule=("first", "first")),
+            replace(plan, placements=(*plan.placements, plan.placements[0])),
+            replace(
+                plan,
+                placements=tuple(
+                    replace(p, storage="") if p.value == "z" else p
+                    for p in plan.placements
+                ),
+            ),
+            replace(
+                plan,
+                placements=tuple(
+                    replace(p, storage="x") if p.value == "y" else p
+                    for p in plan.placements
+                ),
+            ),
+            replace(
+                plan,
+                placements=tuple(
+                    replace(p, storage="y") if p.value == "z" else p
+                    for p in plan.placements
+                ),
+            ),
+        )
+        for bad in forms:
+            with self.subTest(plan=bad), self.assertRaises(ValueError):
+                verify_mapping(req, bad)
+
+    def test_forced_output_and_fresh_storage_collision(self) -> None:
+        """Manual output placements are preserved and live names stay distinct."""
+        req = replace(
+            request(fanout=True),
+            constraints=(
+                ValuePlacement(value="x", storage="z"),
+                ValuePlacement(value="out", storage="manual_result"),
+            ),
+        )
+        plan = baseline_mapping(req)
+        self.assertEqual(plan.placements[2].storage, "z.0")
+        self.assertEqual(plan.placements[3].storage, "manual_result")
+
+    def test_invalid_targets_and_distributed_execution(self) -> None:
+        """Reject unsupported executable scopes before allocating storage."""
+        with self.assertRaises(ValueError):
+            replace(target(), name="")
+        with self.assertRaises(ValueError):
+            replace(target(), max_accumulate_slots=0)
+        with self.assertRaisesRegex(ValueError, "device zero"):
+            compile_graph(graph(), target(), parallel=ParallelPlan(device_ids=(1,)))
+
+    def test_identity_graph_runs_without_instructions(self) -> None:
+        """A graph returning an input needs bindings but no device instructions."""
+        identity = replace(graph(), operations=(), outputs=("x",))
+        artifact = compile_graph(identity, target())
+        self.assertEqual(artifact.executable.program.instructions, ())
+        values = (
+            CentNamedScalars(name="x", values=(1.0, -2.0, 3.0)),
+            CentNamedScalars(name="y", values=(9.0, 8.0, 7.0)),
+        )
+        self.assertEqual(artifact.execute(values), (values[0],))
+
+    def test_artifact_and_target_tampering(self) -> None:
+        """Reject missing preservation copies and mismatched shapes or compiled commands."""
+        from vllm_cent.pipeline import allocate_storage
+
+        artifact = compile_graph(graph(fanout=True), target())
+        bad = replace(artifact.target_ir, commands=artifact.target_ir.commands[1:])
+        with self.assertRaisesRegex(ValueError, "Target IR"):
+            allocate_storage(bad)
+        with self.assertRaisesRegex(ValueError, "version"):
+            replace(artifact, version=2)
+        with self.assertRaisesRegex(ValueError, "logical binding"):
+            replace(artifact, outputs=artifact.inputs)
+        other = compile_graph(graph(), target())
+        with self.assertRaisesRegex(ValueError, "executable"):
+            replace(artifact, executable=other.executable)
+
+    def test_copy_tiles_across_scratch_row_and_rebinds(self) -> None:
+        """Nine values need five slots, so a four-slot row needs two copy chunks."""
+        kind = TensorType(shape=(9,))
+        template = graph(fanout=True)
+        large = replace(
+            template,
+            inputs=tuple(replace(v, type=kind) for v in template.inputs),
+            operations=tuple(
+                replace(op, output=replace(op.output, type=kind))
+                for op in template.operations
+            ),
+        )
+        artifact = compile_graph(large, target(tile=2))
+        # Two W/R pairs plus two adds with three ACC tiles apiece.
+        self.assertEqual(len(artifact.executable.program.instructions), 10)
+        for scale in (1.0, -3.0):
+            result = artifact.execute(
+                (
+                    CentNamedScalars(name="x", values=(scale,) * 9),
+                    CentNamedScalars(name="y", values=(2.0 * scale,) * 9),
+                )
+            )
+            self.assertEqual(result[0].values, (5.0 * scale,) * 9)
+            self.assertEqual(result[1].values, (scale,) * 9)
+
+    def test_slots_and_fresh_storage_helpers(self) -> None:
+        """Slot rounding and symbolic-name generation handle boundary cases."""
+        from vllm_cent.pipeline.mapping import _fresh_storage, _slots
+
+        self.assertEqual(_fresh_storage("x", {"x", "x.0", "x.1"}), "x.2")
+        self.assertEqual(_fresh_storage("x", set()), "x")
+        self.assertEqual(
+            _slots(Value(name="a", type=TensorType(shape=())), target()), 1
+        )
+        self.assertEqual(
+            _slots(Value(name="a", type=TensorType(shape=(2, 3))), target()), 3
+        )
 
 
-if __name__ == "__main__":
-    unittest.main()
+class GraphDataflowTests(unittest.TestCase):
+    """Compare compiled graphs with direct Python sums across branches and reused buffers."""
+
+    def test_branched_graphs_match_host_addition(self) -> None:
+        """Retain arbitrary intermediates while storage is reused across branches."""
+        # A fixed seed makes failures repeatable. The small integer inputs keep
+        # every sum exact in reference math, so this checks data flow, not rounding.
+        random = Random(17)
+        tensor = TensorType(shape=(5,))
+        for case in range(12):
+            inputs = tuple(Value(name=f"input{i}", type=tensor) for i in range(4))
+            oracle = {
+                v.name: tuple(float(random.randrange(-4, 5)) for _ in range(5))
+                for v in inputs
+            }
+            bindings = tuple(
+                CentNamedScalars(name=v.name, values=oracle[v.name]) for v in inputs
+            )
+            names = list(oracle)
+            operations = []
+            for index in range(20):
+                left, right = random.choices(names, k=2)
+                output = Value(name=f"v{index}", type=tensor)
+                operations.append(
+                    AddOperation(name=f"op{index}", inputs=(left, right), output=output)
+                )
+                oracle[output.name] = tuple(
+                    a + b for a, b in zip(oracle[left], oracle[right], strict=True)
+                )
+                names.append(output.name)
+            outputs = tuple(random.sample(names, 4))
+            source = SemanticGraph(
+                inputs=inputs, operations=tuple(operations), outputs=outputs
+            )
+            with self.subTest(case=case):
+                artifact = compile_graph(source, target(capacity=80))
+                self.assertEqual(
+                    artifact.execute(bindings),
+                    tuple(
+                        CentNamedScalars(name=name, values=oracle[name])
+                        for name in outputs
+                    ),
+                )
+
+    def test_manual_topological_order_is_obeyed(self) -> None:
+        """Independent operations can run in either dependency-valid order."""
+        source = graph()
+        second = replace(source.operations[1], inputs=("y", "x"))
+        source = replace(
+            source, operations=(source.operations[0], second), outputs=("z", "out")
+        )
+        device = legalize(shard(source, ParallelPlan()), CapabilityProfile())
+        req = MappingRequest(graph=device, target=target())
+        # Give every tensor its own buffer so this test isolates execution order
+        # from storage reuse. Neither addition depends on the other anymore.
+        plan = MappingPlan(
+            placements=tuple(
+                ValuePlacement(value=name, storage=name)
+                for name in ("x", "y", "z", "out")
+            ),
+            schedule=("second", "first"),
+        )
+        verify_mapping(req, plan)
+        artifact = compile_graph(source, target(), mapping=plan)
+        self.assertEqual(artifact.target_ir.commands[0].operation, "second")
+        self.assertEqual(
+            artifact.execute(
+                (
+                    CentNamedScalars(name="x", values=(1.0, 2.0, 3.0)),
+                    CentNamedScalars(name="y", values=(4.0, 5.0, 6.0)),
+                )
+            ),
+            (
+                CentNamedScalars(name="z", values=(5.0, 7.0, 9.0)),
+                CentNamedScalars(name="out", values=(5.0, 7.0, 9.0)),
+            ),
+        )

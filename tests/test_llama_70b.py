@@ -35,7 +35,7 @@ from vllm_cent.ir import (
     Shard,
 )
 from vllm_cent.parallel import ApplyTensorParallel
-from vllm_cent.pipeline import STAGES, compile_stages, load_model, load_run_spec
+from vllm_cent.driver import STAGES, compile_stages, load_model, load_run_spec
 
 # The example's model files (HF config.json) and run specs.
 EXAMPLE_DIR = Path(__file__).resolve().parents[1] / "examples" / "llama_70b"

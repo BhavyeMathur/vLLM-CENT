@@ -1,4 +1,8 @@
-"""Tests for the reusable CENT runtime-data contract."""
+"""Check how input/output names map to memory ranges before execution.
+
+These tests validate names, counts, bounds, and overlapping inputs. They do not
+run the program or infer a tensor layout from a physical address.
+"""
 
 import unittest
 from dataclasses import FrozenInstanceError
@@ -35,7 +39,9 @@ def make_hardware() -> CentHardwareSpec:
     """Create the small hardware geometry used by runtime tests.
 
     Returns:
-        Target with two channels, four banks, and four lanes per burst.
+        Two channels with four banks each and eight scalars per DRAM row.
+        Four Shared Buffer slots hold four scalars each (16 total); each
+        Global Buffer has 12 scalar columns, deliberately wider than a row.
     """
 
     return CentHardwareSpec(
@@ -79,12 +85,12 @@ def make_program(hardware: CentHardwareSpec) -> CentProgram:
 
 
 def dram_region(
-        *,
-        channel: int = 0,
-        bank: int = 0,
-        row: int = 0,
-        column: int = 0,
-        scalar_count: int = 1,
+    *,
+    channel: int = 0,
+    bank: int = 0,
+    row: int = 0,
+    column: int = 0,
+    scalar_count: int = 1,
 ) -> CentDramRegion:
     """Create a DRAM region with concise coordinate overrides.
 
@@ -152,7 +158,7 @@ class CentRuntimeValueTests(unittest.TestCase):
         for constructor in invalid_regions:
             with self.subTest(constructor=constructor):
                 with self.assertRaisesRegex(
-                        ValueError, "scalar_count must be at least 1"
+                    ValueError, "scalar_count must be at least 1"
                 ):
                     constructor()
 
@@ -163,7 +169,7 @@ class CentRuntimeValueTests(unittest.TestCase):
 
 
 class CentExecutionManifestTests(unittest.TestCase):
-    """Check manifest identity, input, bounds, and aliasing rules."""
+    """Check input/output names, memory bounds, and inputs sharing storage."""
 
     def test_executable_accepts_all_raw_address_spaces(self) -> None:
         """DRAM, Shared Buffer, and Global Buffer regions can coexist."""
@@ -332,6 +338,9 @@ class CentExecutionManifestTests(unittest.TestCase):
     def test_manifest_rejects_overlapping_input_regions(self) -> None:
         """Two host inputs cannot initialize the same physical scalar lane."""
 
+        # DRAM and Global Buffer pairs share column 3. The Shared Buffer
+        # pair shares scalar 4: slot 0 holds four scalars, so a fifth value
+        # reaches slot 1. That overlap requires the hardware slot width.
         overlapping_pairs = (
             (
                 CentInputBinding(
@@ -413,7 +422,7 @@ class CentExecutionManifestTests(unittest.TestCase):
         self.assertEqual(executable.manifest.outputs, outputs)
 
     def test_adjacent_regions_and_separate_coordinates_do_not_overlap(self) -> None:
-        """Input checks preserve half-open bounds and physical coordinates."""
+        """Columns 0..3 and 4..7 are adjacent; another bank has separate storage."""
 
         manifest = CentExecutionManifest(
             inputs=(
@@ -446,6 +455,8 @@ class CentExecutionManifestTests(unittest.TestCase):
         """Each raw region must fit completely in its hardware address space."""
 
         hardware = make_hardware()
+        # Eight DRAM columns end at index 7; twelve Global Buffer columns
+        # end at 11. Two values at either last column extend past capacity.
         invalid_regions = (
             dram_region(column=7, scalar_count=2),
             CentSharedBufferRegion(
@@ -508,7 +519,7 @@ class CentExecutionManifestTests(unittest.TestCase):
 
 
 class RuntimeValidationHelperTests(unittest.TestCase):
-    """Directly test nontrivial normalization and validation helpers."""
+    """Check conversion from memory addresses to comparable scalar ranges."""
 
     def test_physical_span_normalizes_every_region_type(self) -> None:
         """Convert each typed region into its exact scalar interval."""
@@ -532,7 +543,8 @@ class RuntimeValidationHelperTests(unittest.TestCase):
                 _CentPhysicalSpan(
                     space=_CentStorageSpace.SHARED_BUFFER,
                     coordinates=(),
-                    # Two complete four-lane slots precede slot two.
+                    # Two four-lane slots precede slot 2: start=2*4=8.
+                    # Five values fill indices 8..12, so the end is 13.
                     start=8,
                     end=13,
                 ),
@@ -556,8 +568,10 @@ class RuntimeValidationHelperTests(unittest.TestCase):
                 self.assertEqual(_physical_span(region, hardware), expected)
 
     def test_physical_span_overlap_requires_same_region_and_intersection(self) -> None:
-        """Use half-open intervals and complete physical coordinates."""
+        """Ranges include their start but exclude their end, within the same row."""
 
+        # [2, 6) contains 2, 3, 4, 5. It shares scalar 5 with [5, 7),
+        # shares nothing with [6, 8), and never overlaps a different bank.
         base = _CentPhysicalSpan(
             space=_CentStorageSpace.DRAM,
             coordinates=(0, 0, 0),
@@ -608,7 +622,7 @@ class RuntimeValidationHelperTests(unittest.TestCase):
             _validate_unique_names(bindings, category="input")
 
     def test_input_overlap_helper_reports_the_binding_names(self) -> None:
-        """Reject intersecting normalized inputs with a useful error."""
+        """Report both input names when their memory ranges share a scalar."""
 
         bindings = (
             CentInputBinding(
@@ -628,6 +642,8 @@ class RuntimeValidationHelperTests(unittest.TestCase):
         """Reject one out-of-range region in each independent address space."""
 
         hardware = make_hardware()
+        # Eight DRAM columns end at index 7; twelve Global Buffer columns
+        # end at 11. Two values at either last column extend past capacity.
         invalid_regions = (
             dram_region(column=7, scalar_count=2),
             CentSharedBufferRegion(

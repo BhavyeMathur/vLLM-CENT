@@ -1,4 +1,8 @@
-"""Tests for the public model-to-CENT compiler."""
+"""Check model validation and the instruction structure of compiled Llama blocks.
+
+These tests inspect plans, addresses, and command counts. They do not execute
+a Llama block or establish numerical correctness for unresolved operations.
+"""
 
 import unittest
 from collections import Counter
@@ -59,7 +63,7 @@ def small_request(
         dram_rows: Rows available in every bank.
         sequence_length: Tokens in the current context.
         max_sequence_length: Reserved KV-cache length.
-        accumulator_slots_per_bank: Accumulator registers in each PU.
+        accumulator_slots_per_bank: Registers holding running sums in each bank.
 
     Returns:
         Complete request using four banks and four-value micro-operations.
@@ -172,7 +176,7 @@ class CompilerInputTests(unittest.TestCase):
 
 
 class TransformerBlockCompilerTests(unittest.TestCase):
-    """Test complete Llama block compilation."""
+    """Test the command sequence emitted for an entire Llama block."""
 
     def test_tiny_block_has_stable_paper_operand_instruction_counts(self) -> None:
         """Keep the tiny block's instruction counts stable."""
@@ -309,7 +313,7 @@ class TransformerBlockCompilerTests(unittest.TestCase):
         )
         plan = _create_compile_plan(request)
         program = compile_transformer_block(request)
-        # Four query heads share two KV heads. Four channels, one PU per
+        # Four query heads share two KV heads. Four channels, one bank group per
         # channel, and 16 columns give 4 * 1 * 16 = 64 activation values per
         # pass. The 128-value FFN therefore needs both supported passes.
         self.assertGreater(len(program.instructions), 0)
@@ -330,7 +334,7 @@ class TransformerBlockCompilerTests(unittest.TestCase):
         )
 
     def test_small_and_multirow_normalization_layouts_compile(self) -> None:
-        """Compile partition-padding and multirow normalization boundaries."""
+        """Compile vectors that need padding or more than one DRAM row."""
 
         small = compile_transformer_block(
             small_request(

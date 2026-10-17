@@ -2,7 +2,7 @@
 
     aloi-compile --model examples/llama_70b/llama3_1_70b.json \\
                  --run examples/llama_70b/runs/llama3_1_70b_tp8_decode.yaml
-    python -m vllm_cent.pipeline --model ... --run ...   # same, no script
+    python -m vllm_cent.driver --model ... --run ...   # same, no script
 
 ``--model`` is an HF config.json; the registry.py next to it provides the
 code. ``--run`` is the YAML run spec (parallelism, workload, scope).

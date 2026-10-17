@@ -1,10 +1,16 @@
-"""Pair a CENT program with its reusable runtime-data manifest."""
+"""Pair instructions with the memory locations used for inputs and outputs.
+
+The manifest is the list of named input and output bindings. Its checks prevent
+missing inputs, writes outside device memory, and two inputs overwriting each
+other. It does not choose a tensor layout or rearrange host values.
+"""
 
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Literal, assert_never
 
 from .bindings import (
+    CentAccumulatorRegion,
     CentDramRegion,
     CentGlobalBufferRegion,
     CentInputBinding,
@@ -38,7 +44,9 @@ class _CentStorageSpace(Enum):
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class _CentPhysicalSpan:
-    """Normalize one raw region to a half-open physical scalar interval.
+    """Describe a memory range with a start index and an exclusive end.
+
+    Two spans can overlap only when their storage kind and coordinates agree.
 
     Attributes:
         space: Storage kind containing the interval.
@@ -46,7 +54,10 @@ class _CentPhysicalSpan:
             uses channel, bank, and row; a Global Buffer uses its channel; the
             device-wide Shared Buffer uses an empty tuple.
         start: First scalar lane in the selected storage region.
-        end: First scalar lane after the selected storage region.
+        end: Index immediately after the last scalar included in this span.
+
+    Examples:
+        A span with ``start=2`` and ``end=5`` includes scalars 2, 3, and 4.
     """
 
     space: _CentStorageSpace
@@ -66,19 +77,20 @@ class _CentPhysicalSpan:
         """
 
         same_region = (
-                self.space is other.space and self.coordinates == other.coordinates
+            self.space is other.space and self.coordinates == other.coordinates
         )
         return same_region and self.start < other.end and other.start < self.end
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CentExecutionManifest:
-    """Describe raw inputs and outputs attached to one CENT program.
+    """List where program inputs are written and outputs are read.
 
-    The raw regions intentionally make no logical shape, packing, padding, or
-    scalar-format claim. Input and output names are independently unique, so a
-    mutable value may keep one stable name across execution. Input regions must
-    not alias; read-only output views may overlap.
+    A name may occur once among inputs and once among outputs, so an updated
+    value can keep its name. Two inputs cannot write the same scalar. Outputs
+    may read overlapping ranges because reading does not change the values.
+    These bindings describe memory locations only: they do not specify tensor
+    shapes, reorder values, add padding, or select a numeric format.
 
     Attributes:
         inputs: Named physical regions populated before instruction zero.
@@ -89,11 +101,11 @@ class CentExecutionManifest:
     outputs: tuple[CentOutputBinding, ...] = ()
 
     def __post_init__(self) -> None:
-        """Validate binding names and target-independent input aliases.
+        """Reject repeated names and input overlaps detectable without slot sizes.
 
         Raises:
-            ValueError: If names repeat within one direction or two input
-                regions can be proven to overlap without target geometry.
+            ValueError: If names repeat within one direction or two inputs
+                overlap even before the hardware slot size is known.
         """
 
         _validate_unique_names(self.inputs, category="input")
@@ -101,10 +113,9 @@ class CentExecutionManifest:
         _validate_no_input_overlaps(self.inputs)
 
     def validate_hardware(self, hardware: CentHardwareSpec) -> None:
-        """Check every raw region against one target's physical capacity.
+        """Check that all inputs and outputs fit, and no two inputs share memory.
 
-        The target burst length also makes it possible to detect Shared Buffer
-        aliases whose regions begin in different slots.
+        The burst length gives the number of scalars in a Shared Buffer slot.
 
         Args:
             hardware: Hardware geometry that must contain every region.
@@ -112,6 +123,11 @@ class CentExecutionManifest:
         Raises:
             ValueError: If any region exceeds its address space or two input
                 regions overlap under this target's burst length.
+
+        Examples:
+            With ``hardware.burst_length=4``, a six-scalar input at slot 0 overlaps
+            an input starting at slot 1. Slot addresses alone do not reveal this;
+            the check needs the number of scalars per slot.
         """
 
         regions: tuple[CentPhysicalRegion, ...] = tuple(
@@ -122,8 +138,8 @@ class CentExecutionManifest:
         _validate_no_input_overlaps(self.inputs, hardware=hardware)
 
     def order_input_values(
-            self,
-            values: tuple[CentNamedScalars, ...],
+        self,
+        values: tuple[CentNamedScalars, ...],
     ) -> tuple[CentNamedScalars, ...]:
         """Validate request values and return them in input-binding order.
 
@@ -131,7 +147,7 @@ class CentExecutionManifest:
             values: Named raw host scalars supplied for this execution.
 
         Returns:
-            The same values ordered to match :attr:`inputs`.
+            The same values ordered to match ``inputs``.
 
         Raises:
             ValueError: If a name is duplicated, missing, unexpected, or has a
@@ -144,6 +160,8 @@ class CentExecutionManifest:
                 raise ValueError(f"duplicate input value name: {value.name}")
             values_by_name[value.name] = value
 
+        # Validate the entire name set before ordering values. A missing input
+        # cannot be repaired by silently reusing another input's position.
         expected_names = {binding.name for binding in self.inputs}
         actual_names = set(values_by_name)
         missing_names = expected_names - actual_names
@@ -171,7 +189,7 @@ class CentExecutionManifest:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CentExecutable:
-    """Pair an immutable instruction program with its runtime-data contract.
+    """Keep a program and its input/output memory bindings together.
 
     Attributes:
         program: Ordered typed instructions and their hardware target.
@@ -192,9 +210,9 @@ class CentExecutable:
 
 
 def _validate_unique_names(
-        bindings: tuple[CentInputBinding, ...] | tuple[CentOutputBinding, ...],
-        *,
-        category: Literal["input", "output"],
+    bindings: tuple[CentInputBinding, ...] | tuple[CentOutputBinding, ...],
+    *,
+    category: Literal["input", "output"],
 ) -> None:
     """Require unique names within one manifest direction.
 
@@ -214,9 +232,9 @@ def _validate_unique_names(
 
 
 def _validate_no_input_overlaps(
-        bindings: tuple[CentInputBinding, ...],
-        *,
-        hardware: CentHardwareSpec | None = None,
+    bindings: tuple[CentInputBinding, ...],
+    *,
+    hardware: CentHardwareSpec | None = None,
 ) -> None:
     """Reject two input bindings that initialize the same scalar lane.
 
@@ -230,11 +248,13 @@ def _validate_no_input_overlaps(
         ValueError: If two input regions share one physical scalar lane.
     """
 
+    # Convert addresses to comparable ranges once, then compare each pair.
+    # Different banks or channels remain separate even if their columns match.
     spans = tuple(
         (binding, _physical_span(binding.region, hardware)) for binding in bindings
     )
     for index, (left_binding, left_span) in enumerate(spans):
-        for right_binding, right_span in spans[index + 1:]:
+        for right_binding, right_span in spans[index + 1 :]:
             if left_span.overlaps(right_span):
                 raise ValueError(
                     "input regions "
@@ -243,17 +263,19 @@ def _validate_no_input_overlaps(
 
 
 def _physical_span(
-        region: CentPhysicalRegion,
-        hardware: CentHardwareSpec | None,
+    region: CentPhysicalRegion,
+    hardware: CentHardwareSpec | None,
 ) -> _CentPhysicalSpan:
-    """Normalize a typed raw region for overlap validation.
+    """Convert a memory region to indices that can be checked for overlap.
 
     Args:
         region: Physical region to normalize.
         hardware: Optional target supplying the Shared Buffer burst length.
 
     Returns:
-        Half-open scalar interval with its complete storage coordinates.
+        Storage kind, coordinates, start index, and exclusive end index.
+        Without ``hardware``, Shared Buffer ranges use slot indices and detect
+        only inputs that start in the same slot.
     """
 
     if isinstance(region, CentDramRegion):
@@ -275,6 +297,8 @@ def _physical_span(
                 start=region.address.slot,
                 end=region.address.slot + 1,
             )
+        # Convert slots to scalar indices: at four lanes per slot, slot 2
+        # begins at scalar 8. Counts in the binding are already in scalars.
         first_lane = region.address.slot * hardware.burst_length
         return _CentPhysicalSpan(
             space=_CentStorageSpace.SHARED_BUFFER,
@@ -289,21 +313,24 @@ def _physical_span(
             start=region.address.column,
             end=region.address.column + region.scalar_count,
         )
+    if isinstance(region, CentAccumulatorRegion):
+        raise ValueError("accumulator regions are trace-only; use buffer host bindings")
     assert_never(region)
 
 
 def _validate_region_hardware(
-        region: CentPhysicalRegion,
-        hardware: CentHardwareSpec,
+    region: CentPhysicalRegion,
+    hardware: CentHardwareSpec,
 ) -> None:
-    """Check one raw region against its target storage geometry.
+    """Check that an input or output fits inside its selected memory area.
 
     Args:
-        region: Physical region to validate.
-        hardware: Target that must contain the complete region.
+        region: Starting address and number of scalar values to access.
+        hardware: Device capacities and slot width used to check the entire range.
 
     Raises:
-        ValueError: If the region extends outside its address space.
+        ValueError: If an address is invalid, a DRAM range crosses a row, or a
+            buffer range extends past its capacity.
     """
 
     if isinstance(region, CentDramRegion):
@@ -314,6 +341,8 @@ def _validate_region_hardware(
 
     if isinstance(region, CentSharedBufferRegion):
         validate_shared_buffer_address(region.address, hardware)
+        # Convert slots to scalar indices: at four lanes per slot, slot 2
+        # begins at scalar 8. Counts in the binding are already in scalars.
         first_lane = region.address.slot * hardware.burst_length
         buffer_lane_count = hardware.shared_buffer_slots * hardware.burst_length
         if first_lane + region.scalar_count > buffer_lane_count:
@@ -327,4 +356,6 @@ def _validate_region_hardware(
             raise ValueError("Global Buffer region exceeds the target capacity")
         return
 
+    if isinstance(region, CentAccumulatorRegion):
+        raise ValueError("accumulator regions are trace-only; use buffer host bindings")
     assert_never(region)

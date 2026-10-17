@@ -10,13 +10,22 @@ __all__ = ["CompileRequest", "DecodeStepSpec"]
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class DecodeStepSpec:
-    """Token counts needed to compile one decode step.
+    """Describe the new token's position and the cache space reserved for the request.
+
+    Decoding processes one new token while attending to earlier tokens.
+    ``max_sequence_length`` controls how much memory is reserved even when
+    the current context is shorter.
 
     Attributes:
         sequence_length: Number of tokens currently in the attention context.
             This includes the token being decoded and cannot exceed
             ``max_sequence_length``.
-        max_sequence_length: Number of tokens reserved in the KV cache.
+        max_sequence_length: Maximum token positions reserved for cached keys
+            and values (the KV cache); this determines cache row allocation.
+
+    Examples:
+        If ``sequence_length`` is 5, this step includes tokens 0 through 4 and
+        writes the new key/value pair at position 4.
     """
 
     sequence_length: int
@@ -40,12 +49,17 @@ class DecodeStepSpec:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CompileRequest:
-    """Inputs needed to compile one model block.
+    """Bundle the model, device, and token dimensions used by the block compiler.
+
+    This describes shapes and placement, not actual tensors. Loading weights,
+    populating input slots, and providing runtime cache contents are separate
+    responsibilities.
 
     Attributes:
         model: Description of the model architecture.
         hardware: Description of the CENT device that will run the program.
-        placement: Channels assigned to this model block.
+        placement: Number of channels allotted to one block copy; determines
+            how model values are split among that copy's banks.
         step: Token counts for the current decode step.
     """
 

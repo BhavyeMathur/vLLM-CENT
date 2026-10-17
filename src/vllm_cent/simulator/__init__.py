@@ -1,4 +1,4 @@
-"""Public manifest-facing interface for CENT functional simulation."""
+"""Run CENT programs on host numbers and return named results and traces."""
 
 from .api import (
     CentExecutionEvent,

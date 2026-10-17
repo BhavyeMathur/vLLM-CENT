@@ -6,7 +6,7 @@ directory, then picks the family by the config's ``model_type``.
 
 from __future__ import annotations
 
-from vllm_cent.pipeline import register_model
+from vllm_cent.driver import register_model
 
 from .annotations import axis_sizes, semantic_annotations
 from .config import LlamaConfig

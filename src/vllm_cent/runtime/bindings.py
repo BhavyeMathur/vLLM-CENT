@@ -1,15 +1,22 @@
-"""Describe named host values and reusable raw physical regions."""
+"""Describe host values and the device memory locations that hold them.
+
+A scalar is one number. A lane is one scalar position in a buffer; a Shared
+Buffer slot contains ``hardware.burst_length`` lanes. DRAM (dynamic random
+access memory) addresses select a channel, bank, row, and scalar column.
+"""
 
 from dataclasses import dataclass
 from typing import TypeAlias
 
 from ..cent import (
+    CentBankRegisterAddress,
     CentGlobalBufferAddress,
     CentMemoryAddress,
     CentSharedBufferAddress,
 )
 
 __all__ = [
+    "CentAccumulatorRegion",
     "CentDramRegion",
     "CentGlobalBufferRegion",
     "CentInputBinding",
@@ -35,7 +42,7 @@ def _validate_name(name: str) -> None:
 
 
 def _validate_scalar_count(scalar_count: int) -> None:
-    """Require a raw region to contain at least one scalar.
+    """Require the memory region to contain at least one value.
 
     Args:
         scalar_count: Number of consecutive scalar lanes in the region.
@@ -50,15 +57,18 @@ def _validate_scalar_count(scalar_count: int) -> None:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CentNamedScalars:
-    """Provide one named sequence of raw host scalar values.
+    """Provide host numbers associated with one input or output name.
 
-    A runtime binding determines the values' physical destination or source.
-    This type intentionally carries no logical shape, packing, padding, or
-    scalar-format claim.
+    The binding with the same name tells the runtime where these numbers go.
+    This type does not reshape values, reorder them, or add padding. The
+    execution target determines how to represent each number.
 
     Attributes:
         name: Input or output binding name.
         values: Scalars in the physical lane order declared by the binding.
+
+    Examples:
+        A three-number input bound to DRAM column 5 fills columns 5, 6, and 7.
     """
 
     name: str
@@ -89,7 +99,7 @@ class CentDramRegion:
     scalar_count: int
 
     def __post_init__(self) -> None:
-        """Validate the target-independent scalar count.
+        """Check that the region includes at least one scalar.
 
         Raises:
             ValueError: If the region contains no scalars.
@@ -107,14 +117,18 @@ class CentSharedBufferRegion:
 
     Attributes:
         address: First Shared Buffer slot occupied by the region.
-        scalar_count: Number of consecutive scalar lanes in slot-major order.
+        scalar_count: Number of scalars, filling each slot before moving to the next.
+
+    Examples:
+        With four lanes per slot, six values at slot 2 occupy all of slot 2 and
+        the first two lanes of slot 3. The other two lanes are outside the region.
     """
 
     address: CentSharedBufferAddress
     scalar_count: int
 
     def __post_init__(self) -> None:
-        """Validate the target-independent scalar count.
+        """Check that the region includes at least one scalar.
 
         Raises:
             ValueError: If the region contains no scalars.
@@ -136,7 +150,7 @@ class CentGlobalBufferRegion:
     scalar_count: int
 
     def __post_init__(self) -> None:
-        """Validate the target-independent scalar count.
+        """Check that the region includes at least one scalar.
 
         Raises:
             ValueError: If the region contains no scalars.
@@ -145,10 +159,29 @@ class CentGlobalBufferRegion:
         _validate_scalar_count(self.scalar_count)
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CentAccumulatorRegion:
+    """Identify one register in traces; host bindings must use buffers.
+
+    Attributes:
+        address: Channel, bank, and selected accumulation register.
+    """
+
+    address: CentBankRegisterAddress
+
+    @property
+    def scalar_count(self) -> int:
+        """Return one scalar stored in this register."""
+        return 1
+
+
 CentPhysicalRegion: TypeAlias = (
-        CentDramRegion | CentSharedBufferRegion | CentGlobalBufferRegion
+    CentDramRegion
+    | CentSharedBufferRegion
+    | CentGlobalBufferRegion
+    | CentAccumulatorRegion
 )
-"""A raw physical region understood by runtime targets."""
+"""A contiguous range of scalar positions in one device memory space."""
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -156,8 +189,8 @@ class CentInputBinding:
     """Bind named host scalars to a physical region before execution.
 
     Attributes:
-        name: Name used to match one :class:`CentNamedScalars` request value.
-        region: Raw physical region initialized before instruction zero.
+        name: Name used to match one ``CentNamedScalars`` request value.
+        region: Memory range filled with the named input before execution starts.
     """
 
     name: str
@@ -178,8 +211,8 @@ class CentOutputBinding:
     """Bind a result name to a physical region read after execution.
 
     Attributes:
-        name: Name assigned to the extracted :class:`CentNamedScalars` value.
-        region: Raw physical region read after the final instruction.
+        name: Name assigned to the extracted ``CentNamedScalars`` value.
+        region: Memory range read to obtain the named output after execution.
     """
 
     name: str

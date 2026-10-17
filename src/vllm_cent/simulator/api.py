@@ -1,4 +1,9 @@
-"""Public manifest-facing API for functional CENT execution."""
+"""Run a CENT program using named inputs and output memory bindings.
+
+Functional execution computes values; it does not predict hardware timing.
+Each request gets fresh device state. The runtime manifest maps names to
+memory ranges, and tracing reports the ranges each instruction reads or writes.
+"""
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -6,6 +11,7 @@ from typing import assert_never
 
 from vllm_cent.cent import CentInstruction
 from vllm_cent.runtime import (
+    CentAccumulatorRegion,
     CentDramRegion,
     CentExecutable,
     CentGlobalBufferRegion,
@@ -36,10 +42,11 @@ __all__ = [
 
 
 class CentNumericProfile(Enum):
-    """Select the numeric contract used by functional execution.
+    """Select how simulator values are stored and arithmetic is computed.
 
     Members:
-        REFERENCE_MATH: Python float arithmetic for compiler dataflow checks.
+        REFERENCE_MATH: Python ``float`` arithmetic for checking that instructions move
+            and combine the expected values; not hardware rounding behavior.
     """
 
     REFERENCE_MATH = auto()
@@ -62,7 +69,7 @@ class CentSimulatorConfiguration:
     """Configure one deterministic functional execution.
 
     Attributes:
-        numeric_profile: Arithmetic contract used for state and instructions.
+        numeric_profile: Rule for storing numbers and computing instruction results.
         trace_level: Amount of typed execution tracing returned to the caller.
     """
 
@@ -75,8 +82,9 @@ class CentExecutionRequest:
     """Combine a reusable executable with named values for one run.
 
     Attributes:
-        executable: Program and raw physical runtime manifest to execute.
-        inputs: Raw values matched to manifest input bindings by name.
+        executable: Program plus the named memory ranges for its inputs and outputs.
+        inputs: Host numbers matched to input bindings by name, regardless of
+            the order supplied here. Counts must match the bound memory ranges.
         configuration: Numeric and trace configuration for this run.
     """
 
@@ -120,12 +128,16 @@ class CentExecutionEvent:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CentExecutionResult:
-    """Return named raw outputs and deterministic execution metadata.
+    """Return the output values and a record of completed execution.
+
+    Values follow the physical memory layout in the manifest. This result does
+    not reshape tensors or remove padding; the logical artifact layer does that.
 
     Attributes:
-        outputs: Values extracted in manifest output-binding order.
-        events: Optional instruction summaries selected by the trace level.
-        executed_instruction_count: Number of committed instructions.
+        outputs: Named scalar sequences, in the manifest's output order.
+        events: Per-instruction read/write summaries when tracing is enabled;
+            otherwise an empty tuple.
+        executed_instruction_count: Number of instructions successfully applied.
     """
 
     outputs: tuple[CentNamedScalars, ...]
@@ -134,11 +146,13 @@ class CentExecutionResult:
 
 
 def execute_functionally(request: CentExecutionRequest) -> CentExecutionResult:
-    """Materialize, execute, and extract one CENT functional request.
+    """Check support, load inputs, run the program, and read its outputs.
 
-    The entire program is preflighted before request values mutate fresh state.
-    Inputs and outputs use raw physical spans only; this function infers no
-    logical layout, packing, or zero-padding rule.
+    Preflight checks every instruction before loading any input. Once support
+    is confirmed, names and counts are checked, inputs are written, and
+    instructions execute in order on fresh state.
+    Input values are used in the order given within each binding; no tensor
+    reshaping or zero padding is added here.
 
     Args:
         request: Executable, named input values, and simulator configuration.
@@ -149,6 +163,10 @@ def execute_functionally(request: CentExecutionRequest) -> CentExecutionResult:
     Raises:
         CentManifestError: If request inputs disagree with the manifest.
         CentSimulationError: If preflight or instruction execution fails.
+
+    Examples:
+        If a program copies values and then uses an unsupported instruction,
+        preflight rejects the request before loading inputs or running the copy.
     """
 
     executable = request.executable
@@ -157,22 +175,28 @@ def execute_functionally(request: CentExecutionRequest) -> CentExecutionResult:
         numeric=_numeric_semantics(request.configuration.numeric_profile),
     )
 
-    # Capability checks deliberately precede instruction zero and all runtime
-    # writes, so a valid prefix cannot hide unsupported meaning later on.
+    # Reject unsupported instructions anywhere in the program before loading
+    # inputs. A supported prefix must not run before a later rejection.
     preflight_program(executable.program, state)
     try:
         ordered_inputs = executable.manifest.order_input_values(request.inputs)
     except ValueError as error:
         raise CentManifestError(str(error)) from error
 
+    # Values may arrive in any name order. The manifest has now reordered
+    # and checked them, so each pair writes exactly its own destination.
     for binding, value in zip(
-            executable.manifest.inputs,
-            ordered_inputs,
-            strict=True,
+        executable.manifest.inputs,
+        ordered_inputs,
+        strict=True,
     ):
         _materialize_input(state, binding, value)
 
-    summary = _execute_preflighted_program(executable.program, state)
+    summary = _execute_preflighted_program(
+        executable.program,
+        state,
+        retain_effects=request.configuration.trace_level is CentTraceLevel.SUMMARY,
+    )
     outputs = tuple(
         _extract_output(state, binding) for binding in executable.manifest.outputs
     )
@@ -200,16 +224,20 @@ def _numeric_semantics(profile: CentNumericProfile) -> CentNumericSemantics:
 
 
 def _materialize_input(
-        state: CentDeviceState,
-        binding: CentInputBinding,
-        value: CentNamedScalars,
+    state: CentDeviceState,
+    binding: CentInputBinding,
+    value: CentNamedScalars,
 ) -> None:
-    """Write one ordered host value to its typed physical region.
+    """Write one named sequence of host numbers to its bound memory range.
 
     Args:
         state: Fresh device state receiving the input.
         binding: Named raw physical destination declared by the manifest.
-        value: Name- and size-validated host scalars.
+        value: Host numbers whose name and count have already been checked
+            against the binding.
+
+    Raises:
+        ValueError: The destination is out of bounds or conversion rejects a value.
     """
 
     region = binding.region
@@ -222,21 +250,28 @@ def _materialize_input(
     if isinstance(region, CentGlobalBufferRegion):
         state.write_global_buffer(region.address, value.values)
         return
+    if isinstance(region, CentAccumulatorRegion):
+        raise ValueError("accumulator regions are trace-only; use buffer host bindings")
     assert_never(region)  # pragma: no cover - closed union guard
 
 
 def _extract_output(
-        state: CentDeviceState,
-        binding: CentOutputBinding,
+    state: CentDeviceState,
+    binding: CentOutputBinding,
 ) -> CentNamedScalars:
-    """Read one named raw output from its typed physical region.
+    """Read the exact number of scalars requested by one output binding.
 
     Args:
         state: Successfully executed device state.
         binding: Named raw physical source declared by the manifest.
 
     Returns:
-        Named host values in increasing physical-lane order.
+        Named host values in increasing column order, or by slot then lane
+        for Shared Buffer output.
+
+    Raises:
+        ValueError: The requested range is outside device memory.
+        CentUninitializedReadError: An output scalar was never written.
     """
 
     region = binding.region
@@ -252,17 +287,19 @@ def _extract_output(
             region.address,
             value_count=region.scalar_count,
         )
+    elif isinstance(region, CentAccumulatorRegion):
+        raise ValueError("accumulator regions are trace-only; use buffer host bindings")
     else:
         assert_never(region)  # pragma: no cover - closed union guard
     return CentNamedScalars(name=binding.name, values=values)
 
 
 def _execution_events(
-        request: CentExecutionRequest,
-        state: CentDeviceState,
-        summary: CentExecutionSummary,
+    request: CentExecutionRequest,
+    state: CentDeviceState,
+    summary: CentExecutionSummary,
 ) -> tuple[CentExecutionEvent, ...]:
-    """Build the selected successful instruction trace.
+    """Attach read and write ranges to each instruction when tracing is enabled.
 
     Args:
         request: Completed request whose trace level selects the result.

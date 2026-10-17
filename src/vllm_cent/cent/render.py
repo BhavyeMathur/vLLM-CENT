@@ -24,10 +24,11 @@ from .instructions import (
     WriteSingleBank,
 )
 from .program import CentProgram
+from .reference import ReferenceInstruction
 
 __all__ = ["render_channel_mask", "render_instruction", "render_text_program"]
 
-# This text follows the paper and is useful for inspection. It is intentionally
+# This text follows the paper's operand order for inspection. It is intentionally
 # distinct from the executable AiM trace ABI, whose channel mask, configuration
 # registers, and operand lists are handled by ``cent.aim``.
 
@@ -42,7 +43,11 @@ def render_channel_mask(channels: CentChannelSet) -> str:
         channels: Physical channels that should receive the instruction.
 
     Returns:
-        Lowercase hexadecimal mask, such as ``"0x9"`` for channels 0 and 3.
+        Lowercase hexadecimal mask.
+
+    Examples:
+        ``CentChannelSet(channels=(0, 3))`` renders as ``"0x9"`` because bits
+        zero and three are set.
     """
 
     # Instructions keep readable channel numbers. Only the text renderer packs
@@ -56,10 +61,13 @@ def render_channel_mask(channels: CentChannelSet) -> str:
 def _shared_buffer_operands(
     instruction: Exponent | Reduction | Accumulate,
 ) -> str:
-    """Render the ``OPsize Rd Rs`` fields shared by three PNM commands.
+    """Render the count and buffer slots for three near-memory commands.
+
+    Their common field order is ``OPsize Rd Rs``: amount of work, destination
+    slot, then source slot. The actual arithmetic remains instruction-specific.
 
     Args:
-        instruction: EXP, RED, or ACC instruction to render.
+        instruction: ``EXP``, ``RED``, or ``ACC`` instruction to render.
 
     Returns:
         Space-separated operation count, output slot, and input slot.
@@ -74,10 +82,12 @@ def _shared_buffer_operands(
 def render_instruction(instruction: CentInstruction) -> str:
     """Render one instruction in the operand order used by the paper.
 
-    For example, Python's ``address.row`` becomes ``RO``. A Shared Buffer slot
-    becomes ``Rs`` when read and ``Rd`` when written. This inspection format is
-    not round-trippable: it omits semantic fields that the paper's assembly
-    table does not encode, such as the MAC operand source and copy-bank index.
+    A Shared Buffer slot becomes ``Rs`` when read and ``Rd`` when written.
+    This inspection format is not round-trippable: it omits semantic fields
+    that the paper's assembly table does not encode, such as the MAC operand
+    source and copy-bank index.
+    Use it to inspect a program, not to recover an equivalent typed program or
+    as input to the AiM timing simulator.
 
     Args:
         instruction: Typed CENT command to render.
@@ -87,7 +97,14 @@ def render_instruction(instruction: CentInstruction) -> str:
 
     Raises:
         TypeError: If ``instruction`` has an unknown type.
+
+    Examples:
+        The Python field ``address.row`` is written in the paper's ``RO`` position.
+        For a single-bank write with ``address.row=3``, that operand is ``3``.
     """
+
+    if isinstance(instruction, ReferenceInstruction):
+        raise ValueError("reference services have no physical instruction encoding")
 
     if isinstance(instruction, (WriteSingleBank, ReadSingleBank)):
         opcode = instruction.opcode.value
@@ -143,7 +160,7 @@ def render_instruction(instruction: CentInstruction) -> str:
             f"{instruction.source.slot} {instruction.destination.slot}"
         )
     if isinstance(instruction, ReceiveCxl):
-        return instruction.opcode.value
+        return str(instruction.opcode.value)
     if isinstance(instruction, BroadcastCxl):
         opcode = instruction.opcode.value
         return (

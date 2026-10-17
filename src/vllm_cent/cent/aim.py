@@ -1,4 +1,9 @@
-"""Serialize the DRAM portion of a CENT program for the AiM simulator."""
+"""Translate CENT bank operations into records for the AiM timing simulator.
+
+The trace describes commands and timing dependencies. It carries no tensor
+values and cannot establish numerical correctness. Instructions whose operands
+cannot be preserved by this format are rejected instead of silently changed.
+"""
 
 from .instructions import (
     ApplyActivation,
@@ -17,6 +22,7 @@ from .instructions import (
     WriteSingleBank,
 )
 from .program import CentProgram
+from .reference import ReferenceInstruction
 
 __all__ = [
     "AIM_SIMULATOR_BANKS",
@@ -45,7 +51,7 @@ _SIMULATOR_REGISTER = 0
 
 
 class AimSimulatorCompatibilityError(ValueError):
-    """Report a CENT operation that the AiM trace ABI cannot represent."""
+    """Report an operation or operand the AiM trace format cannot represent."""
 
 
 def validate_aim_hardware(program: CentProgram) -> None:
@@ -81,7 +87,8 @@ def render_aim_channel_mask(channels: CentChannelSet) -> str:
 
     The simulator maps the least-significant mask bit to physical channel 31,
     so channel zero occupies bit 31. This differs from the paper-readable
-    renderer, which intentionally uses the conventional bit-n mapping.
+    renderer, which intentionally uses the conventional mapping from channel
+    number to bit position.
 
     Args:
         channels: Physical AiM channel numbers to select.
@@ -91,6 +98,10 @@ def render_aim_channel_mask(channels: CentChannelSet) -> str:
 
     Raises:
         AimSimulatorCompatibilityError: If a channel is outside 0 through 31.
+
+    Examples:
+        A selection containing only channel zero renders as ``0x80000000``.
+        A selection containing only channel 31 renders as ``0x1``.
     """
 
     mask = 0
@@ -108,7 +119,7 @@ def _require_zero_column(instruction: CentInstruction, column: int) -> None:
 
     Args:
         instruction: Instruction reported in an incompatibility message.
-        column: Paper-level scalar column coordinate.
+        column: Starting scalar column in the current Python address model.
 
     Raises:
         AimSimulatorCompatibilityError: If ``column`` is not zero.
@@ -140,7 +151,7 @@ def _require_simulator_register(instruction: CentInstruction, register: int) -> 
 def _render_single_bank_transfer(
     instruction: WriteSingleBank | ReadSingleBank,
 ) -> tuple[str, ...]:
-    """Expand a paper transfer into the simulator's one-burst records.
+    """Expand one typed bank transfer into one timing record per burst.
 
     The trace grammar omits ``OPsize`` and ``CO`` for these two operations.
     Repeating the row access preserves the timing model for consecutive bursts;
@@ -160,6 +171,9 @@ def _render_single_bank_transfer(
     _require_zero_column(instruction, instruction.address.column)
     channels = CentChannelSet(channels=(instruction.address.channel,))
     channel_mask = render_aim_channel_mask(channels)
+    # The trace has a general-purpose-register field, not a Shared Buffer type.
+    # This adapter copies the slot number into that field for timing traces; it
+    # does not establish a hardware mapping between the two storage structures.
     first_gpr = (
         instruction.source.slot
         if isinstance(instruction, WriteSingleBank)
@@ -175,11 +189,11 @@ def _render_single_bank_transfer(
 def render_aim_instruction(instruction: CentInstruction) -> tuple[str, ...]:
     """Render one supported instruction as AiM trace records.
 
-    Configuration-register writes are emitted immediately before operations
-    whose meaning depends on that hidden state. The result may therefore hold
-    more than one line. Callers rendering a standalone instruction are
-    responsible for validating its target-dependent address bounds first;
-    :func:`render_aim_trace` receives an already validated program.
+    A configuration register holds settings that remain active for later
+    commands. The adapter writes these settings immediately before the command
+    that needs them, so the result may hold more than one line. Callers rendering
+    a standalone instruction must validate its target-dependent address bounds
+    first; ``render_aim_trace`` receives an already validated program.
 
     Args:
         instruction: Typed CENT instruction to serialize.
@@ -190,7 +204,17 @@ def render_aim_instruction(instruction: CentInstruction) -> tuple[str, ...]:
     Raises:
         AimSimulatorCompatibilityError: If the simulator lacks the instruction
             or cannot encode one of its operands.
+
+    Examples:
+        A ``MacAllBanks`` instruction emits a source-selection register write
+        followed by the multiply-accumulate command. The tuple preserves that order
+        so the command uses the requested source.
     """
+
+    if isinstance(instruction, ReferenceInstruction):
+        raise AimSimulatorCompatibilityError(
+            "reference services have no physical instruction encoding"
+        )
 
     if isinstance(instruction, (WriteSingleBank, ReadSingleBank)):
         return _render_single_bank_transfer(instruction)
@@ -208,7 +232,7 @@ def render_aim_instruction(instruction: CentInstruction) -> tuple[str, ...]:
         _require_zero_column(instruction, instruction.column)
         _require_simulator_register(instruction, instruction.accumulation_register)
         channel_mask = render_aim_channel_mask(instruction.channels)
-        # CFR0 is persistent simulator state rather than a MAC_ABK operand.
+        # CFR0 (configuration register zero) retains its value between commands.
         # Reassert it immediately before every MAC so the rendered meaning does
         # not depend on an earlier instruction or the simulator's default. A
         # stateful whole-program optimizer may safely coalesce equal writes.
@@ -278,9 +302,10 @@ def render_aim_trace(program: CentProgram) -> str:
     """Render a complete trace accepted by the AiM simulator.
 
     The adapter covers AiM's DRAM-side instructions. It deliberately rejects
-    CENT PNM and CXL instructions such as ``EXP``, ``RED``, ``RISCV``, and
+    CENT processing-near-memory (PNM) and Compute Express Link (CXL)
+    instructions such as ``EXP``, ``RED``, ``RISCV``, and
     ``SEND_CXL`` because the referenced simulator does not implement them.
-    ``EOC`` is appended because the trace frontend requires it at end of file.
+    An ``EOC`` record marks the end of the trace; the trace reader requires it.
 
     Args:
         program: Validated CENT program for the fixed AiM geometry.
@@ -294,6 +319,8 @@ def render_aim_trace(program: CentProgram) -> str:
     """
 
     validate_aim_hardware(program)
+    # One typed instruction may expand into several records. Flatten those
+    # records without changing command order, then terminate the whole trace.
     lines = [
         line
         for instruction in program.instructions

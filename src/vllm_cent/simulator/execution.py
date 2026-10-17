@@ -1,4 +1,4 @@
-"""Execute preflighted CENT instructions and commit their physical effects."""
+"""Execute checked CENT instructions in order, applying each result as a unit."""
 
 from dataclasses import dataclass
 
@@ -17,14 +17,14 @@ __all__ = ["CentExecutionSummary", "execute_program", "preflight_program"]
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CentExecutionSummary:
-    """Summarize one successfully completed state-level execution.
+    """Report instructions completed against an existing device state.
 
     Attributes:
         executed_instruction_count: Number of instructions committed in program
             order.
         committed_effects: Complete read and write effects for each committed
             instruction, in program order. The tuple index is the instruction
-            index.
+            index. Empty when the internal request executor disables history.
     """
 
     executed_instruction_count: int
@@ -32,16 +32,16 @@ class CentExecutionSummary:
 
 
 def execute_program(
-        program: CentProgram,
-        state: CentDeviceState,
+    program: CentProgram,
+    state: CentDeviceState,
 ) -> CentExecutionSummary:
     """Execute a supported program sequentially against one device state.
 
-    Preflight scans the complete program before instruction zero. Each kernel
-    resolves and reads all sources into immutable physical effects. The state
-    then validates and commits the complete write tuple as one transaction.
-    Earlier completed instructions remain committed if a later instruction
-    faults.
+    Preflight first checks whether every instruction is supported. Each
+    instruction then reads its sources and computes all proposed writes before
+    changing memory. Commit applies those writes only after every destination
+    passes validation. Earlier completed instructions remain applied if a
+    later instruction fails.
 
     Args:
         program: Validated typed instructions in execution order.
@@ -55,6 +55,10 @@ def execute_program(
         CentUninitializedReadError: If an instruction consumes any unwritten
             source lane.
         CentUnsupportedSemanticsError: If preflight finds unsupported meaning.
+
+    Examples:
+        If the third instruction fails while reading an unwritten operand, the
+        first two remain applied, but no writes from the third become visible.
     """
 
     preflight_program(program, state)
@@ -62,48 +66,57 @@ def execute_program(
 
 
 def _execute_preflighted_program(
-        program: CentProgram,
-        state: CentDeviceState,
+    program: CentProgram,
+    state: CentDeviceState,
+    *,
+    retain_effects: bool = True,
 ) -> CentExecutionSummary:
-    """Execute a program whose complete semantics were already preflighted.
+    """Execute instructions after support checks and input loading are complete.
 
-    The public request path calls this helper after preflight and input
-    materialization. Keeping that sequencing explicit prevents a second scan
-    without allowing callers to accidentally bypass preflight through the
-    public state-level entry point.
+    The public request API has already checked the whole program before loading
+    inputs. It calls this helper to avoid repeating that scan. Callers with an
+    existing device state use ``execute_program``, which performs the scan.
 
     Args:
         program: Fully preflighted instructions in execution order.
         state: Mutable state whose hardware matches ``program``.
+        retain_effects: Keep completed writes and read ranges for tracing. When
+            false, discard each instruction's temporary values after commit.
 
     Returns:
-        Count and exact committed read/write effects in program order.
+        Completed instruction count and, when requested, exact read/write
+        effects in program order. Without history, ``committed_effects`` is empty.
 
     Raises:
         CentExecutionFault: If a dynamic constraint fails during execution.
         CentUninitializedReadError: If an instruction consumes unwritten state.
     """
 
-    committed_effects = tuple(
-        _execute_instruction(instruction, state, instruction_index)
-        for instruction_index, instruction in enumerate(program.instructions)
-    )
+    # Execution needs only the current instruction's proposed writes. Keeping
+    # every overwritten value would make memory grow with the whole program,
+    # even when the caller asked for no trace.
+    committed_effects: list[_InstructionEffects] = []
+    for instruction_index, instruction in enumerate(program.instructions):
+        effects = _execute_instruction(instruction, state, instruction_index)
+        if retain_effects:
+            committed_effects.append(effects)
     return CentExecutionSummary(
         executed_instruction_count=len(program.instructions),
-        committed_effects=committed_effects,
+        committed_effects=tuple(committed_effects),
     )
 
 
 def _execute_instruction(
-        instruction: CentInstruction,
-        state: CentDeviceState,
-        instruction_index: int,
+    instruction: CentInstruction,
+    state: CentDeviceState,
+    instruction_index: int,
 ) -> _InstructionEffects:
-    """Prepare and atomically commit one instruction's complete write set.
+    """Compute one instruction's writes, then apply all of them together.
 
     Args:
         instruction: Supported typed instruction to execute.
-        state: Device state supplying sources and receiving effects.
+        state: Memory read by the kernel and updated only after all proposed
+            writes pass validation.
         instruction_index: Zero-based program position used in failure context.
 
     Returns:

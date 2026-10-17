@@ -1,4 +1,12 @@
-"""Focused storage components used by the functional device-state facade."""
+"""Store simulated memory and distinguish unwritten scalars from zero.
+
+DRAM (dynamic random-access memory) rows are allocated on first write. Small
+buffers use fixed-size arrays. Both keep an explicit marker for unwritten
+positions.
+
+Examples:
+    Writing DRAM column 2 does not initialize columns 0 and 1.
+"""
 
 from dataclasses import dataclass, field
 from enum import Enum
@@ -19,33 +27,33 @@ class _Uninitialized(Enum):
     """Mark a scalar location that has never been written.
 
     Members:
-        VALUE: Unique nonnumeric value used in initialized-value arrays.
+        VALUE: Marker placed where no scalar has been written yet.
     """
 
     VALUE = 0
 
 
 def _require_stored_floats(
-        values: list[float | _Uninitialized],
-        *,
-        region: str,
+    values: list[float | _Uninitialized],
+    *,
+    region: str,
 ) -> tuple[float, ...]:
-    """Return stored values only when every runtime value is a Python float.
+    """Return all selected values after checking that each is a Python ``float``.
 
-    Storage readers check the uninitialized sentinel before calling this
-    helper. Reaching another value type means internal state was corrupted or a
-    numeric policy violated its protocol; silently filtering it would change
-    lane counts and hide the invariant failure.
+    The caller has already rejected unwritten locations. A different value type
+    here means storage is corrupted or number conversion returned the wrong type.
+    Dropping such a value would shift the remaining positions, so reject the
+    whole read instead.
 
     Args:
-        values: Initialized storage values selected by one read.
-        region: Human-readable state region used in invariant failures.
+        values: Initialized values selected by one memory read, in memory order.
+        region: Human-readable name of the memory area, used in the error message.
 
     Returns:
-        Complete values with their runtime type proven to the type checker.
+        Every selected ``float`` in the original order, without dropping positions.
 
     Raises:
-        RuntimeError: If any value is not a Python float.
+        RuntimeError: If any selected value is not a Python ``float``.
     """
 
     if any(not isinstance(value, float) for value in values):
@@ -80,12 +88,12 @@ class _UninitializedScalarError(Exception):
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class _DramRowAddress:
-    """Identify one sparse DRAM row without its scalar column.
+    """Identify a complete DRAM row, without selecting a column within it.
 
     Attributes:
         channel: Zero-based channel number.
-        bank: Zero-based bank number inside the channel.
-        row: Zero-based row number inside the bank.
+        bank: Zero-based bank number within that channel.
+        row: Zero-based row number within that bank.
     """
 
     channel: int
@@ -95,15 +103,19 @@ class _DramRowAddress:
 
 @dataclass(slots=True, kw_only=True)
 class _SparseDram:
-    """Store initialized DRAM scalars in lazily allocated rows.
+    """Allocate a DRAM row only when something writes to it.
 
-    Rows are immutable tuples. Clones therefore share existing rows safely, and
-    each write replaces only its touched row with a newly prepared tuple.
+    Stored rows are immutable tuples. Clones share those tuples until a write
+    creates a replacement row, so an abandoned clone cannot change the original.
 
     Attributes:
         hardware: Geometry used to validate DRAM addresses and spans.
         device_id: Device identifier attached to uninitialized-read failures.
         _rows: Immutable allocated rows keyed by channel, bank, and row.
+
+    Examples:
+        With ``hardware.dram_columns=8``, writing two numbers at column 3
+        initializes columns 3 and 4. The other six columns remain unwritten.
     """
 
     hardware: CentHardwareSpec
@@ -125,7 +137,7 @@ class _SparseDram:
             raise ValueError("device_id cannot be negative")
 
     def clone(self) -> _SparseDram:
-        """Create an isolated copy-on-write view of the sparse row mapping.
+        """Copy the row lookup table while sharing the immutable row values.
 
         Returns:
             Storage with an independent row mapping and the same immutable row
@@ -137,7 +149,7 @@ class _SparseDram:
         return cloned
 
     def write(self, address: CentMemoryAddress, values: tuple[float, ...]) -> None:
-        """Write already-represented values within one DRAM row.
+        """Write converted numbers to consecutive columns without converting again.
 
         Args:
             address: Physical location of the first destination scalar.
@@ -160,20 +172,22 @@ class _SparseDram:
             bank=address.bank,
             row=address.row,
         )
+        # Build a replacement row so clones sharing the old tuple keep their
+        # original values. Untouched columns remain unwritten or unchanged.
         stored_row = self._rows.get(row_address)
         prepared_row: list[float | _Uninitialized] = (
             [_Uninitialized.VALUE] * self.hardware.dram_columns
             if stored_row is None
             else list(stored_row)
         )
-        prepared_row[address.column: span_end] = values
+        prepared_row[address.column : span_end] = values
         self._rows[row_address] = tuple(prepared_row)
 
     def read(
-            self,
-            address: CentMemoryAddress,
-            *,
-            value_count: int,
+        self,
+        address: CentMemoryAddress,
+        *,
+        value_count: int,
     ) -> tuple[float, ...]:
         """Read consecutive initialized values from one DRAM row.
 
@@ -217,21 +231,21 @@ class _SparseDram:
                     ),
                 )
 
-        values = list(row[address.column: span_end]) if row is not None else []
+        values = list(row[address.column : span_end]) if row is not None else []
         return _require_stored_floats(values, region="DRAM")
 
 
 @dataclass(slots=True, kw_only=True)
 class _LinearBuffer:
-    """Store an initialization-aware fixed-capacity scalar array.
+    """Store a fixed number of scalars and track which positions were written.
 
-    Address-space adapters translate their typed addresses to scalar indices
-    and convert :class:`_UninitializedScalarError` into a structured simulator
-    failure. This component owns only linear span and initialization mechanics.
+    This class works with scalar indices only. Device state translates buffer
+    addresses into those indices and converts a missing index back into the
+    appropriate address for an error message.
 
     Attributes:
         capacity: Number of scalar positions in the buffer.
-        _values: Stored scalars or sentinels for unwritten positions.
+        _values: Stored numbers, with a special marker in positions never written.
     """
 
     capacity: int
@@ -260,7 +274,7 @@ class _LinearBuffer:
         return cloned
 
     def write(self, start: int, values: tuple[float, ...]) -> None:
-        """Write already-represented values at consecutive scalar indices.
+        """Write converted numbers at consecutive indices without converting again.
 
         Args:
             start: Zero-based destination scalar index.
@@ -304,6 +318,8 @@ class _LinearBuffer:
             raise ValueError("linear buffer read exceeds storage")
 
         values = self._values[start:span_end]
+        # The slice starts at zero locally; errors need the original buffer
+        # index. Reading indices 5..7 and missing offset 1 must report index 6.
         for offset, value in enumerate(values):
             if value is _Uninitialized.VALUE:
                 raise _UninitializedScalarError(start + offset)
@@ -312,7 +328,10 @@ class _LinearBuffer:
 
 @dataclass(slots=True, kw_only=True)
 class _BankRegisterFile:
-    """Store one sparse file of near-bank scalar registers.
+    """Store written values for one kind of register next to each memory bank.
+
+    A dictionary entry exists only after a register is written. Missing entries
+    therefore mean unwritten registers, not registers containing zero.
 
     Attributes:
         hardware: Geometry that defines channel, bank, and register bounds.
@@ -347,8 +366,23 @@ class _BankRegisterFile:
         if not self.uninitialized_reason:
             raise ValueError("uninitialized_reason cannot be empty")
 
+    def clone(self) -> _BankRegisterFile:
+        """Copy initialized registers for an atomic instruction commit.
+
+        Returns:
+            Independent register storage with the same addresses and values.
+        """
+        clone = _BankRegisterFile(
+            hardware=self.hardware,
+            device_id=self.device_id,
+            region_name=self.region_name,
+            uninitialized_reason=self.uninitialized_reason,
+        )
+        clone._values = dict(self._values)
+        return clone
+
     def write(self, address: CentBankRegisterAddress, value: float) -> None:
-        """Write one already-represented register value.
+        """Write one converted register value without converting it again.
 
         Args:
             address: Channel, bank, and register to write.

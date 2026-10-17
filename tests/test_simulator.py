@@ -1,4 +1,9 @@
-"""Tests for the deterministic CENT functional simulator core."""
+"""Check simulator storage, instruction calculations, and failure behavior.
+
+DRAM (dynamic random-access memory) is addressed by channel, bank, row, and
+scalar column. A lane is one scalar position. The fixture uses two lanes per
+burst and per Shared Buffer slot; these small sizes are test choices.
+"""
 
 import math
 import unittest
@@ -16,11 +21,13 @@ from vllm_cent.cent import (
     CopyBankToGlobalBuffer,
     CopyGlobalBufferToBank,
     ElementwiseMultiply,
+    MacAllBanks,
     Exponent,
     ReadSingleBank,
     WriteGlobalBuffer,
     WriteSingleBank,
 )
+from vllm_cent.cent.reference import ReferenceInstruction
 from vllm_cent.runtime import (
     CentDramRegion,
     CentGlobalBufferRegion,
@@ -79,7 +86,9 @@ def hardware(*, shared_buffer_slots: int = 4) -> CentHardwareSpec:
         shared_buffer_slots: Number of two-lane Shared Buffer slots.
 
     Returns:
-        Two channels with two four-bank PU groups per channel.
+        Two channels with eight banks each. Each processing unit (PU)
+        serves four banks, giving groups 0..3 and 4..7. Rows and Global
+        Buffers hold eight scalars; each Shared Buffer slot holds two.
     """
 
     return CentHardwareSpec(
@@ -96,7 +105,7 @@ def hardware(*, shared_buffer_slots: int = 4) -> CentHardwareSpec:
 
 
 def memory_address(
-        *, channel: int = 0, bank: int = 0, row: int = 0, column: int = 0
+    *, channel: int = 0, bank: int = 0, row: int = 0, column: int = 0
 ) -> CentMemoryAddress:
     """Create a DRAM address while making changed coordinates visible.
 
@@ -132,7 +141,11 @@ def program(*instructions: CentInstruction) -> CentProgram:
 
 
 class CountingStoreSemantics:
-    """Quantize host stores visibly while leaving arithmetic deterministic.
+    """Add 0.25 on each host conversion so accidental repeated conversion shows.
+
+    For example, 1.0 becomes 1.25 when loaded. A copy must keep 1.25; another
+    conversion would incorrectly produce 1.5. This is a test marker, not a
+    model of hardware rounding.
 
     Attributes:
         store_call_count: Number of host values converted by :meth:`store`.
@@ -194,10 +207,10 @@ class FailingArithmeticSemantics:
     """
 
     def __init__(
-            self,
-            *,
-            fail_multiply_at: int | None = None,
-            fail_add_at: int | None = None,
+        self,
+        *,
+        fail_multiply_at: int | None = None,
+        fail_add_at: int | None = None,
     ) -> None:
         """Configure the arithmetic calls that fail.
 
@@ -285,8 +298,8 @@ class SimulatorValueTests(unittest.TestCase):
         """Require nonnegative device and instruction identifiers."""
 
         for arguments in (
-                {"device_id": -1},
-                {"instruction_index": -1},
+            {"device_id": -1},
+            {"instruction_index": -1},
         ):
             with self.subTest(arguments=arguments):
                 with self.assertRaises(ValueError):
@@ -294,7 +307,7 @@ class SimulatorValueTests(unittest.TestCase):
 
 
 class ReferenceMathSemanticsTests(unittest.TestCase):
-    """Test the explicitly non-hardware-fidelity numeric profile."""
+    """Check Python float reference arithmetic, without claiming hardware rounding."""
 
     def test_preserves_python_float_values_and_operations(self) -> None:
         """Preserve signed zero and special values while using host arithmetic."""
@@ -324,7 +337,8 @@ class StorageComponentTests(unittest.TestCase):
         self.assertEqual(storage.read(address, value_count=3), (1.0, 2.0, 3.0))
         self.assertEqual(cloned.read(address, value_count=3), (1.0, 8.0, 9.0))
 
-        # The source side also copies a row before its first post-clone write.
+        # Sharing the original row tuple must be safe in both directions:
+        # writing the source now must not change the clone's saved row.
         storage.write(memory_address(column=1), (7.0,))
         self.assertEqual(storage.read(address, value_count=3), (7.0, 2.0, 3.0))
         self.assertEqual(cloned.read(address, value_count=3), (1.0, 8.0, 9.0))
@@ -333,6 +347,8 @@ class StorageComponentTests(unittest.TestCase):
         """Reject invalid sparse spans and identify the first missing scalar."""
 
         storage = _SparseDram(hardware=hardware(), device_id=4)
+        # Only column 6 is initialized. A two-value read must identify
+        # column 7 as missing, preserving its channel/bank/row coordinates.
         start = memory_address(channel=1, bank=2, row=1, column=6)
         storage.write(start, (1.0,))
 
@@ -345,10 +361,10 @@ class StorageComponentTests(unittest.TestCase):
         )
 
         for operation in (
-                lambda: storage.write(memory_address(column=7), (1.0, 2.0)),
-                lambda: storage.write(memory_address(), ()),
-                lambda: storage.read(memory_address(), value_count=0),
-                lambda: storage.read(memory_address(column=7), value_count=2),
+            lambda: storage.write(memory_address(column=7), (1.0, 2.0)),
+            lambda: storage.write(memory_address(), ()),
+            lambda: storage.read(memory_address(), value_count=0),
+            lambda: storage.read(memory_address(column=7), value_count=2),
         ):
             with self.subTest(operation=operation):
                 with self.assertRaises(ValueError):
@@ -380,14 +396,14 @@ class StorageComponentTests(unittest.TestCase):
 
         storage = _LinearBuffer(capacity=2)
         for operation in (
-                lambda: storage.write(-1, (1.0,)),
-                lambda: storage.write(2, (1.0,)),
-                lambda: storage.write(0, ()),
-                lambda: storage.write(1, (1.0, 2.0)),
-                lambda: storage.read(-1, value_count=1),
-                lambda: storage.read(2, value_count=1),
-                lambda: storage.read(0, value_count=0),
-                lambda: storage.read(1, value_count=2),
+            lambda: storage.write(-1, (1.0,)),
+            lambda: storage.write(2, (1.0,)),
+            lambda: storage.write(0, ()),
+            lambda: storage.write(1, (1.0, 2.0)),
+            lambda: storage.read(-1, value_count=1),
+            lambda: storage.read(2, value_count=1),
+            lambda: storage.read(0, value_count=0),
+            lambda: storage.read(1, value_count=2),
         ):
             with self.subTest(operation=operation):
                 with self.assertRaises(ValueError):
@@ -414,9 +430,9 @@ class StorageComponentTests(unittest.TestCase):
         self.assertEqual(raised.exception.location, missing)
 
         for invalid in (
-                CentBankRegisterAddress(channel=2, bank=0, register=0),
-                CentBankRegisterAddress(channel=0, bank=8, register=0),
-                CentBankRegisterAddress(channel=0, bank=0, register=2),
+            CentBankRegisterAddress(channel=2, bank=0, register=0),
+            CentBankRegisterAddress(channel=0, bank=8, register=0),
+            CentBankRegisterAddress(channel=0, bank=0, register=2),
         ):
             with self.subTest(invalid=invalid):
                 with self.assertRaises(ValueError):
@@ -439,8 +455,8 @@ class StorageComponentTests(unittest.TestCase):
                 uninitialized_reason="accumulator register is uninitialized",
             )
         for region_name, reason in (
-                ("", "accumulator register is uninitialized"),
-                ("accumulator", ""),
+            ("", "accumulator register is uninitialized"),
+            ("accumulator", ""),
         ):
             with self.subTest(region_name=region_name, reason=reason):
                 with self.assertRaises(ValueError):
@@ -453,7 +469,7 @@ class StorageComponentTests(unittest.TestCase):
 
 
 class DeviceStateTests(unittest.TestCase):
-    """Test typed sparse storage and strict initialization tracking."""
+    """Check address-based reads and writes and reject reads of unwritten values."""
 
     def test_all_state_regions_begin_uninitialized(self) -> None:
         """Reject reads from every region until an initializer writes it."""
@@ -578,10 +594,10 @@ class DeviceStateTests(unittest.TestCase):
 
         for address in invalid_addresses:
             for access in (
-                    lambda address=address: state.write_accumulator(address, 1.0),
-                    lambda address=address: state.read_accumulator(address),
-                    lambda address=address: state.write_activation_result(address, 1.0),
-                    lambda address=address: state.read_activation_result(address),
+                lambda address=address: state.write_accumulator(address, 1.0),
+                lambda address=address: state.read_accumulator(address),
+                lambda address=address: state.write_activation_result(address, 1.0),
+                lambda address=address: state.read_activation_result(address),
             ):
                 with self.subTest(address=address, access=access):
                     with self.assertRaises(ValueError):
@@ -635,7 +651,9 @@ class DeviceStateTests(unittest.TestCase):
             SharedBufferWriteEffect(address=shared_address, values=(1.0, 2.0)),
             GlobalBufferWriteEffect(
                 address=CentGlobalBufferAddress(channel=0, column=7),
-                # Only one scalar fits at column seven in the eight-column GB.
+                # Only one scalar fits at column 7 in an eight-column
+                # Global Buffer. Rejecting this later write must also discard
+                # the earlier proposed Shared Buffer write.
                 values=(3.0, 4.0),
             ),
         )
@@ -721,7 +739,7 @@ class DeviceStateTests(unittest.TestCase):
         )
 
     def test_batch_commit_reuses_prepared_dense_components(self) -> None:
-        """Apply several writes through one clone of each touched buffer."""
+        """Keep earlier writes when later writes target the same copied buffer."""
 
         state = CentDeviceState(hardware=hardware())
         state.commit_effects(
@@ -761,7 +779,7 @@ class DeviceStateTests(unittest.TestCase):
         )
 
     def test_batch_commit_clones_only_touched_storage_components(self) -> None:
-        """Preserve component identity for regions absent from a transaction."""
+        """Keep existing storage objects when the commit does not write to them."""
 
         state = CentDeviceState(hardware=hardware())
         original_dram = state._dram
@@ -775,9 +793,9 @@ class DeviceStateTests(unittest.TestCase):
         self.assertIsNot(state._dram, original_dram)
         self.assertIs(state._shared_buffer, original_shared)
         for current, original in zip(
-                state._global_buffers,
-                original_globals,
-                strict=True,
+            state._global_buffers,
+            original_globals,
+            strict=True,
         ):
             self.assertIs(current, original)
 
@@ -799,7 +817,7 @@ class DeviceStateTests(unittest.TestCase):
         self.assertIsNot(state._global_buffers[1], globals_after_write[1])
 
     def test_host_conversion_is_separate_from_stored_value_transport(self) -> None:
-        """Quantize host values once and copy their stored representation unchanged."""
+        """Convert host values once and copy the resulting numbers unchanged."""
 
         numeric = CountingStoreSemantics()
         state = CentDeviceState(hardware=hardware(), numeric=numeric)
@@ -855,7 +873,7 @@ class InstructionEffectPreparationTests(unittest.TestCase):
     """Directly test dispatch and every private instruction kernel."""
 
     def test_prepare_write_single_bank_returns_one_dram_effect(self) -> None:
-        """Map complete Shared Buffer source slots to the instruction address."""
+        """Copy two two-lane source slots to four consecutive DRAM columns."""
 
         state = CentDeviceState(hardware=hardware())
         source = CentSharedBufferAddress(slot=1)
@@ -881,7 +899,7 @@ class InstructionEffectPreparationTests(unittest.TestCase):
         )
 
     def test_prepare_read_single_bank_returns_one_shared_effect(self) -> None:
-        """Map the exact DRAM burst span to its Shared Buffer destination."""
+        """Read four consecutive DRAM scalars into two two-lane Shared Buffer slots."""
 
         state = CentDeviceState(hardware=hardware())
         source = memory_address(channel=1, bank=3, row=1, column=2)
@@ -912,6 +930,8 @@ class InstructionEffectPreparationTests(unittest.TestCase):
         state = CentDeviceState(hardware=hardware())
         source = CentSharedBufferAddress(slot=0)
         state.write_shared_buffer(source, (2.0, 3.0))
+        # Channel sets sort their members, so input order (1, 0) still yields
+        # writes for channel 0 then channel 1. Both get the same two values.
         instruction = WriteGlobalBuffer(
             channels=CentChannelSet(channels=(1, 0)),
             operation_size=1,
@@ -937,7 +957,7 @@ class InstructionEffectPreparationTests(unittest.TestCase):
         )
 
     def test_prepare_copy_bank_to_global_buffer_keeps_channels_independent(
-            self,
+        self,
     ) -> None:
         """Read each selected channel's named bank into its own Global Buffer."""
 
@@ -982,7 +1002,7 @@ class InstructionEffectPreparationTests(unittest.TestCase):
         )
 
     def test_prepare_copy_global_buffer_to_bank_keeps_channels_independent(
-            self,
+        self,
     ) -> None:
         """Read each selected Global Buffer into the same bank coordinates."""
 
@@ -1037,14 +1057,16 @@ class InstructionEffectPreparationTests(unittest.TestCase):
         )
 
     def test_prepare_elementwise_multiply_returns_every_group_result(self) -> None:
-        """Produce one product effect for each four-bank processing-unit group."""
+        """Prepare bank 0 times bank 1 into bank 2, and bank 4 times bank 5 into bank 6."""
 
         state = CentDeviceState(hardware=hardware())
+        # Matching positions multiply independently: (1*3, 2*4) = (3, 8)
+        # in bank 2, and (5*7, 6*8) = (35, 48) in bank 6.
         for bank, values in (
-                (0, (1.0, 2.0)),
-                (1, (3.0, 4.0)),
-                (4, (5.0, 6.0)),
-                (5, (7.0, 8.0)),
+            (0, (1.0, 2.0)),
+            (1, (3.0, 4.0)),
+            (4, (5.0, 6.0)),
+            (5, (7.0, 8.0)),
         ):
             state.write_dram(memory_address(bank=bank), values)
         instruction = ElementwiseMultiply(
@@ -1204,6 +1226,8 @@ class InstructionEffectPreparationTests(unittest.TestCase):
             behavior.instruction_type for behavior in _INSTRUCTION_BEHAVIORS
         )
         expected_types = {
+            MacAllBanks,
+            ReferenceInstruction,
             Accumulate,
             CopyBankToGlobalBuffer,
             CopyGlobalBufferToBank,
@@ -1234,7 +1258,7 @@ class InstructionEffectPreparationTests(unittest.TestCase):
         self.assertIs(behavior.instruction_type, WriteSingleBank)
 
     def test_instruction_behavior_rejects_a_mismatched_direct_call(self) -> None:
-        """Defend the type-erased handler boundary against caller mistakes."""
+        """Reject addition passed directly to a handler registered for bank writes."""
 
         state = CentDeviceState(hardware=hardware())
         behavior = _InstructionBehavior(
@@ -1317,7 +1341,7 @@ class TransferExecutionTests(unittest.TestCase):
         )
 
     def test_write_global_buffer_honors_channel_mask(self) -> None:
-        """Replicate source slots only to Global Buffers selected by CHmask."""
+        """Copy source slots only to channels selected by the channel mask."""
 
         state = CentDeviceState(hardware=hardware())
         state.write_shared_buffer(
@@ -1406,10 +1430,10 @@ class ArithmeticExecutionTests(unittest.TestCase):
         # Bank groups are 0-3 and 4-7. The products therefore land in banks 2
         # and 6, respectively, while bank 3 remains untouched.
         for bank, values in (
-                (0, (1.0, 2.0, 3.0, 4.0)),
-                (1, (5.0, 6.0, 7.0, 8.0)),
-                (4, (-1.0, -2.0, -3.0, -4.0)),
-                (5, (2.0, 3.0, 4.0, 5.0)),
+            (0, (1.0, 2.0, 3.0, 4.0)),
+            (1, (5.0, 6.0, 7.0, 8.0)),
+            (4, (-1.0, -2.0, -3.0, -4.0)),
+            (5, (2.0, 3.0, 4.0, 5.0)),
         ):
             state.write_dram(memory_address(bank=bank, column=2), values)
         instruction = ElementwiseMultiply(
@@ -1470,7 +1494,7 @@ class ArithmeticExecutionTests(unittest.TestCase):
 
 
 class FailureSemanticsTests(unittest.TestCase):
-    """Test preflight and per-instruction transactional behavior."""
+    """Check whole-program support scans and all-or-none writes per instruction."""
 
     def test_unsupported_preflight_prevents_any_program_mutation(self) -> None:
         """Reject a later unsupported opcode before an earlier valid write runs."""
@@ -1504,6 +1528,8 @@ class FailureSemanticsTests(unittest.TestCase):
     def test_preflight_rejects_partial_accumulate_overlap(self) -> None:
         """Reject overlap other than exact alias before changing Shared Buffer."""
 
+        # Three slots at destination 0 cover 0..2; three at source 1 cover
+        # 1..3. They overlap only partly, so read/write ordering is unresolved.
         overlap_hardware = hardware(shared_buffer_slots=5)
         state = CentDeviceState(hardware=overlap_hardware)
         state.write_shared_buffer(
@@ -1533,6 +1559,8 @@ class FailureSemanticsTests(unittest.TestCase):
         """Read every source before committing any selected-channel result."""
 
         state = CentDeviceState(hardware=hardware())
+        # Channel 0 is readable but channel 1 has never been written. The
+        # failure in channel 1 must prevent even channel 0's result write.
         state.write_dram(memory_address(channel=0, bank=1), (7.0, 8.0))
         instruction = CopyBankToGlobalBuffer(
             channels=CentChannelSet(channels=(0, 1)),
@@ -1600,13 +1628,13 @@ class FailureSemanticsTests(unittest.TestCase):
         )
 
     def test_write_global_buffer_with_late_unset_lane_changes_no_channel(self) -> None:
-        """Preserve every selected Global Buffer when the SB snapshot is incomplete."""
+        """Leave both Global Buffers unchanged when a Shared Buffer lane is unwritten."""
 
         state = CentDeviceState(hardware=hardware())
         source = CentSharedBufferAddress(slot=0)
         for channel, values in (
-                (0, (10.0, 11.0, 12.0, 13.0)),
-                (1, (20.0, 21.0, 22.0, 23.0)),
+            (0, (10.0, 11.0, 12.0, 13.0)),
+            (1, (20.0, 21.0, 22.0, 23.0)),
         ):
             state.write_global_buffer(
                 CentGlobalBufferAddress(channel=channel, column=2),
@@ -1641,8 +1669,8 @@ class FailureSemanticsTests(unittest.TestCase):
 
         state = CentDeviceState(hardware=hardware())
         for channel, values in (
-                (0, (90.0, 91.0)),
-                (1, (92.0, 93.0)),
+            (0, (90.0, 91.0)),
+            (1, (92.0, 93.0)),
         ):
             state.write_dram(
                 memory_address(channel=channel, bank=3),
@@ -1673,16 +1701,16 @@ class FailureSemanticsTests(unittest.TestCase):
         )
 
     def test_elementwise_multiply_with_late_missing_group_writes_nothing(self) -> None:
-        """Preserve all PU results when a later group has an unset operand."""
+        """Preserve both result banks when the second four-bank group lacks an operand."""
 
         state = CentDeviceState(hardware=hardware())
         for bank, values in (
-                (0, (1.0, 2.0)),
-                (1, (3.0, 4.0)),
-                (2, (90.0, 91.0)),
-                (4, (5.0, 6.0)),
-                # Bank 5 is intentionally uninitialized in the second PU group.
-                (6, (92.0, 93.0)),
+            (0, (1.0, 2.0)),
+            (1, (3.0, 4.0)),
+            (2, (90.0, 91.0)),
+            (4, (5.0, 6.0)),
+            # Bank 5 is intentionally uninitialized in the second PU group.
+            (6, (92.0, 93.0)),
         ):
             state.write_dram(memory_address(bank=bank), values)
         instruction = ElementwiseMultiply(
@@ -1727,17 +1755,20 @@ class FailureSemanticsTests(unittest.TestCase):
         )
 
     def test_late_numeric_failure_changes_no_elementwise_result_bank(self) -> None:
-        """Compute all EW_MUL effects before committing any processing-unit group."""
+        """Preserve both result banks when multiplication fails in the second group."""
 
+        # Two lanes in the first bank group use calls 1 and 2. Call 3 fails
+        # at the first lane of the second group, whose result bank is 6.
+        # Neither bank 2 nor bank 6 may lose its preloaded values.
         numeric = FailingArithmeticSemantics(fail_multiply_at=3)
         state = CentDeviceState(hardware=hardware(), numeric=numeric)
         for bank, values in (
-                (0, (1.0, 2.0)),
-                (1, (3.0, 4.0)),
-                (2, (90.0, 91.0)),
-                (4, (5.0, 6.0)),
-                (5, (7.0, 8.0)),
-                (6, (92.0, 93.0)),
+            (0, (1.0, 2.0)),
+            (1, (3.0, 4.0)),
+            (2, (90.0, 91.0)),
+            (4, (5.0, 6.0)),
+            (5, (7.0, 8.0)),
+            (6, (92.0, 93.0)),
         ):
             state.write_dram(memory_address(bank=bank), values)
         instruction = ElementwiseMultiply(
@@ -1748,8 +1779,8 @@ class FailureSemanticsTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(
-                CentExecutionFault,
-                "configured multiply",
+            CentExecutionFault,
+            "configured multiply",
         ) as raised:
             execute_program(program(instruction), state)
 
@@ -1766,6 +1797,8 @@ class FailureSemanticsTests(unittest.TestCase):
     def test_late_numeric_failure_preserves_accumulate_destination(self) -> None:
         """Keep all ACC lanes and report its destination when addition fails."""
 
+        # The first lane can be computed, but the second addition fails.
+        # Keeping (1, 2) proves the first lane was not written prematurely.
         numeric = FailingArithmeticSemantics(fail_add_at=2)
         state = CentDeviceState(hardware=hardware(), numeric=numeric)
         destination = CentSharedBufferAddress(slot=0)
@@ -1779,8 +1812,8 @@ class FailureSemanticsTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(
-                CentExecutionFault,
-                "configured add",
+            CentExecutionFault,
+            "configured add",
         ) as raised:
             execute_program(program(instruction), state)
 
@@ -1791,7 +1824,7 @@ class FailureSemanticsTests(unittest.TestCase):
         )
 
     def test_program_keeps_completed_prefix_when_later_instruction_faults(self) -> None:
-        """Commit completed instructions but keep a failing instruction atomic."""
+        """Keep earlier completed instructions while discarding the failing one's writes."""
 
         state = CentDeviceState(hardware=hardware())
         state.write_shared_buffer(CentSharedBufferAddress(slot=0), (3.0, 4.0))

@@ -20,7 +20,7 @@ __all__ = [
 ]
 
 
-# Near-bank PU instructions -------------------------------------------------
+# Near-bank processing-unit (PU) instructions -------------------------------------------------
 #
 # These instructions run beside the DRAM banks. CHmask chooses the channels,
 # OPsize chooses the number of repeated operations, RO/CO give the first DRAM
@@ -28,12 +28,16 @@ __all__ = [
 
 
 class MacOperandSource(Enum):
-    """Select the nonlocal input consumed by ``MAC_ABK``.
+    """Choose where a bank reads the second input of a multiply-accumulate.
+
+    A multiply-accumulate multiplies input pairs and adds their products to a
+    stored running sum. Here the first input lives in a DRAM bank; the second
+    comes from the channel's Global Buffer or a neighboring bank.
 
     AiM exposes this choice through configuration register zero rather than an
     operand in the textual ``MAC_ABK`` instruction. Keeping the state explicit
-    in the compiler IR prevents two different calculations from becoming the
-    same apparent instruction.
+    in the compiler's intermediate representation (IR) prevents two different
+    calculations from becoming the same apparent instruction.
 
     Members:
         GLOBAL_BUFFER: Multiply each bank value by the channel Global Buffer.
@@ -49,13 +53,16 @@ class MacAllBanks(CentInstruction):
     """Multiply values in every selected bank and add them to registers.
 
     This is ``MAC_ABK CHmask OPsize RO CO Regid`` in the paper. Each multiply
-    uses data starting at ``RO``/``CO`` and adds its result to ``Regid``.
+    uses data starting at ``RO``/``CO`` and adds its result to ``Regid``. The
+    register must already contain the desired starting sum. ``channels``
+    selects whole channels, not individual banks within them.
 
     Attributes:
         channels: Physical channels that perform the operation, or ``CHmask``.
         operation_size: Number of burst-sized operations, or ``OPsize``.
         row: First DRAM row, or ``RO``.
-        column: First scalar position in that row, or ``CO``.
+        column: First scalar position in that row under the current Python
+            address convention; see ``CentMemoryAddress`` for hardware units.
         accumulation_register: Register that receives the running sum, or
             ``Regid``.
         operand_source: Location of the second multiply input. The AiM target
@@ -100,19 +107,25 @@ class ElementwiseMultiply(CentInstruction):
     """Multiply corresponding values stored in neighboring banks.
 
     This is ``EW_MUL CHmask OPsize RO CO`` in the paper. Within each four-bank
-    processing-unit group, banks zero and one are inputs and bank two receives
-    the result. These roles are defined by CENT's functional reference model;
-    the instruction therefore does not carry explicit bank operands.
+    group, banks zero and one are inputs and bank two receives the result.
+    These roles are defined by CENT's functional reference model; this is a
+    software convention, not a universal hardware bank mapping. The typed
+    instruction has no explicit bank operands.
 
     Attributes:
         channels: Physical channels that perform the operation, or ``CHmask``.
         operation_size: Number of burst-sized operations, or ``OPsize``.
         row: First DRAM row, or ``RO``.
-        column: First scalar position in that row, or ``CO``.
-        FIRST_OPERAND_BANK: Position of the first input within each PU group.
-        SECOND_OPERAND_BANK: Position of the second input within each PU group.
-        RESULT_BANK: Position receiving the product within each PU group.
+        column: First scalar position in that row under the current Python
+            address convention; see ``CentMemoryAddress`` for hardware units.
+        FIRST_OPERAND_BANK: Position of the first input within each four-bank group.
+        SECOND_OPERAND_BANK: Position of the second input within each four-bank group.
+        RESULT_BANK: Position receiving the product within each four-bank group.
         OPCODE: Fixed ``EW_MUL`` instruction name.
+
+    Examples:
+        Under the reference bank mapping, values ``[2, 3]`` in bank zero and
+        ``[4, 5]`` in bank one produce ``[8, 15]`` in bank two.
     """
 
     channels: CentChannelSet
@@ -177,8 +190,9 @@ class ApplyActivation(CentInstruction):
 
 # PNM instructions ----------------------------------------------------------
 #
-# These instructions run in the PNM units. They read Shared Buffer slots from
-# Rs and write slots at Rd. OPsize says how many consecutive slots are handled.
+# Processing-near-memory (PNM) units operate outside the DRAM banks. These
+# instructions name Shared Buffer input Rs and output Rd. Current validation
+# treats OPsize as a slot count; the exact footprints still need a target contract.
 
 
 # TODO(emulator ABI): Define the exact EXP calculation.
@@ -216,24 +230,27 @@ class Exponent(CentInstruction):
         require_positive("operation_size", self.operation_size)
 
 
-# TODO(emulator ABI): Define the RED operation and result layout.
+# TODO(emulator ABI): Finish the RED output and numerical contract.
 #
-# The paper names this instruction "Reduction" but does not say whether it sums,
-# multiplies, finds a minimum or maximum, or supports a configurable operation.
-# We also need to know whether it combines lanes within each slot, combines
-# several slots, and where it writes the result.
+# CENT Figure 7(b) defines a sum of the 16 lanes in one slot; Section 4.2
+# puts that BF16 result in the destination's first lane. The other lanes,
+# rounding, and overlap behavior are not specified. OPsize repeats per-slot
+# work; a whole-vector sum needs a separate stage combining those results.
+# See docs/research/execution-contracts.md before adding numerical semantics.
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Reduction(CentInstruction):
-    """Request the paper's currently underspecified reduction operation.
+    """Sum the lanes within each Shared Buffer slot.
 
-    This is ``RED OPsize Rd Rs`` in the paper. The reduction operation and
-    output layout must be confirmed before numerical lowering can depend on it.
+    CENT Figure 7(b) and Section 4.2 define ``RED OPsize Rd Rs`` as independent
+    per-slot sums, each written to the destination slot's first lane. This is
+    not a sum across the entire input vector. Numerical execution remains
+    unsupported until the unused output lanes and rounding rules are defined.
 
     Attributes:
-        operation_size: Amount of work selected by ``OPsize``.
-        destination: First output slot, or ``Rd``.
+        operation_size: Number of consecutive slots to reduce, or ``OPsize``.
+        destination: First output slot, or ``Rd``; each result occupies lane zero.
         source: First input slot, or ``Rs``.
         OPCODE: Fixed ``RED`` instruction name.
     """
@@ -265,12 +282,18 @@ class Accumulate(CentInstruction):
 
     This is ``ACC OPsize Rd Rs`` in the paper. Each lane performs
     ``Rd[i] = Rd[i] + Rs[i]``, so ``Rd`` must already contain valid values.
+    A lane is one scalar position inside a slot.
 
     Attributes:
         operation_size: Number of slots to add, or ``OPsize``.
         destination: First input-and-output slot, or ``Rd``.
         source: First slot whose values are added, or ``Rs``.
         OPCODE: Fixed ``ACC`` instruction name.
+
+    Examples:
+        Under reference-math execution, destination values ``[10, 20]`` plus source
+        values ``[1, 2]`` become ``[11, 22]``. This example does not specify
+        hardware rounding or overlap behavior.
     """
 
     operation_size: int
@@ -296,14 +319,15 @@ class Accumulate(CentInstruction):
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class RunRiscV(CentInstruction):
-    """Start code on the PNM RISC-V cores.
+    """Start a routine on the processing-near-memory RISC-V cores.
 
     This is ``RISCV OPsize PC Rd Rs`` in the paper. ``PC`` chooses the code,
     ``Rs`` supplies its inputs, and ``Rd`` receives its outputs.
 
     Attributes:
         operation_size: Number of work items, or ``OPsize``.
-        program_counter: Address of the first RISC-V instruction, or ``PC``.
+        program_counter: Entry address of the RISC-V routine, or ``PC``. Its
+            address units and calling convention still need a target definition.
         destination: First output Shared Buffer slot, or ``Rd``.
         source: First input Shared Buffer slot, or ``Rs``.
         OPCODE: Fixed ``RISCV`` instruction name.

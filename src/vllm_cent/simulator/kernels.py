@@ -1,7 +1,13 @@
-"""Prepare immutable physical effects for supported CENT instructions."""
+"""Read instruction operands and compute proposed writes without applying them.
+
+A kernel is the function implementing one instruction's calculation or copy.
+It reads every source before returning the writes to commit. Instruction
+``operation_size`` counts transfer bursts, each containing
+``hardware.burst_length`` scalars. DRAM means dynamic random-access memory.
+"""
 
 from vllm_cent.cent import (
-    BANKS_PER_PU,
+    BANKS_PER_GROUP,
     Accumulate,
     CentGlobalBufferAddress,
     CentMemoryAddress,
@@ -56,13 +62,14 @@ class _KernelArithmeticError(Exception):
 
 
 def _prepare_write_single_bank(
-        instruction: WriteSingleBank,
-        state: CentDeviceState,
+    instruction: WriteSingleBank,
+    state: CentDeviceState,
 ) -> _InstructionEffects:
-    """Prepare ``WR_SBK`` by snapshotting complete source slots.
+    """Copy Shared Buffer values to one memory bank (``WR_SBK``).
 
     Args:
-        instruction: Single-bank write to prepare.
+        instruction: Source Shared Buffer slot, destination bank address, and
+            number of complete slots to copy.
         state: Device state containing the Shared Buffer source.
 
     Returns:
@@ -72,6 +79,8 @@ def _prepare_write_single_bank(
         CentUninitializedReadError: If any source lane is uninitialized.
     """
 
+    # Reading the full source first prevents a missing final lane from leaving
+    # a partially copied destination. Transfers preserve stored numbers as-is.
     values = state.read_shared_buffer(
         instruction.source,
         slot_count=instruction.operation_size,
@@ -88,13 +97,14 @@ def _prepare_write_single_bank(
 
 
 def _prepare_read_single_bank(
-        instruction: ReadSingleBank,
-        state: CentDeviceState,
+    instruction: ReadSingleBank,
+    state: CentDeviceState,
 ) -> _InstructionEffects:
-    """Prepare ``RD_SBK`` by snapshotting its complete DRAM source span.
+    """Copy consecutive values from one memory bank to Shared Buffer (``RD_SBK``).
 
     Args:
-        instruction: Single-bank read to prepare.
+        instruction: Source bank address, destination Shared Buffer slot, and
+            number of bursts to copy.
         state: Device state containing the DRAM source.
 
     Returns:
@@ -123,13 +133,14 @@ def _prepare_read_single_bank(
 
 
 def _prepare_write_global_buffer(
-        instruction: WriteGlobalBuffer,
-        state: CentDeviceState,
+    instruction: WriteGlobalBuffer,
+    state: CentDeviceState,
 ) -> _InstructionEffects:
-    """Prepare ``WR_GB`` writes for every selected channel.
+    """Copy the same Shared Buffer values to each selected Global Buffer (``WR_GB``).
 
     Args:
-        instruction: Broadcast Global Buffer write to prepare.
+        instruction: Source Shared Buffer slot, selected channels, starting
+            Global Buffer column, and number of slots to copy.
         state: Device state containing the Shared Buffer source.
 
     Returns:
@@ -139,6 +150,8 @@ def _prepare_write_global_buffer(
         CentUninitializedReadError: If any source lane is uninitialized.
     """
 
+    # Reading the full source first prevents a missing final lane from leaving
+    # a partially copied destination. Transfers preserve stored numbers as-is.
     values = state.read_shared_buffer(
         instruction.source,
         slot_count=instruction.operation_size,
@@ -164,13 +177,14 @@ def _prepare_write_global_buffer(
 
 
 def _prepare_copy_bank_to_global_buffer(
-        instruction: CopyBankToGlobalBuffer,
-        state: CentDeviceState,
+    instruction: CopyBankToGlobalBuffer,
+    state: CentDeviceState,
 ) -> _InstructionEffects:
-    """Prepare each selected channel's ``COPY_BKGB`` write.
+    """Copy each channel's selected bank into its Global Buffer (``COPY_BKGB``).
 
     Args:
-        instruction: Bank-to-Global-Buffer copy to prepare.
+        instruction: Channels, source bank/row/column, and number of bursts.
+            Each channel writes its own Global Buffer at the same column.
         state: Device state containing each selected channel's DRAM source.
 
     Returns:
@@ -204,13 +218,14 @@ def _prepare_copy_bank_to_global_buffer(
 
 
 def _prepare_copy_global_buffer_to_bank(
-        instruction: CopyGlobalBufferToBank,
-        state: CentDeviceState,
+    instruction: CopyGlobalBufferToBank,
+    state: CentDeviceState,
 ) -> _InstructionEffects:
-    """Prepare each selected channel's ``COPY_GBBK`` write.
+    """Copy each channel's Global Buffer into its selected bank (``COPY_GBBK``).
 
     Args:
-        instruction: Global-Buffer-to-bank copy to prepare.
+        instruction: Channels, destination bank/row/column, and burst count.
+            Each channel reads its own Global Buffer at the same column.
         state: Device state containing each selected channel's Global Buffer.
 
     Returns:
@@ -247,28 +262,38 @@ def _prepare_copy_global_buffer_to_bank(
 
 
 def _prepare_elementwise_multiply(
-        instruction: ElementwiseMultiply,
-        state: CentDeviceState,
+    instruction: ElementwiseMultiply,
+    state: CentDeviceState,
 ) -> _InstructionEffects:
-    """Prepare every four-bank group's lane-wise ``EW_MUL`` result.
+    """Multiply matching scalar positions within each four-bank group (``EW_MUL``).
+
+    Each processing unit (PU) serves four banks. Fixed bank offsets select its
+    two operands and result within that group.
 
     Args:
-        instruction: Elementwise multiplication to prepare.
+        instruction: Channels, row, starting column, and burst count shared
+            by all four-bank groups participating in the multiplication.
         state: Device state containing all selected operand banks.
 
     Returns:
-        Two operand reads and one result write per selected PU group.
+        Two operand ranges and one proposed result write per four-bank group.
 
     Raises:
         CentUninitializedReadError: If any operand scalar is uninitialized.
         _KernelArithmeticError: If the numeric policy rejects multiplication.
+
+    Examples:
+        Groups beginning at banks 0 and 4 use the same operand and result
+        offsets within their own group; operands from the two groups never mix.
     """
 
     scalar_count = instruction.operation_size * state.hardware.burst_length
     reads: list[CentDramRegion] = []
     writes: list[CentWriteEffect] = []
+    # Banks are grouped by processing unit. Adding the fixed operand offsets
+    # to each group start keeps both operands within that same group.
     for channel in instruction.channels.channels:
-        for group_start in range(0, state.hardware.num_banks, BANKS_PER_PU):
+        for group_start in range(0, state.hardware.num_banks, BANKS_PER_GROUP):
             first_address = CentMemoryAddress(
                 channel=channel,
                 bank=group_start + ElementwiseMultiply.FIRST_OPERAND_BANK,
@@ -325,23 +350,30 @@ def _prepare_elementwise_multiply(
 
 
 def _prepare_accumulate(
-        instruction: Accumulate,
-        state: CentDeviceState,
+    instruction: Accumulate,
+    state: CentDeviceState,
 ) -> _InstructionEffects:
-    """Prepare lane-wise ``ACC`` sums from complete source snapshots.
+    """Add matching Shared Buffer positions into the destination (``ACC``).
+
+    Both source ranges are read before any write is applied. If source and
+    destination are the same range, each old value is therefore doubled.
+    Partly overlapping ranges must already have been rejected by preflight.
 
     Args:
-        instruction: Shared Buffer accumulation to prepare.
+        instruction: Source slot, destination slot, and number of slots.
+            Each destination value is added to the corresponding source value.
         state: Device state containing both input spans.
 
     Returns:
-        Both Shared Buffer reads and one in-place destination write.
+        The two read ranges and a proposed write replacing destination values.
 
     Raises:
         CentUninitializedReadError: If either input span is incomplete.
         _KernelArithmeticError: If the numeric policy rejects addition.
     """
 
+    # Snapshot both operands before calculating writes. Exact source/destination
+    # overlap must use the old values for every lane, including later lanes.
     destination_values = state.read_shared_buffer(
         instruction.destination,
         slot_count=instruction.operation_size,

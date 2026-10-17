@@ -519,7 +519,7 @@ they are established from the paper, hardware owners, or the execution target.
 
 ### 13.4 Inactive work
 
-Channel masks do not disable individual PU groups. The compiler must either:
+Channel masks do not disable individual bank groups. The compiler must either:
 
 - initialize every inactive input to a mathematically neutral value and ignore
   its raw result; or
