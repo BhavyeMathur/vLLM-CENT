@@ -10,9 +10,10 @@ these names.
 
 No stage in this module chooses physical addresses. Additions,
 multiplications, copies, order-preserving reshapes, linear transforms, RMS
-normalization, activations, softmax, and fused attention reach the device
-form. Other IR operations, such as RoPE, KV-cache updates, the decomposed
-attention steps, and all-reduce, are rejected with ``NotImplementedError``.
+normalization, activations, softmax, rotary embedding, and fused attention
+reach the device form. Other IR operations, such as KV-cache updates, the
+decomposed attention steps, and all-reduce, are rejected with
+``NotImplementedError``.
 """
 
 from dataclasses import dataclass
@@ -32,6 +33,7 @@ from ..ir import (
     Operation,
     ReshapeOp,
     RMSNormOp,
+    RopeOp,
     SoftmaxOp,
     SplitHeadsOp,
     TensorType,
@@ -48,6 +50,7 @@ __all__ = [
     "DeviceOperationKind",
     "DeviceRankGraph",
     "DeviceRmsNormOperation",
+    "DeviceRopeOperation",
     "MemorySpace",
     "NameValue",
     "legalize",
@@ -100,6 +103,8 @@ class DeviceOperationKind(Enum):
         SOFTMAX: Normalize each last-dimension row into probabilities.
         RMS_NORM: Per-row square mean, reciprocal root, and learned scaling.
             Execution requires the reference scalar and broadcast contract.
+        ROPE: Rotate head vectors by angles looked up per token position.
+            Execution requires the reference rotary-embedding service.
     """
 
     PNM_ADD = "pnm_add"
@@ -111,6 +116,7 @@ class DeviceOperationKind(Enum):
     ACTIVATION = "activation"
     SOFTMAX = "softmax"
     ATTENTION = "attention"
+    ROPE = "rope"
 
 
 class MemorySpace(Enum):
@@ -136,7 +142,8 @@ class CapabilityProfile:
         supported_operations: Device operation kinds that the backend can lower.
             An empty set rejects every operation; the default enables addition,
             multiplication, copy, reshape, linear transforms, normalization,
-            nonlinear functions, and supplied-tensor attention. Target mapping separately requires reference
+            nonlinear functions, rotary embedding, and supplied-tensor
+            attention. Target mapping separately requires reference
             opt-in for accumulator, scalar, and nonlinear computations.
 
     Examples:
@@ -155,6 +162,7 @@ class CapabilityProfile:
             DeviceOperationKind.ACTIVATION,
             DeviceOperationKind.SOFTMAX,
             DeviceOperationKind.ATTENTION,
+            DeviceOperationKind.ROPE,
         }
     )
 
@@ -250,6 +258,25 @@ class DeviceRmsNormOperation(DeviceOperation):
     """
 
     epsilon: float
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class DeviceRopeOperation(DeviceOperation):
+    """Retain how a rotary embedding pairs the rotated elements.
+
+    Attributes:
+        name: Name of the rotated result.
+        kind: ``DeviceOperationKind.ROPE``.
+        inputs: Head vectors, positions, and angle table names, in that order.
+        output: Rotated result name with the unchanged head-vector type.
+        dependencies: Operations producing the inputs.
+        memory_space: Shared Buffer storage at operation boundaries.
+        block: Source model-block label.
+        is_neox_style: True pairs element ``i`` with ``i + rotary_dim // 2``;
+            False pairs ``2i`` with ``2i + 1``.
+    """
+
+    is_neox_style: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -380,8 +407,9 @@ def _check_backend_types(function: Function, names: dict[Value, str]) -> None:
         names: Printed name of every value, for the error message.
 
     Raises:
-        NotImplementedError: If a tensor is not fp32. The functional simulator
-            computes with Python floats; other formats have no lowering yet.
+        NotImplementedError: If a tensor is not fp32, other than RoPE's
+            integer positions. The functional simulator computes with Python
+            floats; other formats have no lowering yet.
         ValueError: If a tensor has a zero-length dimension and so no element
             to store.
     """
@@ -389,8 +417,12 @@ def _check_backend_types(function: Function, names: dict[Value, str]) -> None:
         *function.operands,
         *(result for op in function.operations for result in op.results),
     )
+    # A RoPE position only selects a table row. It is stored as a scalar value,
+    # which holds every integer below 2**24 exactly, so integer dtypes are safe.
+    positions = {op.positions for op in function.operations if isinstance(op, RopeOp)}
     for value in values:
-        if value.type.dtype is not DType.FP32:
+        # RopeOp itself requires the positions to be int32 or int64.
+        if value not in positions and value.type.dtype is not DType.FP32:
             raise NotImplementedError(
                 f"The CENT pipeline supports fp32 tensors only; "
                 f"{names[value]} is {value.type.dtype}"
@@ -432,6 +464,8 @@ def _device_kind(op: Operation, name: str) -> DeviceOperationKind:
         return DeviceOperationKind.SOFTMAX
     if isinstance(op, RMSNormOp):
         return DeviceOperationKind.RMS_NORM
+    if isinstance(op, RopeOp):
+        return DeviceOperationKind.ROPE
     raise NotImplementedError(f"No device legalization for {op.NAME} ({name})")
 
 
@@ -479,6 +513,16 @@ def _device_operation(
             dependencies=dependencies,
             block=block,
             function=op.function,
+        )
+    if isinstance(op, RopeOp):
+        return DeviceRopeOperation(
+            name=name,
+            kind=kind,
+            inputs=inputs,
+            output=output,
+            dependencies=dependencies,
+            block=block,
+            is_neox_style=op.is_neox_style,
         )
     if isinstance(op, AttentionOp):
         return DeviceAttentionOperation(

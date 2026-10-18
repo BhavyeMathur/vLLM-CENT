@@ -73,6 +73,7 @@ class ReferenceOpcode(str, Enum):
         SOFTMAX: Normalize consecutive rows with negative-infinity masking.
         TRANSPOSE: Pack the transpose of a selected matrix slice.
         ATTENTION_SCORES: Scale one query score vector and apply its masks.
+        ROTARY_EMBEDDING: Rotate head vectors by table angles at given positions.
     """
 
     INITIALIZE_ACCUMULATOR = "REF_INITIALIZE_ACCUMULATOR"
@@ -87,6 +88,7 @@ class ReferenceOpcode(str, Enum):
     SOFTMAX = "REF_SOFTMAX"
     TRANSPOSE = "REF_TRANSPOSE"
     ATTENTION_SCORES = "REF_ATTENTION_SCORES"
+    ROTARY_EMBEDDING = "REF_ROTARY_EMBEDDING"
 
 
 class CentInstruction:

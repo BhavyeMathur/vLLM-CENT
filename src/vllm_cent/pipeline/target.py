@@ -19,7 +19,11 @@ from ..cent import (
     WriteSingleBank,
 )
 from ..cent.instructions import CentInstruction
-from ..cent.reference import ReferenceActivation, ReferenceSoftmax
+from ..cent.reference import (
+    ReferenceActivation,
+    ReferenceRotaryEmbedding,
+    ReferenceSoftmax,
+)
 from ..cent.utils import ceil_div
 from ..runtime import (
     CentExecutable,
@@ -33,6 +37,7 @@ from .ir import (
     DeviceRmsNormOperation,
     DeviceActivationOperation,
     DeviceAttentionOperation,
+    DeviceRopeOperation,
 )
 from .attention_codegen import (
     AttentionCommand,
@@ -40,6 +45,7 @@ from .attention_codegen import (
     _emit_attention,
 )
 from .nonlinear import ActivationCommand, SoftmaxCommand
+from .rotary import RopeCommand
 from .reference_codegen import (
     LinearCommand,
     _LinearBuffers,
@@ -140,6 +146,7 @@ class TargetProgram:
         | RmsNormCommand
         | ActivationCommand
         | SoftmaxCommand
+        | RopeCommand
         | AttentionCommand,
         ...,
     ]
@@ -200,6 +207,7 @@ def lower_target(request: MappingRequest, mapping: MappingPlan) -> TargetProgram
         | RmsNormCommand
         | ActivationCommand
         | SoftmaxCommand
+        | RopeCommand
         | AttentionCommand
     ] = []
     values = {value.name: value for value in _values(rank)}
@@ -298,6 +306,28 @@ def lower_target(request: MappingRequest, mapping: MappingPlan) -> TargetProgram
                     destination=destination,
                     value_count=op.output.type.numel,
                     function=op.function,
+                    operation=name,
+                )
+            )
+            continue
+        if isinstance(op, DeviceRopeOperation):
+            # x is [*tokens, heads, head_dim] and the table is
+            # [positions, rotary_dim]. Each token has one position; all
+            # leading dimensions together count the tokens.
+            heads, head_dim = op.output.type.shape[-2:]
+            table_type = values[op.inputs[2]].type
+            commands.append(
+                RopeCommand(
+                    source=left,
+                    positions=locations[op.inputs[1]],
+                    table=locations[op.inputs[2]],
+                    destination=destination,
+                    token_count=op.output.type.numel // (heads * head_dim),
+                    head_count=heads,
+                    head_dim=head_dim,
+                    rotary_dim=table_type.shape[1],
+                    position_count=table_type.shape[0],
+                    is_neox_style=op.is_neox_style,
                     operation=name,
                 )
             )
@@ -488,6 +518,22 @@ def _emit_commands(
                     destination=addresses[command.destination],
                     value_count=command.value_count,
                     function=command.function,
+                )
+            )
+            continue
+        if isinstance(command, RopeCommand):
+            instructions.append(
+                ReferenceRotaryEmbedding(
+                    source=addresses[command.source],
+                    positions=addresses[command.positions],
+                    table=addresses[command.table],
+                    destination=addresses[command.destination],
+                    token_count=command.token_count,
+                    head_count=command.head_count,
+                    head_dim=command.head_dim,
+                    rotary_dim=command.rotary_dim,
+                    position_count=command.position_count,
+                    is_neox_style=command.is_neox_style,
                 )
             )
             continue

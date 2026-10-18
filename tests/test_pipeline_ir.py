@@ -33,6 +33,7 @@ from vllm_cent.pipeline.ir import (
     DeviceOperationKind,
     DeviceRankGraph,
     DeviceRmsNormOperation,
+    DeviceRopeOperation,
     NameValue,
     legalize,
     verify_device,
@@ -256,6 +257,45 @@ class LegalizeTests(unittest.TestCase):
                     ),
                 )
 
+    def test_rope_keeps_its_pairing_and_integer_positions(self) -> None:
+        """RoPE becomes ROPE; its int64 positions are allowed, unlike other tensors.
+
+        x is (3, 2, 4): three tokens of two heads of width four. Each token
+        has one position, so positions is (3,); the table has eight rows of
+        four rotary values (two cosines, two sines).
+        """
+        for is_neox_style in (True, False):
+            with self.subTest(is_neox_style=is_neox_style):
+                x = argument("x", 3, 2, 4)
+                positions = argument("positions", 3, dtype=DType.INT64)
+                table = argument("table", 8, 4)
+                rope = RopeOp(
+                    operands=(x, positions, table),
+                    is_neox_style=is_neox_style,
+                    name_hint="attn.q",
+                )
+                source = function((x, positions, table), (rope,), rope.results)
+                self.assertEqual(
+                    rank_operations(source),
+                    (
+                        DeviceRopeOperation(
+                            name="attn.q",
+                            kind=DeviceOperationKind.ROPE,
+                            inputs=("x", "positions", "table"),
+                            output=NameValue("attn.q", tensor(3, 2, 4)),
+                            dependencies=(),
+                            block="attn",
+                            is_neox_style=is_neox_style,
+                        ),
+                    ),
+                )
+
+    def test_integer_tensor_outside_rope_is_unsupported(self) -> None:
+        """Only a RoPE position may be an integer; returning one directly is rejected."""
+        positions = argument("positions", 3, dtype=DType.INT64)
+        with self.assertRaisesRegex(NotImplementedError, "positions is int64"):
+            legalize(function((positions,), (), (positions,)), CapabilityProfile())
+
     def test_activation_keeps_its_formula(self) -> None:
         """The selected activation formula reaches the device operation unchanged."""
         x = argument("x", 2, 3)
@@ -466,25 +506,6 @@ class LegalizeRejectionTests(unittest.TestCase):
                 self.assertRaisesRegex(NotImplementedError, op_name),
             ):
                 legalize(source, CapabilityProfile())
-
-    def test_rope_is_unsupported(self) -> None:
-        """RoPE has no device lowering; the error names the operation.
-
-        ``RopeOp`` also needs int64 positions, which the fp32-only backend
-        cannot store. Legalization checks operation kinds before element
-        formats, so the missing lowering is reported rather than the tensor
-        type. The query (3, 2, 4) holds three tokens of two heads of width
-        four; the table has eight positions of four rotary values.
-        """
-        x = argument("x", 3, 2, 4)
-        positions = argument("positions", 3, dtype=DType.INT64)
-        table = argument("table", 8, 4)
-        rope = RopeOp(operands=(x, positions, table), name_hint="q")
-        with self.assertRaisesRegex(NotImplementedError, r"aloi\.rope \(q\)"):
-            legalize(
-                function((x, positions, table), (rope,), rope.results),
-                CapabilityProfile(),
-            )
 
     def test_results_must_be_present_and_unique(self) -> None:
         """A function returning nothing, or the same value twice, is rejected."""

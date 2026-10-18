@@ -303,6 +303,7 @@ def verify_mapping(request: MappingRequest, plan: MappingPlan) -> None:
         DeviceOperationKind.ACTIVATION,
         DeviceOperationKind.SOFTMAX,
         DeviceOperationKind.ATTENTION,
+        DeviceOperationKind.ROPE,
     )
     if (
         any(op.kind in reference_kinds for op in rank.operations)

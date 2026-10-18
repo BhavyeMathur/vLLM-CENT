@@ -25,6 +25,7 @@ __all__ = [
     "ReferenceInstruction",
     "ReferenceReduceSum",
     "ReferenceRmsScale",
+    "ReferenceRotaryEmbedding",
     "ReferenceSoftmax",
     "ReferenceStoreSlice",
     "ReferenceTranspose",
@@ -327,6 +328,65 @@ class ReferenceAttentionScores(ReferenceInstruction):
     OPCODE: ClassVar[ReferenceOpcode] = ReferenceOpcode.ATTENTION_SCORES
 
 
+# TODO(RoPE on hardware): The paper and the reference CENT code do not say
+# which steps of rotary embedding run on PIM banks, PNM units, or RISC-V cores.
+# The older structural lowering (lowering/transformer/attention.py) emits only
+# the element products. A physical form likely gathers the table rows of each
+# position, multiplies with EW_MUL, and adds the signed products with ACC.
+#
+# This service computes the complete rotation in software instead, like
+# ReferenceSoftmax. Replace it once the gather and pairing steps are defined.
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ReferenceRotaryEmbedding(ReferenceInstruction):
+    """Rotate every head vector by the angles stored for its token's position.
+
+    The source holds ``token_count * head_count`` head vectors of
+    ``head_dim`` scalars, token-major. The table holds one row per position:
+    ``rotary_dim // 2`` cosines followed by as many sines. For token ``t``
+    with position ``p``, each pair ``(a, b)`` of its first ``rotary_dim``
+    elements becomes ``(a * cos - b * sin, b * cos + a * sin)`` with the
+    angles of pair index ``i`` in row ``p``. The remaining elements are
+    copied unchanged. Inputs are read before any output is written, so the
+    destination may equal the source. Python arithmetic defines the result;
+    it requires ``ReferenceMathSemantics``. No physical table lookup or
+    pairing encoding is implied.
+
+    Attributes:
+        source: First slot of the head vectors.
+        positions: First slot of ``token_count`` positions. Each must be an
+            integer table row, stored as a scalar value.
+        table: First slot of ``position_count`` rows of ``rotary_dim`` values.
+        destination: First output slot; unused final lanes become zero.
+        token_count: Number of tokens; each has one position.
+        head_count: Head vectors per token, all rotated by that token's angles.
+        head_dim: Scalars in each head vector.
+        rotary_dim: Leading scalars of each head vector that are rotated.
+        position_count: Rows in the table.
+        is_neox_style: True pairs element ``i`` with ``i + rotary_dim // 2``
+            (Hugging Face and vLLM ``rotate_half``); False pairs ``2i`` with
+            ``2i + 1`` (GPT-J and Meta's original Llama code).
+
+    Examples:
+        With ``head_dim=4``, ``rotary_dim=4`` and NeoX pairing, a head
+        ``(a0, a1, b0, b1)`` uses pairs ``(a0, b0)`` and ``(a1, b1)``. A table
+        row ``(1, 0, 0, 1)`` holds ``cos=(1, 0)`` and ``sin=(0, 1)``, so the
+        result is ``(a0, -b1, b0, a1)``: pair 0 is kept and pair 1 turns by
+        ninety degrees.
+    """
+
+    source: CentSharedBufferAddress
+    positions: CentSharedBufferAddress
+    table: CentSharedBufferAddress
+    destination: CentSharedBufferAddress
+    token_count: int
+    head_count: int
+    head_dim: int
+    rotary_dim: int
+    position_count: int
+    is_neox_style: bool
+    OPCODE: ClassVar[ReferenceOpcode] = ReferenceOpcode.ROTARY_EMBEDDING
+
+
 def validate_reference(
     instruction: ReferenceInstruction, hardware: CentHardwareSpec
 ) -> None:
@@ -385,6 +445,28 @@ def validate_reference(
             span(instruction.mask, instruction.mask_offset + instruction.value_count)
         if instruction.causal_limit is not None and instruction.causal_limit < 0:
             raise ValueError("causal_limit cannot be negative")
+        return
+    if isinstance(instruction, ReferenceRotaryEmbedding):
+        if (
+            min(
+                instruction.token_count,
+                instruction.head_count,
+                instruction.head_dim,
+                instruction.rotary_dim,
+                instruction.position_count,
+            )
+            < 1
+        ):
+            raise ValueError("rotary embedding counts must be positive")
+        # Every rotated element needs a partner, so the rotated prefix is
+        # an even number of elements that fits inside one head vector.
+        if instruction.rotary_dim % 2 or instruction.rotary_dim > instruction.head_dim:
+            raise ValueError("rotary_dim must be even and at most head_dim")
+        count = instruction.token_count * instruction.head_count * instruction.head_dim
+        span(instruction.source, count)
+        span(instruction.destination, count)
+        span(instruction.positions, instruction.token_count)
+        span(instruction.table, instruction.position_count * instruction.rotary_dim)
         return
     if isinstance(instruction, ReferenceSoftmax):
         if instruction.row_count < 1 or instruction.row_width < 1:

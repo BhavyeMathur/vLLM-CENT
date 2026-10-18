@@ -8,6 +8,7 @@ coexists with the older model-specific structural compiler.
 
 from ..ir import Function
 from .artifact import CompiledArtifact, compile_target
+from .fuse_attention import fuse_attention
 from .ir import CapabilityProfile, legalize
 from .mapping import (
     AccumulatorPlacement,
@@ -43,6 +44,7 @@ __all__ = [
     "compile_mlir",
     "compile_target",
     "emit_program",
+    "fuse_attention",
     "lower_target",
     "verify_mapping",
 ]
@@ -59,22 +61,25 @@ def compile_graph(
 ) -> CompiledArtifact:
     """Turn a tensor calculation into a reusable CENT program, one stage at a time.
 
-    Select supported device operations, choose buffer reuse and operation
+    Fuse decomposed attention into the form the backend lowers, select
+    supported device operations, choose buffer reuse and operation
     order, then assign addresses and emit instructions. Each boundary checks
     the previous result. Static addition, multiplication, copy, and contiguous
     reshape run on device zero. Linear transforms, RMS normalization,
-    activations, softmax, and attention require the explicit reference
-    execution contract. Tensor shapes are known at compile time; elementwise
+    activations, softmax, rotary embedding, and attention require the
+    explicit reference execution contract. Tensor shapes are known at compile time; elementwise
     arithmetic does not broadcast.
 
     Args:
-        graph: IR function with fp32 tensors and static shapes. Its argument
-            and result names, as the IR printer shows them, name the program's
-            inputs and outputs. It contains no hardware addresses.
+        graph: IR function with fp32 tensors (RoPE positions may be int32 or
+            int64) and static shapes. Its argument and result names, as the IR
+            printer shows them, name the program's inputs and outputs. It
+            contains no hardware addresses.
         target: Hardware sizes and command limits used from mapping onward.
         capabilities: Device operations available for implementing the graph.
             ``None`` enables all implemented device operations.
-        mapping: Optional complete manual schedule and buffer assignment. When
+        mapping: Optional complete manual schedule and buffer assignment, over
+            the names of the function after attention fusion. When
             supplied, it is verified and ``mapper`` is not called.
         mapper: Callable that proposes a mapping when ``mapping`` is ``None``. The default
             reuses storage after its contents are no longer needed.
@@ -90,9 +95,12 @@ def compile_graph(
         NotImplementedError: If a tensor is not fp32, or a calculation or
             required capability has no lowering.
     """
-    # Legalization names every value and chooses device-supported operations.
+    # The backend lowers only fused attention, so rewrite decomposed chains
+    # first. Legalization then names every value and chooses device-supported
+    # operations.
     device = legalize(
-        graph, CapabilityProfile() if capabilities is None else capabilities
+        fuse_attention(graph),
+        CapabilityProfile() if capabilities is None else capabilities,
     )
     # Physical limits enter here. Manual and generated plans share the same
     # target-lowering verifier, so neither can bypass storage-safety checks.

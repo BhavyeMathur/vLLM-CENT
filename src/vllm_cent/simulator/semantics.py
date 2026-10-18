@@ -25,6 +25,7 @@ from vllm_cent.cent.reference import (
     ReferenceInstruction,
     ReferenceRmsScale,
     ReferenceActivation,
+    ReferenceRotaryEmbedding,
     ReferenceSoftmax,
 )
 from .reference import _prepare_reference, _prepare_mac
@@ -293,7 +294,13 @@ def _preflight_defined_instruction(
     """
 
     if isinstance(
-        instruction, (ReferenceRmsScale, ReferenceActivation, ReferenceSoftmax)
+        instruction,
+        (
+            ReferenceRmsScale,
+            ReferenceActivation,
+            ReferenceRotaryEmbedding,
+            ReferenceSoftmax,
+        ),
     ) and not isinstance(state.numeric, ReferenceMathSemantics):
         raise CentUnsupportedSemanticsError(
             "reference nonlinear arithmetic requires ReferenceMathSemantics",
