@@ -60,11 +60,14 @@ fast-math assumptions, dynamic types, and non-F32 types.
 `vllm_cent.ir.Operation` holds only what every calculation shares: its operand
 values, its inferred results, and an optional name hint such as the module path
 `mlp.gate_proj`. Each concrete type owns its parameters and infers its result
-type, so an invalid operation cannot be constructed. `AddOp`, `MulOp`, `CopyOp`,
-`ReshapeOp`, `LinearOp`, `RMSNormOp`, `ActivationOp`, `SoftmaxOp`, and
-`AllReduceOp` live in `ir/semantic.py`. Transformer operations (`SplitHeadsOp`,
-`MergeHeadsOp`, `RopeOp`, `KvUpdateOp`, `GqaQKOp`, `GqaSVOp`, and the fused
-`AttentionOp`) live in `ir/transformer.py`. Only `RMSNormOp` has `eps`.
+type, so an invalid operation cannot be constructed. Operations live in the
+`ir/semantic/` package, grouped by the rule that infers their result type:
+`tensor` (`CopyOp`, `ReshapeOp`), `elementwise` (`ActivationOp`, `AddOp`,
+`MulOp`), `linalg` (`LinearOp`), `normalization` (`RMSNormOp`, `SoftmaxOp`), and
+`collective` (`AllReduceOp`). Transformer operations live in
+`ir/semantic/transformer/`: `heads` (`SplitHeadsOp`, `MergeHeadsOp`), `rope`
+(`RopeOp`), `kv_cache` (`KvUpdateOp`), and `attention` (`GqaQKOp`, `GqaSVOp`, and
+the fused `AttentionOp`). Only `RMSNormOp` has `eps`.
 
 `Function.verify()` checks that every operand is defined before use. Target
 legalization remains a separate decision: `legalize()` maps each operation to a

@@ -15,7 +15,7 @@ from .semantic import (
     RMSNormOp,
     SoftmaxOp,
 )
-from .transformer import (
+from .semantic.transformer import (
     AttentionOp,
     GqaQKOp,
     GqaSVOp,

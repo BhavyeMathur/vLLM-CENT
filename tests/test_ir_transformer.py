@@ -5,7 +5,7 @@ from __future__ import annotations
 import unittest
 
 from vllm_cent.ir.base import Value
-from vllm_cent.ir.transformer import (
+from vllm_cent.ir.semantic.transformer import (
     AttentionOp,
     GqaQKOp,
     GqaSVOp,

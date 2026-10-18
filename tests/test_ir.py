@@ -34,7 +34,7 @@ VECTOR = TensorType(shape=(1, 4), dtype=DType.FP16)
 # ---------------------------------------------------------------------------
 # Test-only operations
 #
-# These exercise the Operation base class without depending on semantic.py.
+# These exercise the Operation base class without depending on any real op.
 # Subclasses only assign NAME and NUM_OPERANDS; the ClassVar declaration in
 # the base class keeps dataclass from treating them as fields.
 # ---------------------------------------------------------------------------

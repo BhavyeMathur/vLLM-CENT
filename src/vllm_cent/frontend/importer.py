@@ -33,7 +33,7 @@ from ..ir.semantic import (
     RMSNormOp,
     SoftmaxOp,
 )
-from ..ir.transformer import (
+from ..ir.semantic.transformer import (
     GqaQKOp,
     GqaSVOp,
     KvUpdateOp,
