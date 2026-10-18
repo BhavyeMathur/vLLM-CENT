@@ -235,6 +235,21 @@ class LayerTest(unittest.TestCase):
         x = torch.randn(2, 3, 16)
         torch.testing.assert_close(layer(x), reference(x))
 
+    def test_rms_norm_layer_without_weight(self) -> None:
+        """Without elementwise_affine there is no weight; the op has one operand."""
+
+        layer = aloi.RMSNorm(4, 1e-5, elementwise_affine=False)
+        reference = nn.RMSNorm(4, 1e-5, elementwise_affine=False)
+        self.assertEqual(list(layer.named_parameters()), [])
+        x = torch.randn(2, 4)
+        torch.testing.assert_close(layer(x), reference(x))
+        # _op_line keeps the layer as its wrapper's ``function`` submodule, so
+        # the result is named after that module path.
+        self.assertEqual(
+            _op_line(layer, 1, 4),
+            "%function = aloi.rms_norm(%x) {eps = 1e-05} : tensor<1x4xfp32>",
+        )
+
     def test_layer_exports_as_its_op(self) -> None:
         """The exported graph holds the op node, not the module."""
 
@@ -651,6 +666,77 @@ def _op_line(function: Callable[[Tensor], Tensor], *shape: int) -> str:
     return _import(_Unary(function), _meta_input(*shape)).splitlines()[3].strip()
 
 
+class _Experts(nn.Module):
+    """Wrap a MoEExperts layer so its parameters get the ``experts.`` prefix."""
+
+    def __init__(self, experts: aloi.MoEExperts) -> None:
+        """Keep the layer.
+
+        Args:
+            experts: The experts to run.
+        """
+        super().__init__()
+        self.experts = experts
+
+    def forward(self, x: Tensor, routing_weights: Tensor) -> Tensor:
+        """Run the experts.
+
+        Args:
+            x: ``[tokens, hidden]``.
+            routing_weights: ``[tokens, experts]``.
+
+        Returns:
+            ``[tokens, hidden]``.
+        """
+        output: Tensor = self.experts(x, routing_weights)
+        return output
+
+
+class Llama4KernelTest(unittest.TestCase):
+    """The eager kernels of the Llama 4 ops compute their documented formulas."""
+
+    def test_attn_temperature(self) -> None:
+        """floor_scale 4: positions 0..2 keep scale 1; 3 gets log(2) * 0.5 + 1."""
+        x = torch.ones(1, 2, 1, 2)
+        positions = torch.tensor([[2, 3]])
+        scaled = aloi.attn_temperature(x, positions, 4.0, 0.5)
+        expected = torch.tensor([1.0, math.log(2.0) * 0.5 + 1.0])
+        torch.testing.assert_close(scaled[0, :, 0, 0], expected)
+
+    def test_topk_sigmoid(self) -> None:
+        """Logits (2, -1, 0.5) with top_k 1 and 2 keep the sigmoid of the best ones."""
+        logits = torch.tensor([[2.0, -1.0, 0.5]])
+        sigmoid = torch.sigmoid(logits)[0]
+        torch.testing.assert_close(
+            aloi.topk_sigmoid(logits, 1), torch.tensor([[sigmoid[0].item(), 0.0, 0.0]])
+        )
+        torch.testing.assert_close(
+            aloi.topk_sigmoid(logits, 2),
+            torch.tensor([[sigmoid[0].item(), 0.0, sigmoid[2].item()]]),
+        )
+
+    def test_moe_experts_weight_on_input_or_output(self) -> None:
+        """Two tokens, three experts; compare with each chosen expert run alone."""
+        torch.manual_seed(0)
+        gate, up = torch.randn(3, 5, 4), torch.randn(3, 5, 4)
+        down = torch.randn(3, 4, 5)
+        x = torch.randn(2, 4)
+        # Token 0 uses expert 2 with weight 0.7, token 1 expert 0 with 0.4.
+        routing = torch.tensor([[0.0, 0.0, 0.7], [0.4, 0.0, 0.0]])
+
+        def expert(e: int, u: Tensor) -> Tensor:
+            """Run expert ``e`` on input ``u``."""
+            return (F.silu(u @ gate[e].T) * (u @ up[e].T)) @ down[e].T
+
+        on_input = torch.stack((expert(2, 0.7 * x[0]), expert(0, 0.4 * x[1])))
+        on_output = torch.stack((0.7 * expert(2, x[0]), 0.4 * expert(0, x[1])))
+        for flag, expected in ((True, on_input), (False, on_output)):
+            with self.subTest(apply_router_weight_on_input=flag):
+                torch.testing.assert_close(
+                    aloi.moe_experts(x, routing, gate, up, down, flag), expected
+                )
+
+
 class ConverterTest(unittest.TestCase):
     """aten elementwise ops, argument defaults and result names."""
 
@@ -674,6 +760,46 @@ class ConverterTest(unittest.TestCase):
                 "  %block.mul = aloi.mul(%block.silu, %x) : tensor<1x16xfp32>",
                 "  %block.add = aloi.add(%block.mul, %x) : tensor<1x16xfp32>",
             ],
+        )
+
+    def test_llama4_ops_import_with_their_attributes(self) -> None:
+        """attn_temperature, topk_sigmoid and moe_experts keep their constants."""
+
+        positions = torch.empty(1, 2, dtype=torch.int64, device="meta")
+
+        class _Temperature(nn.Module):
+            """Scale queries by their positions."""
+
+            def forward(self, q: Tensor, positions: Tensor) -> Tensor:
+                """Apply attn_temperature with Scout's constants.
+
+                Args:
+                    q: ``[1, 2, 3, 4]`` queries.
+                    positions: ``[1, 2]`` positions.
+
+                Returns:
+                    The scaled queries.
+                """
+                scaled: Tensor = aloi.attn_temperature(q, positions, 8192.0, 0.1)
+                return scaled
+
+        text = _import(_Temperature(), _meta_input(1, 2, 3, 4), positions)
+        self.assertIn(
+            "aloi.attn_temperature(%q, %positions) {floor_scale = 8192.0, attn_scale = 0.1}",
+            text,
+        )
+        self.assertEqual(
+            _op_line(lambda x: aloi.topk_sigmoid(x, 2), 1, 4),
+            "%topk_sigmoid = aloi.topk_sigmoid(%x) {top_k = 2} : tensor<1x4xfp32>",
+        )
+        with torch.device("meta"):
+            experts = aloi.MoEExperts(3, 4, 5, apply_router_weight_on_input=True)
+        routing = torch.empty(2, 3, device="meta")
+        text = _import(_Experts(experts), _meta_input(2, 4), routing)
+        self.assertIn(
+            "aloi.moe_experts(%x, %routing_weights, %experts.gate_proj, "
+            "%experts.up_proj, %experts.down_proj) {apply_router_weight_on_input = true}",
+            text,
         )
 
     def test_aten_activations_become_one_op(self) -> None:

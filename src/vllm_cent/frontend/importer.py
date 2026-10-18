@@ -34,6 +34,9 @@ from ..ir.semantic import (
     SoftmaxOp,
 )
 from ..ir.semantic.transformer import (
+    AttnTemperatureOp,
+    MoeExpertsOp,
+    TopKSigmoidOp,
     GqaQKOp,
     GqaSVOp,
     KvUpdateOp,
@@ -292,11 +295,18 @@ def _tensor_op(op_class: type[Operation], *operand_names: str) -> _Converter:
 def _convert_rms_norm(
     node: Node, env: dict[Node, Value], name_hint: str | None
 ) -> Operation:
-    """Convert ``aloi::rms_norm(x, weight, eps=None)`` into an ``RMSNormOp``."""
+    """Convert ``aloi::rms_norm(x, weight, eps=None)`` into an ``RMSNormOp``.
+
+    A None weight (``elementwise_affine=False``) gives the one-operand form.
+    """
 
     arguments = _arguments(node)
+    weight = arguments["weight"]
+    operands: tuple[Value, ...] = (_value(env, arguments["x"]),)
+    if weight is not None:
+        operands += (_value(env, weight),)
     return RMSNormOp(
-        operands=(_value(env, arguments["x"]), _value(env, arguments["weight"])),
+        operands=operands,
         eps=_optional_float("eps", arguments["eps"]),
         name_hint=name_hint,
     )
@@ -427,6 +437,54 @@ def _convert_reshape(
     )
 
 
+def _convert_attn_temperature(
+    node: Node, env: dict[Node, Value], name_hint: str | None
+) -> Operation:
+    """Convert ``aloi::attn_temperature(x, positions, floor_scale, attn_scale)``."""
+
+    arguments = _arguments(node)
+    return AttnTemperatureOp(
+        operands=(_value(env, arguments["x"]), _value(env, arguments["positions"])),
+        floor_scale=_float("floor_scale", arguments["floor_scale"]),
+        attn_scale=_float("attn_scale", arguments["attn_scale"]),
+        name_hint=name_hint,
+    )
+
+
+def _convert_topk_sigmoid(
+    node: Node, env: dict[Node, Value], name_hint: str | None
+) -> Operation:
+    """Convert ``aloi::topk_sigmoid(logits, top_k)`` into a ``TopKSigmoidOp``."""
+
+    arguments = _arguments(node)
+    return TopKSigmoidOp(
+        operands=(_value(env, arguments["logits"]),),
+        top_k=_int("top_k", arguments["top_k"]),
+        name_hint=name_hint,
+    )
+
+
+def _convert_moe_experts(
+    node: Node, env: dict[Node, Value], name_hint: str | None
+) -> Operation:
+    """Convert ``aloi::moe_experts(x, routing_weights, gate, up, down, on_input)``.
+
+    Raises:
+        TypeError: If ``apply_router_weight_on_input`` is not a bool.
+    """
+
+    arguments = _arguments(node)
+    on_input = arguments["apply_router_weight_on_input"]
+    if not isinstance(on_input, bool):
+        raise TypeError(f"apply_router_weight_on_input must be a bool, got {on_input!r}")
+    names = ("x", "routing_weights", "gate_proj", "up_proj", "down_proj")
+    return MoeExpertsOp(
+        operands=tuple(_value(env, arguments[name]) for name in names),
+        apply_router_weight_on_input=on_input,
+        name_hint=name_hint,
+    )
+
+
 def _convert_gqa_qk(
     node: Node, env: dict[Node, Value], name_hint: str | None
 ) -> Operation:
@@ -474,6 +532,9 @@ _CONVERTERS: dict[OpOverload, _Converter] = {
     torch.ops.aloi.gqa_qk.default: _convert_gqa_qk,
     torch.ops.aloi.softmax.default: _tensor_op(SoftmaxOp, "x"),
     torch.ops.aloi.gqa_sv.default: _tensor_op(GqaSVOp, "probs", "v_cache"),
+    torch.ops.aloi.attn_temperature.default: _convert_attn_temperature,
+    torch.ops.aloi.topk_sigmoid.default: _convert_topk_sigmoid,
+    torch.ops.aloi.moe_experts.default: _convert_moe_experts,
     torch.ops.aten.silu.default: _activation(ActivationKind.SILU),
     torch.ops.aten.relu.default: _activation(ActivationKind.RELU),
     torch.ops.aten.sigmoid.default: _activation(ActivationKind.SIGMOID),

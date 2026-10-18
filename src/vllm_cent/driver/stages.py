@@ -50,7 +50,7 @@ def compile_stages(model: LoadedModel, run: RunSpec) -> dict[str, str]:
 
     registration, config = model.registration, model.config
     program = export_model(
-        registration.build_model(config),
+        registration.build_model(config, run.scope.layer),
         registration.example_inputs(
             config, run.workload.batch, run.workload.context_len
         ),
@@ -65,7 +65,7 @@ def compile_stages(model: LoadedModel, run: RunSpec) -> dict[str, str]:
 
     PassManager(
         (
-            AnnotateRolesAndAxes(registration.annotations(config)),
+            AnnotateRolesAndAxes(registration.annotations(config, run.scope.layer)),
             ApplyTensorParallel(
                 run.parallel.build_plan(), registration.axis_sizes(config)
             ),

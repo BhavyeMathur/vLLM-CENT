@@ -15,6 +15,7 @@ compile. Together they define the SPMD program the compiler produces::
       context_len: 2048
     scope:
       layers: 1
+      layer: 0          # which decoder layer: layer types may differ
 """
 
 from __future__ import annotations
@@ -112,9 +113,12 @@ class Scope:
 
     Attributes:
         layers: Number of decoder layers.
+        layer: Index of the first compiled layer. It matters when layers
+            differ, e.g. Llama 4 interleaves layers with and without RoPE.
     """
 
     layers: int = 1
+    layer: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,6 +171,20 @@ def _positive_int(section: str, key: str, value: object) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValueError(
             f"run spec {section}.{key} must be a positive int, got {value!r}"
+        )
+    return value
+
+
+def _nonnegative_int(section: str, key: str, value: object) -> int:
+    """Return a nonnegative int setting, such as an index.
+
+    Raises:
+        ValueError: If the value is not an int of at least 0.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(
+            f"run spec {section}.{key} must be an int >= 0, got {value!r}"
         )
     return value
 
@@ -235,8 +253,11 @@ def parse_run_spec(data: Mapping[str, Any]) -> RunSpec:
         ),
     )
 
-    scope = _section(data, "scope", {"layers"})
-    scope_spec = Scope(layers=_positive_int("scope", "layers", scope.get("layers", 1)))
+    scope = _section(data, "scope", {"layers", "layer"})
+    scope_spec = Scope(
+        layers=_positive_int("scope", "layers", scope.get("layers", 1)),
+        layer=_nonnegative_int("scope", "layer", scope.get("layer", 0)),
+    )
     return RunSpec(parallel=parallel_spec, workload=workload_spec, scope=scope_spec)
 
 

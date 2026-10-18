@@ -47,7 +47,7 @@ _TINY_REGISTRY = textwrap.dedent(
             return self.proj(x)
 
 
-    def build(width):
+    def build(width, layer):
         with torch.device("meta"):
             return Projection(width)
 
@@ -59,7 +59,7 @@ _TINY_REGISTRY = textwrap.dedent(
         example_inputs=lambda width, batch, context_len: (
             torch.empty(batch, 16, device="meta"),
         ),
-        annotations=lambda width: {
+        annotations=lambda width, layer: {
             "x": TensorAnnotation(TensorRole.ACTIVATION, ("batch", "hidden")),
             "proj.weight": TensorAnnotation(TensorRole.WEIGHT, ("out", "hidden")),
         },
@@ -110,9 +110,9 @@ class RegistryTest(unittest.TestCase):
         registration = register_model(
             "registry_test",
             parse_config=dict,
-            build_model=lambda config: None,  # type: ignore[arg-type, return-value]
+            build_model=lambda config, layer: None,  # type: ignore[arg-type, return-value]
             example_inputs=lambda config, batch, context_len: (),
-            annotations=lambda config: {},
+            annotations=lambda config, layer: {},
             axis_sizes=lambda config: {},
         )
         self.addCleanup(registry_module._REGISTRY.pop, "registry_test", None)
@@ -168,6 +168,12 @@ class RunSpecTest(unittest.TestCase):
         self.assertEqual(set(plan.exceptions), {"k_proj.weight", "lm_head.weight"})
         self.assertEqual((spec.workload.batch, spec.workload.context_len), (4, 4096))
 
+    def test_scope_layer(self) -> None:
+        """scope.layer selects the compiled layer; it defaults to the first."""
+
+        self.assertEqual(parse_run_spec({}).scope.layer, 0)
+        self.assertEqual(parse_run_spec({"scope": {"layer": 3}}).scope.layer, 3)
+
     def test_rejections(self) -> None:
         """Typos and invalid values are reported, not ignored."""
 
@@ -178,6 +184,8 @@ class RunSpecTest(unittest.TestCase):
             "split not a list": {"parallel": {"split": "q_head"}},
             "unknown phase": {"workload": {"phase": "train"}},
             "negative batch": {"workload": {"batch": -1}},
+            "negative layer": {"scope": {"layer": -1}},
+            "layer not an int": {"scope": {"layer": "3"}},
         }
         for name, data in cases.items():
             with self.subTest(case=name), self.assertRaises(ValueError):

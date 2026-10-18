@@ -463,6 +463,13 @@ class LegalizeTests(unittest.TestCase):
 class LegalizeRejectionTests(unittest.TestCase):
     """Check that legalization rejects work the CENT backend cannot run."""
 
+    def test_rms_norm_without_weight_is_unsupported(self) -> None:
+        """The reference RMSNorm emitter needs a weight; Llama 4's QK-norm has none."""
+        x = argument("x", 2, 4)
+        norm = RMSNormOp(operands=(x,), eps=1e-5, name_hint="qk_norm")
+        with self.assertRaisesRegex(NotImplementedError, "without a weight"):
+            legalize(function((x,), (norm,), norm.results), CapabilityProfile())
+
     def test_non_fp32_tensor_is_unsupported(self) -> None:
         """The functional simulator computes only fp32 tensors."""
         for dtype in (DType.FP16, DType.BF16):

@@ -483,6 +483,30 @@ class RMSNormOpTest(unittest.TestCase):
         op = RMSNormOp(operands=(_value(1, HIDDEN_SIZE), _value(HIDDEN_SIZE)))
         self.assertEqual(op.attributes(), {"eps": None})
 
+    def test_weight_is_optional(self) -> None:
+        """Llama 4's QK-norm: per-head [1, 1, 5, 128] queries, no learned scale.
+
+        The query is one rank's 5 of 40 heads; normalizing over head_dim
+        keeps that split, and the op prints with one operand.
+        """
+
+        q = _placed(
+            (1, 1, 5, 128),
+            (*TOKEN_AXES, "q_head", "head_dim"),
+            Shard("q_head"),
+            global_shape=(1, 1, 40, 128),
+        )
+        op = RMSNormOp(operands=(q,), eps=1e-5, name_hint="qk_norm")
+        self.assertIsNone(op.weight)
+        self.assertEqual(op.results[0].type, q.type)
+        x = _value(1, 4, name="x")
+        self.assertEqual(
+            _print_one(RMSNormOp(operands=(x,), eps=1e-5, name_hint="norm")),
+            "%norm = aloi.rms_norm(%x) {eps = 1e-05} : tensor<1x4xfp16>",
+        )
+        with self.assertRaisesRegex(ValueError, "expects"):
+            RMSNormOp(operands=(x, _value(4), _value(4)))
+
     def test_eps_cannot_change_after_construction(self) -> None:
         """Ops are frozen, so eps stays the value the result type was checked with."""
 

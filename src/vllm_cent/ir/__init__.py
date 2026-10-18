@@ -17,12 +17,15 @@ from .semantic import (
 )
 from .semantic.transformer import (
     AttentionOp,
+    AttnTemperatureOp,
     GqaQKOp,
     GqaSVOp,
     KvUpdateOp,
     MergeHeadsOp,
+    MoeExpertsOp,
     RopeOp,
     SplitHeadsOp,
+    TopKSigmoidOp,
 )
 from .types import (
     DType,
@@ -43,6 +46,7 @@ __all__ = [
     "AllReduceOp",
     "AnnotateRolesAndAxes",
     "AttentionOp",
+    "AttnTemperatureOp",
     "ClonePass",
     "CopyOp",
     "DType",
@@ -54,6 +58,7 @@ __all__ = [
     "LinearOp",
     "MergeHeadsOp",
     "Module",
+    "MoeExpertsOp",
     "MulOp",
     "Operation",
     "Partial",
@@ -70,6 +75,7 @@ __all__ = [
     "TensorAnnotation",
     "TensorRole",
     "TensorType",
+    "TopKSigmoidOp",
     "Value",
     "clone_function",
     "format_type",

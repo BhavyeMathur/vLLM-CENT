@@ -463,6 +463,13 @@ def _device_kind(op: Operation, name: str) -> DeviceOperationKind:
     if isinstance(op, SoftmaxOp):
         return DeviceOperationKind.SOFTMAX
     if isinstance(op, RMSNormOp):
+        # TODO(unscaled RMSNorm): The reference RMSNorm lowering multiplies by
+        # a weight tensor. Llama 4's QK-norm has none; lowering it needs either
+        # a weightless variant of the emitter or a constant ones vector.
+        if op.weight is None:
+            raise NotImplementedError(
+                f"No device legalization for {op.NAME} without a weight ({name})"
+            )
         return DeviceOperationKind.RMS_NORM
     if isinstance(op, RopeOp):
         return DeviceOperationKind.ROPE
