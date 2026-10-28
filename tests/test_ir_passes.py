@@ -18,7 +18,7 @@ VECTOR = TensorType(shape=(1, 4), dtype=DType.FP16)
 class _Identity(Operation):
     """One operand; the result has the operand's type."""
 
-    NAME = "test.identity"
+    NAME = "test.pass_identity"
     NUM_OPERANDS = 1
 
     def infer_result_types(self) -> tuple[TensorType, ...]:

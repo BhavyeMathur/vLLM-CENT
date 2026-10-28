@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
+from types import MappingProxyType
 from typing import ClassVar, Self
 
 from .types import TensorType
+
+# Every op class that defines a NAME, keyed by that name, at every IR level
+# ("aloi.linear", "pim.gemv"). Operation.__init_subclass__ fills it as op
+# classes are defined, so it holds the ops of every module imported so far.
+_OPERATIONS: dict[str, type[Operation]] = {}
 
 
 @dataclass(
@@ -29,6 +35,40 @@ class Operation(ABC):
     name_hint: str | None = field(default=None, kw_only=True)
     operands: tuple[Value, ...]
     results: tuple[Value, ...] = field(init=False)
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        """Register each op class that defines its own NAME.
+
+        Classes without a NAME of their own (mixins such as ``_PIMOp``, shared
+        rules such as ``SoftmaxRules``) are not ops and are skipped; a class
+        that only inherits a NAME would otherwise claim its parent's.
+
+        ``@dataclass(slots=True)`` builds a second class to add the slots, so
+        this runs twice for each op; the second, final class must win. A
+        class with the same module and class name therefore replaces the
+        registered one, which also covers a class defined in a function that
+        runs again. (The class name, not ``__qualname__``: while this hook
+        runs for the second class, dataclasses has not yet copied the nested
+        qualified name onto it.)
+
+        Raises:
+            ValueError: If a different class already uses this NAME.
+        """
+
+        super().__init_subclass__(**kwargs)
+        if "NAME" not in cls.__dict__:
+            return
+        registered = _OPERATIONS.get(cls.NAME)
+        if registered is not None and (registered.__module__, registered.__name__) != (
+            cls.__module__,
+            cls.__name__,
+        ):
+            raise ValueError(
+                f"op name {cls.NAME!r} is used by both "
+                f"{registered.__module__}.{registered.__qualname__} and "
+                f"{cls.__module__}.{cls.__qualname__}"
+            )
+        _OPERATIONS[cls.NAME] = cls
 
     def __post_init__(self) -> None:
         # Convert before anything else: a generator has no len(), and a list
@@ -81,6 +121,39 @@ class Decomposable(ABC):
 
         The last Op's result replaces this Op's result.
         """
+
+
+def operation_class(name: str) -> type[Operation]:
+    """Return the op class registered under ``name``, e.g. ``"aloi.linear"``.
+
+    Only ops of imported modules are registered: import ``vllm_cent.ir.device``
+    before looking up a device op such as ``"pim.gemv"``.
+
+    Args:
+        name: An op's ``NAME``.
+
+    Returns:
+        The op class.
+
+    Raises:
+        KeyError: If no imported op class has that name; the message lists
+            the registered names.
+    """
+
+    registered = _OPERATIONS.get(name)
+    if registered is None:
+        raise KeyError(f"no op named {name!r}; registered: {sorted(_OPERATIONS)}")
+    return registered
+
+
+def registered_operations() -> Mapping[str, type[Operation]]:
+    """Return every registered op class by name, as a read-only view.
+
+    Returns:
+        A live view: ops of modules imported later appear in it too.
+    """
+
+    return MappingProxyType(_OPERATIONS)
 
 
 @dataclass(frozen=True, eq=False, slots=True)

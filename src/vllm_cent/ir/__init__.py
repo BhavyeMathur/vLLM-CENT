@@ -1,6 +1,15 @@
 """ALOI IR: generic SSA core, semantic dialect, printer, and pass infrastructure."""
 
-from .base import Function, Module, Operation, Value, clone_function, rebuild_function
+from .base import (
+    Function,
+    Module,
+    Operation,
+    Value,
+    clone_function,
+    operation_class,
+    rebuild_function,
+    registered_operations,
+)
 from .pass_manager import FunctionPass, Pass, PassManager
 from .passes import AnnotateRolesAndAxes, ClonePass, TensorAnnotation
 from .printer import format_type, print_function, print_module, value_names
@@ -93,11 +102,13 @@ __all__ = [
     "Value",
     "clone_function",
     "format_type",
+    "operation_class",
     "outermost_axis",
     "packed_axis",
     "packed_axis_factors",
     "print_function",
     "print_module",
     "rebuild_function",
+    "registered_operations",
     "value_names",
 ]
