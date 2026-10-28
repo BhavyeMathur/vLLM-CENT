@@ -15,6 +15,7 @@ from .data import (
     DeviceReshapeOp,
     DeviceSplitHeadsOp,
     DeviceTransferOp,
+    ViewOp,
 )
 from .pim import PIMActivationOp, PIMEwmulOp, PIMGemvOp
 from .pnm import (
@@ -56,4 +57,5 @@ __all__ = [
     "PNMSoftmaxOp",
     "PNMSubOp",
     "PNMSumOp",
+    "ViewOp",
 ]

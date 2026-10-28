@@ -1,0 +1,66 @@
+# CENT device at the paper's scale, read by vllm_cent.device.load_device_spec.
+# Every *_size field is in bytes, not values; how many values fit follows
+# from the dtype (bf16: 2 bytes per value).
+schema_version: "0.1"
+name: cent_paper
+
+target:
+  target_id: cent_aim
+  trace_format: aim_text_trace
+
+architecture:
+  type: cent
+  channels: 32                # paper: CHmask has one bit per channel
+  banks_per_channel: 16
+  banks_per_group: 4          # banks paired for EW_MUL; see cent/hardware.py
+  rows_per_bank: 16384
+  row_size: 2048              # bytes: 1024 bf16 values per row
+  burst_size: 32              # bytes: paper's 256-bit transfer, 16 bf16 values
+  global_buffer_size: 2048    # bytes per channel: one row's worth
+  shared_buffer_size: 65536   # bytes: paper's 64 KiB, 2048 slots of 32 bytes
+  accumulators_per_bank: 32
+
+capabilities:
+  # Supported Device IR ops (pim.gemv, ...) and their element types. Views
+  # (device.reshape, device.split_heads, device.merge_heads) are always
+  # supported and must not be listed.
+  ops:
+    pim:
+      gemv: [bf16]
+      ewmul: [bf16]
+      activation: [bf16]
+      qk: [bf16]
+      sv: [bf16]
+      cache_write: [bf16]
+    pnm:
+      add: [bf16]
+      sub: [bf16]
+      mul: [bf16]
+      div: [bf16]
+      exp: [bf16]
+      reduce_max: [bf16]
+      reduce_sum: [bf16]
+      rms_norm: [bf16]
+      rope: [bf16]
+      # TODO(paper): Whether the PNM side has a softmax unit, or softmax must
+      # be decomposed into exp, reduce_sum and div, is not settled.
+      # softmax: [bf16]
+    cxl:
+      all_reduce: [bf16]
+    device:
+      transfer: [bf16]
+      copy: [bf16]
+      broadcast: [bf16]
+
+  # Activation functions in the PIM lookup tables, with their AFid. The paper
+  # does not publish the AFid numbering; 0 for sigmoid is a local choice.
+  pim_activations:
+    sigmoid: 0
+
+  # TODO(paper): Which activation functions the PNM units compute directly is
+  # not stated; none are listed until a source or a recipe needs one.
+  pnm_activations: []
+
+  # The GEMV lowering adds no model bias: its WR_BIAS writes only reload
+  # partial sums (lowering/linear.py).
+  pim_gemv_bias: false

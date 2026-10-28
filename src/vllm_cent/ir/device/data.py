@@ -27,6 +27,7 @@ __all__ = [
     "DeviceReshapeOp",
     "DeviceSplitHeadsOp",
     "DeviceTransferOp",
+    "ViewOp",
 ]
 
 
@@ -80,22 +81,32 @@ class DeviceCopyOp(_SameDomainOp, CopyOp):
     NAME = "device.copy"
 
 
+class ViewOp(_SameDomainOp):
+    """Base of ops that read the same elements under another shape.
+
+    A view moves no data and emits no instruction, so every target supports
+    it: a DeviceSpec needs no entry for it.
+    """
+
+    __slots__ = ()
+
+
 @dataclass(frozen=True, eq=False, slots=True)
-class DeviceReshapeOp(_SameDomainOp, ReshapeOp):
+class DeviceReshapeOp(ViewOp, ReshapeOp):
     """``aloi.reshape`` as a view in the operand's domain; no data moves."""
 
     NAME = "device.reshape"
 
 
 @dataclass(frozen=True, eq=False, slots=True)
-class DeviceSplitHeadsOp(_SameDomainOp, SplitHeadsOp):
+class DeviceSplitHeadsOp(ViewOp, SplitHeadsOp):
     """``aloi.split_heads`` as a view in the operand's domain; no data moves."""
 
     NAME = "device.split_heads"
 
 
 @dataclass(frozen=True, eq=False, slots=True)
-class DeviceMergeHeadsOp(_SameDomainOp, MergeHeadsOp):
+class DeviceMergeHeadsOp(ViewOp, MergeHeadsOp):
     """``aloi.merge_heads`` as a view in the operand's domain; no data moves."""
 
     NAME = "device.merge_heads"
