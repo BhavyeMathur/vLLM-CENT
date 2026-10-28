@@ -59,7 +59,9 @@ Q_PROJ_OUT = packed_axis(Q_HEAD, HEAD_DIM)
 KV_PROJ_OUT = packed_axis(KV_HEAD, HEAD_DIM)
 
 
-def semantic_annotations(config: Llama4Config, layer: int) -> dict[str, TensorAnnotation]:
+def semantic_annotations(
+    config: Llama4Config, layer: int
+) -> dict[str, TensorAnnotation]:
     """Return the annotation of every argument of decoder layer ``layer``.
 
     Args:

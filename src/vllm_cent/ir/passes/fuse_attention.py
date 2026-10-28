@@ -156,7 +156,9 @@ class FuseAttention(FunctionPass):
             return function
 
         # Rebuild the function, mapping every old value to its replacement.
-        arguments = tuple(Value(type=arg.type, name=arg.name) for arg in function.operands)
+        arguments = tuple(
+            Value(type=arg.type, name=arg.name) for arg in function.operands
+        )
         new_values: dict[Value, Value] = dict(
             zip(function.operands, arguments, strict=True)
         )
@@ -165,7 +167,9 @@ class FuseAttention(FunctionPass):
             if op in consumed:
                 continue
             if not isinstance(op, GqaQKOp) or op not in chains:
-                rebuilt = op.with_operands(new_values[operand] for operand in op.operands)
+                rebuilt = op.with_operands(
+                    new_values[operand] for operand in op.operands
+                )
                 operations.append(rebuilt)
                 new_values.update(zip(op.results, rebuilt.results, strict=True))
                 continue

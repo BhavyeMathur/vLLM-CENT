@@ -17,8 +17,8 @@ import math
 from collections.abc import Callable, Mapping
 
 import torch
+import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
-import torch.nn.functional as F
 
 
 @torch.library.custom_op(
@@ -417,7 +417,9 @@ def moe_experts(
         gate = expert_input @ gate_proj[expert].to(torch.float32).T
         up = expert_input @ up_proj[expert].to(torch.float32).T
         expert_output = (F.silu(gate) * up) @ down_proj[expert].to(torch.float32).T
-        output += expert_output if apply_router_weight_on_input else expert_output * weight
+        output += (
+            expert_output if apply_router_weight_on_input else expert_output * weight
+        )
     return output.to(x.dtype)
 
 

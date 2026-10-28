@@ -11,24 +11,24 @@ from typing import Protocol
 
 from vllm_cent.cent import (
     Accumulate,
-    MacAllBanks,
     CentInstruction,
     CentProgram,
     CopyBankToGlobalBuffer,
     CopyGlobalBufferToBank,
     ElementwiseMultiply,
+    MacAllBanks,
     ReadSingleBank,
     WriteGlobalBuffer,
     WriteSingleBank,
 )
 from vllm_cent.cent.reference import (
+    ReferenceActivation,
     ReferenceInstruction,
     ReferenceRmsScale,
-    ReferenceActivation,
     ReferenceRotaryEmbedding,
     ReferenceSoftmax,
 )
-from .reference import _prepare_reference, _prepare_mac
+
 from .effects import _InstructionEffects
 from .errors import (
     CentExecutionFault,
@@ -43,8 +43,9 @@ from .kernels import (
     _prepare_write_global_buffer,
     _prepare_write_single_bank,
 )
-from .state import CentDeviceState
 from .numeric import ReferenceMathSemantics
+from .reference import _prepare_mac, _prepare_reference
+from .state import CentDeviceState
 
 __all__: list[str] = []
 

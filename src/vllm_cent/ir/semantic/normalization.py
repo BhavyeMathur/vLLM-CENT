@@ -23,7 +23,7 @@ __all__ = [
 ]
 
 
-@dataclass(frozen = True, eq = False, slots=True)
+@dataclass(frozen=True, eq=False, slots=True)
 class RMSNormRules(Operation):
     """Type rules shared by every RMSNorm op, at any IR level; not an op itself.
 
@@ -57,8 +57,7 @@ class RMSNormRules(Operation):
         # for eps <= 0; this rejects nan and inf as well as non-positive eps.
         if (self.eps is not None) and not (0 < self.eps < inf):
             raise ValueError(
-                f"{self.NAME}: eps must be positive and finite, "
-                f"got {self.eps}"
+                f"{self.NAME}: eps must be positive and finite, got {self.eps}"
             )
 
         # Check ranks before indexing shape[-1] below, so a scalar x gives a
@@ -71,10 +70,7 @@ class RMSNormRules(Operation):
 
         weight = self.weight
         if weight is not None and len(weight.type.shape) != 1:
-            raise ValueError(
-                f"{self.NAME}: weight must be 1D, "
-                f"got {weight.type.shape}"
-            )
+            raise ValueError(f"{self.NAME}: weight must be 1D, got {weight.type.shape}")
 
         if weight is not None and self.x.type.dtype != weight.type.dtype:
             raise ValueError(
@@ -89,8 +85,7 @@ class RMSNormRules(Operation):
         # Every rank scales its rows by the whole weight vector.
         if weight is not None and not isinstance(weight.type.placement, Replicate):
             raise ValueError(
-                f"{self.NAME}: weight must be replicated, "
-                f"got {weight.type.placement}"
+                f"{self.NAME}: weight must be replicated, got {weight.type.placement}"
             )
         match self.x.type.placement:
             case Partial():
@@ -128,11 +123,10 @@ class RMSNormRules(Operation):
         # tensor is computed during the forward pass, i.e. an activation.
         # The copy keeps x's placement and global_shape: a row split along
         # batch or seq_len stays split the same way.
-        return (replace(self.x.type, role = TensorRole.ACTIVATION),)
+        return (replace(self.x.type, role=TensorRole.ACTIVATION),)
 
 
-
-@dataclass(frozen = True, eq = False, slots=True)
+@dataclass(frozen=True, eq=False, slots=True)
 class RMSNormOp(RMSNormRules):
     """RMS normalization over the last dimension, with an optional scale.
 
@@ -152,7 +146,7 @@ class RMSNormOp(RMSNormRules):
     NAME = "aloi.rms_norm"
 
 
-@dataclass(frozen = True, eq = False, slots=True)
+@dataclass(frozen=True, eq=False, slots=True)
 class SoftmaxRules(Operation):
     """Type rules shared by every softmax op, at any IR level; not an op itself.
 
@@ -186,10 +180,10 @@ class SoftmaxRules(Operation):
                 f"{self.NAME}: x's last dimension is split across ranks; "
                 "softmax needs the whole dimension on every rank"
             )
-        return (replace(self.x.type, role = TensorRole.ACTIVATION),)
+        return (replace(self.x.type, role=TensorRole.ACTIVATION),)
 
 
-@dataclass(frozen = True, eq = False, slots=True)
+@dataclass(frozen=True, eq=False, slots=True)
 class SoftmaxOp(SoftmaxRules, Decomposable):
     """Softmax over the last dimension.
 
@@ -209,15 +203,23 @@ class SoftmaxOp(SoftmaxRules, Decomposable):
         hint = self.name_hint or "softmax"
         width = x.type.shape[-1]
         axis = x.type.axes[-1] if x.type.axes else None
-        
-        row_max = MaxOp(operands = (x,), name_hint = f"{hint}.max")
-        max_rows = BroadcastOp(operands = row_max.results, size = width, axis = axis, name_hint = f"{hint}.max_rows")
+
+        row_max = MaxOp(operands=(x,), name_hint=f"{hint}.max")
+        max_rows = BroadcastOp(
+            operands=row_max.results,
+            size=width,
+            axis=axis,
+            name_hint=f"{hint}.max_rows",
+        )
         shifted = SubOp(operands=(x, *max_rows.results), name_hint=f"{hint}.shifted")
         exps = ExpOp(operands=shifted.results, name_hint=f"{hint}.exp")
         total = SumOp(operands=exps.results, name_hint=f"{hint}.sum")
-        total_rows = BroadcastOp(operands=total.results, size=width, axis=axis,
-                                name_hint=f"{hint}.sum_rows")
+        total_rows = BroadcastOp(
+            operands=total.results, size=width, axis=axis, name_hint=f"{hint}.sum_rows"
+        )
         # The last op stands for the softmax; it keeps the softmax's own name,
         # so later ops print the same operand names as before.
-        result = DivOp(operands=(*exps.results, *total_rows.results), name_hint=self.name_hint)
+        result = DivOp(
+            operands=(*exps.results, *total_rows.results), name_hint=self.name_hint
+        )
         return (row_max, max_rows, shifted, exps, total, total_rows, result)

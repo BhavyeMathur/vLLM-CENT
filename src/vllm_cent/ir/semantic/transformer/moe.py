@@ -147,8 +147,10 @@ class MoeExpertsOp(Operation):
         gate, up, down = (v.type for v in self.operands[2:])
         if any(t.dtype != x.dtype for t in (weights, gate, up, down)):
             raise ValueError(f"{self.NAME}: all operands need one dtype")
-        if x.rank < 1 or weights.rank != x.rank or any(
-            t.rank != 3 for t in (gate, up, down)
+        if (
+            x.rank < 1
+            or weights.rank != x.rank
+            or any(t.rank != 3 for t in (gate, up, down))
         ):
             raise ValueError(
                 f"{self.NAME}: expected x [*, hidden], routing_weights "
@@ -180,9 +182,7 @@ class MoeExpertsOp(Operation):
                     f"down {down.axes} do not fit"
                 )
         return (
-            TensorType(
-                shape=x.shape, dtype=x.dtype, axes=x.axes, placement=placement
-            ),
+            TensorType(shape=x.shape, dtype=x.dtype, axes=x.axes, placement=placement),
         )
 
     def _result_placement(self) -> Placement:

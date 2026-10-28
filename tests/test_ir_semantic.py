@@ -76,9 +76,7 @@ def _annotated(
         A new value.
     """
 
-    return Value(
-        type=TensorType(shape=shape, dtype=DType.FP16, role=role, axes=axes)
-    )
+    return Value(type=TensorType(shape=shape, dtype=DType.FP16, role=role, axes=axes))
 
 
 # Axis names as AnnotateRolesAndAxes would attach them for Llama2-70B. The
@@ -300,7 +298,7 @@ class LinearOpAxesTest(unittest.TestCase):
     """The result keeps x's leading axes and takes the weight's output axis."""
 
     def test_q_proj_produces_packed_head_axis(self) -> None:
-        """hidden -> q_head*head_dim, contracting over hidden."""
+        """Map hidden to q_head*head_dim, contracting over hidden."""
 
         op = LinearOp(
             operands=(
@@ -376,10 +374,14 @@ class LinearOpAxesTest(unittest.TestCase):
         self.assertIs(op.results[0].type.role, TensorRole.ACTIVATION)
 
 
+# A shared default: Replicate() holds no state, so one instance serves all.
+_REPLICATED = Replicate()
+
+
 def _bias(
     width: int,
     axes: tuple[str, ...] = (),
-    placement: Placement = Replicate(),
+    placement: Placement = _REPLICATED,
     global_shape: tuple[int, ...] | None = None,
 ) -> Value:
     """Return an fp16 bias vector of ``width`` elements.
@@ -433,9 +435,7 @@ class LinearOpBiasTest(unittest.TestCase):
     def test_column_parallel_bias_is_split_like_the_output(self) -> None:
         """Wq's 1024 rows on this rank pair with the same 1024 bias elements."""
 
-        bias = _bias(
-            LOCAL_HEADS_WIDTH, (Q_PROJ_OUT,), Shard("q_head"), (HIDDEN_SIZE,)
-        )
+        bias = _bias(LOCAL_HEADS_WIDTH, (Q_PROJ_OUT,), Shard("q_head"), (HIDDEN_SIZE,))
         op = LinearOp(operands=(_replicated_hidden(), _wq_shard(), bias))
         self.assertEqual(op.results[0].type, _sharded_heads().type)
 
@@ -481,7 +481,11 @@ class LinearOpBiasTest(unittest.TestCase):
         """The bias is the third operand of aloi.linear."""
 
         op = LinearOp(
-            operands=(_value(1, 2, name="x"), _value(3, 2, name="w"), _value(3, name="b")),
+            operands=(
+                _value(1, 2, name="x"),
+                _value(3, 2, name="w"),
+                _value(3, name="b"),
+            ),
             name_hint="proj",
         )
         self.assertEqual(
@@ -523,9 +527,7 @@ class LinearOpPlacementTest(unittest.TestCase):
     def test_unsupported_combinations(self) -> None:
         """Combinations that would need communication before the matmul."""
 
-        partial_x = _placed(
-            (1, 1, HIDDEN_SIZE), (*TOKEN_AXES, HIDDEN), Partial()
-        )
+        partial_x = _placed((1, 1, HIDDEN_SIZE), (*TOKEN_AXES, HIDDEN), Partial())
         batch_split_x = _placed(
             (1, 1, HIDDEN_SIZE),
             (*TOKEN_AXES, HIDDEN),

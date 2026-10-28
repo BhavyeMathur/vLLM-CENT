@@ -6,8 +6,8 @@ import unittest
 
 from vllm_cent.ir.base import Value
 from vllm_cent.ir.semantic.transformer import (
-    AttnTemperatureOp,
     AttentionOp,
+    AttnTemperatureOp,
     GqaQKOp,
     GqaSVOp,
     KvUpdateOp,
@@ -411,7 +411,7 @@ class GqaOpsTest(unittest.TestCase):
             GqaQKOp(operands=(q_by_batch, cache_by_batch), scale=1.0)
 
     def test_sv_rejects_wrong_contraction(self) -> None:
-        """probs must sum over the cache's context axis."""
+        """The probabilities must sum over the cache's context axis."""
 
         probs = _value(
             (1, 1, Q_HEADS, CONTEXT), (*TOKEN_AXES, "q_head", "seq_len_again")
@@ -481,7 +481,9 @@ class AttnTemperatureOpTest(unittest.TestCase):
             Shard("q_head"),
             (1, 1, 40, HEAD_DIM),
         )
-        partial_q = _value((1, 1, 5, HEAD_DIM), (*TOKEN_AXES, "q_head", "head_dim"), Partial())
+        partial_q = _value(
+            (1, 1, 5, HEAD_DIM), (*TOKEN_AXES, "q_head", "head_dim"), Partial()
+        )
         for q in (split_q, partial_q):
             with self.subTest(placement=q.type.placement):
                 op = AttnTemperatureOp(
@@ -501,7 +503,12 @@ class AttnTemperatureOpTest(unittest.TestCase):
             "zero floor_scale": ((q, positions), 0.0, 0.1, "floor_scale"),
             "infinite attn_scale": ((q, positions), 2.0, float("inf"), "attn_scale"),
             "float positions": ((q, _value((1, 1))), 2.0, 0.1, "integers"),
-            "one position for two tokens": ((_value((1, 2, 4, HEAD_DIM)), positions), 2.0, 0.1, "token"),
+            "one position for two tokens": (
+                (_value((1, 2, 4, HEAD_DIM)), positions),
+                2.0,
+                0.1,
+                "token",
+            ),
             "split positions": ((q, split_positions), 2.0, 0.1, "replicated"),
         }
         for name, (operands, floor_scale, attn_scale, message) in cases.items():
@@ -561,7 +568,11 @@ class MoeExpertsOpTest(unittest.TestCase):
             """Return one expert weight with the requested placement."""
             sharded = isinstance(placement, Shard)
             return _value(
-                shape, axes, placement, whole[key] if sharded else None, role=TensorRole.WEIGHT
+                shape,
+                axes,
+                placement,
+                whole[key] if sharded else None,
+                role=TensorRole.WEIGHT,
             )
 
         return (
@@ -580,7 +591,8 @@ class MoeExpertsOpTest(unittest.TestCase):
         ):
             with self.subTest(placement=placement):
                 op = MoeExpertsOp(
-                    operands=self._operands(placement), apply_router_weight_on_input=True
+                    operands=self._operands(placement),
+                    apply_router_weight_on_input=True,
                 )
                 self.assertEqual(
                     op.results[0].type,
@@ -609,7 +621,10 @@ class MoeExpertsOpTest(unittest.TestCase):
         )
         cases = {
             "down not transposed": ((x, weights, gate, up, wrong_down), "do not fit"),
-            "routing axis is not the expert axis": ((x, wrong_axes, gate, up, down), "axes"),
+            "routing axis is not the expert axis": (
+                (x, wrong_axes, gate, up, down),
+                "axes",
+            ),
             "split experts": ((x, weights, *split_experts), "intermediate axis"),
         }
         for name, (operands, message) in cases.items():

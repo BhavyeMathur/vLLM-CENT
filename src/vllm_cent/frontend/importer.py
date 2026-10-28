@@ -17,9 +17,6 @@ from torch.export import ExportedProgram
 from torch.export.graph_signature import InputKind, OutputKind
 from torch.fx import Node
 
-# Imported for its side effect: registering torch.ops.aloi.*, which the
-# converter table below refers to.
-from . import aloi  # noqa: F401
 from ..activations import ActivationKind
 from ..ir.base import Function, Module, Operation, Value
 from ..ir.printer import format_type
@@ -35,16 +32,20 @@ from ..ir.semantic import (
 )
 from ..ir.semantic.transformer import (
     AttnTemperatureOp,
-    MoeExpertsOp,
-    TopKSigmoidOp,
     GqaQKOp,
     GqaSVOp,
     KvUpdateOp,
     MergeHeadsOp,
+    MoeExpertsOp,
     RopeOp,
     SplitHeadsOp,
+    TopKSigmoidOp,
 )
 from ..ir.types import DType, TensorType
+
+# Imported for its side effect: registering torch.ops.aloi.*, which the
+# converter table below refers to.
+from . import aloi  # noqa: F401
 
 __all__ = ["import_exported_program"]
 
@@ -99,7 +100,10 @@ def _argument_names(program: ExportedProgram) -> dict[str, str]:
         # with "is" against the enum.
         # Parameters and buffers (e.g. a RoPE cos/sin table) are named by
         # FQN, the key they have in the model's state.
-        if spec.kind in (InputKind.PARAMETER, InputKind.BUFFER) and spec.target is not None:
+        if (
+            spec.kind in (InputKind.PARAMETER, InputKind.BUFFER)
+            and spec.target is not None
+        ):
             names[spec.arg.name] = spec.target
         elif spec.kind is InputKind.USER_INPUT:
             names[spec.arg.name] = spec.arg.name
@@ -280,9 +284,7 @@ def _tensor_op(op_class: type[Operation], *operand_names: str) -> _Converter:
         The converter.
     """
 
-    def convert(
-        node: Node, env: dict[Node, Value], name_hint: str | None
-    ) -> Operation:
+    def convert(node: Node, env: dict[Node, Value], name_hint: str | None) -> Operation:
         """Build ``op_class`` from the named tensor arguments."""
 
         arguments = _arguments(node)
@@ -371,9 +373,7 @@ def _activation(function: ActivationKind) -> _Converter:
         function: The formula this aten op computes.
     """
 
-    def convert(
-        node: Node, env: dict[Node, Value], name_hint: str | None
-    ) -> Operation:
+    def convert(node: Node, env: dict[Node, Value], name_hint: str | None) -> Operation:
         """Build an ``ActivationOp`` that applies ``function``."""
 
         arguments = _arguments(node)
@@ -409,9 +409,7 @@ def _convert_gelu(
     arguments = _arguments(node)
     approximate = arguments["approximate"]
     # _arguments returns plain objects; only a str can be a key of the table.
-    function = (
-        _GELU_FORMULAS.get(approximate) if isinstance(approximate, str) else None
-    )
+    function = _GELU_FORMULAS.get(approximate) if isinstance(approximate, str) else None
     if function is None:
         raise NotImplementedError(f"gelu with approximate={approximate!r}")
     return ActivationOp(
@@ -495,7 +493,9 @@ def _convert_moe_experts(
     arguments = _arguments(node)
     on_input = arguments["apply_router_weight_on_input"]
     if not isinstance(on_input, bool):
-        raise TypeError(f"apply_router_weight_on_input must be a bool, got {on_input!r}")
+        raise TypeError(
+            f"apply_router_weight_on_input must be a bool, got {on_input!r}"
+        )
     names = ("x", "routing_weights", "gate_proj", "up_proj", "down_proj")
     return MoeExpertsOp(
         operands=tuple(_value(env, arguments[name]) for name in names),

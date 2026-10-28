@@ -1,32 +1,34 @@
-"""Small, dependency-free SSA IR"""
+"""Small, dependency-free SSA IR."""
 
 from __future__ import annotations
 
-from dataclasses import  dataclass, field, fields, replace
-from typing import ClassVar, Self
-from collections.abc import Callable, Iterable, Sequence
 from abc import ABC, abstractmethod
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass, field, fields, replace
+from typing import ClassVar, Self
 
 from .types import TensorType
 
-@dataclass(frozen = True, eq = False, )
-class Value:
 
+@dataclass(
+    frozen=True,
+    eq=False,
+)
+class Value:
     type: TensorType
     name: str | None = None
 
 
-@dataclass(frozen = True, eq = False, slots = True)
+@dataclass(frozen=True, eq=False, slots=True)
 class Operation(ABC):
-
     NAME: ClassVar[str]
     # Exact operand count, or the allowed counts when trailing operands
     # are optional (e.g. attention's mask).
     NUM_OPERANDS: ClassVar[int | tuple[int, ...]]
 
-    name_hint: str | None = field(default = None, kw_only = True)
+    name_hint: str | None = field(default=None, kw_only=True)
     operands: tuple[Value, ...]
-    results: tuple[Value, ...] = field(init = False)
+    results: tuple[Value, ...] = field(init=False)
 
     def __post_init__(self) -> None:
         # Convert before anything else: a generator has no len(), and a list
@@ -45,13 +47,12 @@ class Operation(ABC):
             )
 
         result_types = self.infer_result_types()
-        results = tuple(Value(type = t) for t in result_types)
+        results = tuple(Value(type=t) for t in result_types)
         object.__setattr__(self, "results", results)
 
     # Infer the output type entirely by the operation
     @abstractmethod
-    def infer_result_types(self) -> tuple[TensorType, ...]: 
-        ...
+    def infer_result_types(self) -> tuple[TensorType, ...]: ...
 
     # Getting attributes for printing
     def attributes(self) -> dict[str, object]:
@@ -61,15 +62,17 @@ class Operation(ABC):
             if f.name not in {"name_hint", "operands", "results"}
         }
 
-
     def with_operands(self, new_operands: Iterable[Value]) -> Self:
-        return replace(self, operands = tuple(new_operands))
+        return replace(self, operands=tuple(new_operands))
 
 
 class Decomposable(ABC):
-    """An IR Operation that can be decomposed to multiple other IR Operations
-    in the SAME IR Hierarchy
+    """An IR Operation that can be decomposed into other IR Operations.
+
+    The decomposition uses ops of the same IR level, e.g. a semantic op
+    decomposes into semantic ops only.
     """
+
     __slots__ = ()
 
     @abstractmethod
@@ -80,9 +83,9 @@ class Decomposable(ABC):
         """
 
 
-@dataclass(frozen = True, eq = False, slots = True)
+@dataclass(frozen=True, eq=False, slots=True)
 class Function:
-    """One straight-line SSA function"""
+    """One straight-line SSA function."""
 
     name: str
     operands: tuple[Value, ...]
@@ -92,7 +95,7 @@ class Function:
     def __post_init__(self) -> None:
         operands = tuple(self.operands)
         object.__setattr__(self, "operands", operands)
-        
+
         operations = tuple(self.operations)
         object.__setattr__(self, "operations", operations)
 
@@ -107,11 +110,7 @@ class Function:
         return None
 
     def users(self, value: Value) -> tuple[Operation, ...]:
-        return tuple(
-            op
-            for op in self.operations
-            if value in op.operands
-        )
+        return tuple(op for op in self.operations if value in op.operands)
 
     def verify(self) -> None:
         # Add arguments one at a time: set(self.operands) would silently merge
@@ -127,23 +126,30 @@ class Function:
         for op in self.operations:
             # NAME says what kind of op failed; name_hint, when present, says which one.
             label = op.NAME if op.name_hint is None else f"{op.NAME} ({op.name_hint})"
-            missing = [operand.name for operand in op.operands if operand not in available]
+            missing = [
+                operand.name for operand in op.operands if operand not in available
+            ]
             if missing:
                 raise ValueError(f"{label} uses unavailable values: {missing}")
             for result in op.results:
                 if result in available:
-                    raise ValueError(f"{label} defines duplicate SSA value %{result.name}")
+                    raise ValueError(
+                        f"{label} defines duplicate SSA value %{result.name}"
+                    )
                 available.add(result)
-        missing_outputs = [value.name for value in self.results if value not in available]
+        missing_outputs = [
+            value.name for value in self.results if value not in available
+        ]
         if missing_outputs:
             raise ValueError(f"function returns unavailable values: {missing_outputs}")
 
-@dataclass(frozen = True)
+
+@dataclass(frozen=True)
 class Module:
     """A named collection of functions."""
 
     name: str
-    functions: tuple[Function, ... ]
+    functions: tuple[Function, ...]
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "functions", tuple(self.functions))
@@ -160,7 +166,9 @@ class Module:
         names: set[str] = set()
         for func in self.functions:
             if func.name in names:
-                raise ValueError(f"module @{self.name} defines function @{func.name} twice")
+                raise ValueError(
+                    f"module @{self.name} defines function @{func.name} twice"
+                )
             names.add(func.name)
 
         for func in self.functions:
@@ -216,10 +224,7 @@ def rebuild_function(
     new_ops: list[Operation] = []
     for op in func.operations:
         new_op = op.with_operands(
-            new_operands = tuple(
-                new_map[operand] 
-                for operand 
-                in op.operands),
+            new_operands=tuple(new_map[operand] for operand in op.operands),
         )
 
         emitted = (new_op,) if rewrite is None else tuple(rewrite(new_op))
@@ -238,13 +243,13 @@ def rebuild_function(
             new_map[old_result] = new_result
 
     return Function(
-        name = func.name,
-        operands = new_operands,
-        operations = tuple(new_ops),
+        name=func.name,
+        operands=new_operands,
+        operations=tuple(new_ops),
         # The returns are chosen by the original function, not by the ops:
         # look up the copy of each returned value instead of returning every
         # op result.
-        results = tuple(new_map[value] for value in func.results),
+        results=tuple(new_map[value] for value in func.results),
     )
 
 
@@ -260,5 +265,5 @@ def clone_function(func: Function) -> Function:
 
     return rebuild_function(
         func,
-        (Value(type = operand.type, name = operand.name) for operand in func.operands),
+        (Value(type=operand.type, name=operand.name) for operand in func.operands),
     )

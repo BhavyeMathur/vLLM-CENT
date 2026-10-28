@@ -1,4 +1,4 @@
-"""Types shared by all ALOI IR levels"""
+"""Types shared by all ALOI IR levels."""
 
 from __future__ import annotations
 
@@ -32,12 +32,12 @@ class DType(StrEnum):
                 return 8
             case DType.FP4:
                 return 4
-        
+
         assert_never(self)
 
     @classmethod
     def normalize(cls, dtype: object) -> DType:
-        """Return stable ALOI spelling for a dtype-like object
+        """Return the stable ALOI spelling of a dtype-like object.
 
         Accepts a ``DType``, its value (``"fp16"``), a ``torch.dtype``, or the
         torch name with or without the ``torch.`` prefix (``"torch.float16"``,
@@ -146,9 +146,10 @@ def packed_axis(*axes: str) -> str:
             raise ValueError(f"cannot pack axis {axis!r}")
     return _PACKED_AXIS_SEPARATOR.join(axes)
 
+
 def outermost_axis(axis_name: str) -> str:
-    """Extract the outermost dimension for sharding
-    
+    """Extract the outermost axis of a possibly packed axis name, for sharding.
+
     If the outermost axis is a packed axis, e.g. "q_head*head_dim", get only the first dimension.
     """
     return axis_name.split(_PACKED_AXIS_SEPARATOR)[0]
@@ -169,27 +170,34 @@ def packed_axis_factors(axis_name: str) -> tuple[str, ...]:
 
     return tuple(axis_name.split(_PACKED_AXIS_SEPARATOR))
 
+
 @dataclass(frozen=True, slots=True)
 class Replicate:
     """Every rank holds the whole tensor."""
 
+
 @dataclass(frozen=True, slots=True)
 class Shard:
     """Every rank holds 1/tp of the tensor along one semantic axis."""
+
     axis: str
+
 
 @dataclass(frozen=True, slots=True)
 class Partial:
     """Every rank holds a full-shape partial sum; the value is the sum over ranks."""
 
+
 Placement = Replicate | Shard | Partial
 
-@dataclass(frozen = True)
-class TensorType:
-    """Tensor shape + semantics + physical annotations
 
-    ''shape'' is the current tensor shape after sharding
-    ''global shape'' is the shape of the whole tensor before sharding, set only after parallel plan is applied
+@dataclass(frozen=True)
+class TensorType:
+    """Tensor shape, plus its semantic and parallel annotations.
+
+    ``shape`` is the current tensor shape, local to a rank after sharding.
+    ``global_shape`` is the shape of the whole tensor before sharding; it is
+    set only after the parallel plan is applied.
 
     ''axes'' names the meaning of each dimension, e.g. ("batch", "seq_len",
     "hidden"). It is empty until AnnotateRolesAndAxes runs; after that every
@@ -215,7 +223,9 @@ class TensorType:
         if any(dim < 0 for dim in self.shape):
             raise ValueError(f"tensor dimensions must be non-negative: {self.shape}")
         if self.axes and len(self.axes) != len(self.shape):
-            raise ValueError(f"{len(self.axes)} axes do not describe rank-{len(self.shape)} tensor")
+            raise ValueError(
+                f"{len(self.axes)} axes do not describe rank-{len(self.shape)} tensor"
+            )
         if self.global_shape is not None and len(self.global_shape) != len(self.shape):
             raise ValueError("global and local tensor ranks differ")
 
@@ -256,7 +266,9 @@ class TensorType:
 
     def dim_of(self, axis: str) -> int:
         """Return the dimension that `axis` splits: named `axis`, or packed with `axis` outermost."""
-        matches = [d for d, name in enumerate(self.axes) if outermost_axis(name) == axis]
+        matches = [
+            d for d, name in enumerate(self.axes) if outermost_axis(name) == axis
+        ]
         if not matches:
             # Inner factors of a packed name do not count: head_dim inside
             # q_head*head_dim is interleaved and cannot be split contiguously.

@@ -19,8 +19,10 @@ OUT = 2
 
 @dataclass(frozen=True, eq=False)
 class _DropsAxes(Operation):
-    """Keeps the operand's shape but forgets its axes, like an op whose
-    infer_result_types was written before axes existed."""
+    """Keeps the operand's shape but forgets its axes.
+
+    Like an op whose infer_result_types was written before axes existed.
+    """
 
     NAME = "test.drops_axes"
     NUM_OPERANDS = 1
@@ -195,7 +197,7 @@ class AnnotateRolesAndAxesTest(unittest.TestCase):
             _annotate(module, annotations)
 
     def test_op_rejects_inconsistent_annotations(self) -> None:
-        """w contracting over 'out' cannot read x's 'hidden' axis."""
+        """A weight contracting over 'out' cannot read x's 'hidden' axis."""
 
         annotations = _block_annotations()
         annotations["w"] = TensorAnnotation(TensorRole.WEIGHT, ("hidden", "out"))

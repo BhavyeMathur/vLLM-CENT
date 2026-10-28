@@ -223,7 +223,9 @@ class FuseAttentionTests(unittest.TestCase):
             operations=(qk, softmax, sv),
             results=(sv.results[0], softmax.results[0]),
         )
-        self.assertEqual(FuseAttention().run_on_function(source).operations, source.operations)
+        self.assertEqual(
+            FuseAttention().run_on_function(source).operations, source.operations
+        )
 
     def test_keeps_tensor_parallel_chain(self) -> None:
         """Heads split across ranks stay decomposed until the fused form has a TP rule.
@@ -275,7 +277,9 @@ class FuseAttentionTests(unittest.TestCase):
             operations=(qk, softmax, sv),
             results=sv.results,
         )
-        self.assertEqual(FuseAttention().run_on_function(source).operations, source.operations)
+        self.assertEqual(
+            FuseAttention().run_on_function(source).operations, source.operations
+        )
 
     def test_returns_the_same_function_without_chains(self) -> None:
         """Nothing to fuse leaves the input function itself, not a rebuilt copy."""

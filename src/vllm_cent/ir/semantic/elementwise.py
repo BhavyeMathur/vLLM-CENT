@@ -27,7 +27,7 @@ __all__ = [
 _INTEGER_DTYPES = frozenset({DType.INT64, DType.INT32, DType.INT8})
 
 
-@dataclass(frozen = True, eq = False, slots = True)
+@dataclass(frozen=True, eq=False, slots=True)
 class ActivationOp(Operation):
     """A parameter-free activation applied to every element.
 
@@ -64,10 +64,10 @@ class ActivationOp(Operation):
 
         if isinstance(self.x.type.placement, Partial):
             raise ValueError(f"{self.NAME}: x is a partial sum; all_reduce it first")
-        return (replace(self.x.type, role = TensorRole.ACTIVATION),)
+        return (replace(self.x.type, role=TensorRole.ACTIVATION),)
 
 
-@dataclass(frozen = True, eq = False, slots=True)
+@dataclass(frozen=True, eq=False, slots=True)
 class ExpOp(Operation):
     """Natural exponential ``e ** x``, element by element.
 
@@ -99,10 +99,10 @@ class ExpOp(Operation):
             )
         if isinstance(self.x.type.placement, Partial):
             raise ValueError(f"{self.NAME}: x is a partial sum; all_reduce it first")
-        return (replace(self.x.type, role = TensorRole.ACTIVATION),)
+        return (replace(self.x.type, role=TensorRole.ACTIVATION),)
 
 
-@dataclass(frozen = True, eq = False, slots=True)
+@dataclass(frozen=True, eq=False, slots=True)
 class _ElementwiseBinaryOp(Operation):
     """Shared rules of ops that combine two same-shaped tensors elementwise.
 
@@ -155,16 +155,16 @@ class _ElementwiseBinaryOp(Operation):
         axes = lhs.axes if lhs.axes and rhs.axes else ()
         return (
             TensorType(
-                shape = lhs.shape,
-                dtype = lhs.dtype,
-                axes = axes,
-                global_shape = lhs.global_shape,
-                placement = lhs.placement,
+                shape=lhs.shape,
+                dtype=lhs.dtype,
+                axes=axes,
+                global_shape=lhs.global_shape,
+                placement=lhs.placement,
             ),
         )
 
 
-@dataclass(frozen = True, eq = False, slots=True)
+@dataclass(frozen=True, eq=False, slots=True)
 class AddOp(_ElementwiseBinaryOp):
     """Elementwise sum, e.g. a residual connection.
 
@@ -174,7 +174,7 @@ class AddOp(_ElementwiseBinaryOp):
     NAME = "aloi.add"
 
 
-@dataclass(frozen = True, eq = False, slots=True)
+@dataclass(frozen=True, eq=False, slots=True)
 class SubOp(_ElementwiseBinaryOp):
     """Elementwise difference ``lhs - rhs``, e.g. subtracting each row's maximum.
 
@@ -184,7 +184,7 @@ class SubOp(_ElementwiseBinaryOp):
     NAME = "aloi.sub"
 
 
-@dataclass(frozen = True, eq = False, slots=True)
+@dataclass(frozen=True, eq=False, slots=True)
 class MulOp(_ElementwiseBinaryOp):
     """Elementwise product, e.g. the SwiGLU gate times the up projection.
 
@@ -194,7 +194,7 @@ class MulOp(_ElementwiseBinaryOp):
     NAME = "aloi.mul"
 
 
-@dataclass(frozen = True, eq = False, slots=True)
+@dataclass(frozen=True, eq=False, slots=True)
 class DivOp(_ElementwiseBinaryOp):
     """Elementwise quotient ``lhs / rhs``, e.g. dividing by a softmax row sum.
 

@@ -4,6 +4,7 @@ import math
 import unittest
 from dataclasses import replace
 
+from tests.test_pipeline_gemv_norm import target
 from vllm_cent.cent import CentSharedBufferAddress
 from vllm_cent.ir import (
     AttentionOp,
@@ -17,11 +18,10 @@ from vllm_cent.ir import (
 from vllm_cent.pipeline import compile_graph
 from vllm_cent.pipeline.attention_codegen import (
     AttentionCommand,
-    _AttentionWorkspace,
     _attention_workspace,
+    _AttentionWorkspace,
 )
 from vllm_cent.runtime import CentNamedScalars
-from tests.test_pipeline_gemv_norm import target
 
 
 def attention(

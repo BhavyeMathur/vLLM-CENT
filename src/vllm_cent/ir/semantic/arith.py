@@ -25,7 +25,7 @@ __all__ = [
 ]
 
 
-@dataclass(frozen = True, eq = False, slots = True)
+@dataclass(frozen=True, eq=False, slots=True)
 class _LastDimReductionOp(Operation):
     """Shared shape and axes rules of reductions over the last dimension.
 
@@ -58,12 +58,12 @@ class _LastDimReductionOp(Operation):
             global_shape = x.global_shape[:-1]
         return (
             TensorType(
-                shape = x.shape[:-1],
-                dtype = x.dtype,
-                role = TensorRole.ACTIVATION,
-                axes = x.axes[:-1],
-                global_shape = global_shape,
-                placement = placement,
+                shape=x.shape[:-1],
+                dtype=x.dtype,
+                role=TensorRole.ACTIVATION,
+                axes=x.axes[:-1],
+                global_shape=global_shape,
+                placement=placement,
             ),
         )
 
@@ -82,7 +82,7 @@ class _LastDimReductionOp(Operation):
         """
 
 
-@dataclass(frozen = True, eq = False, slots = True)
+@dataclass(frozen=True, eq=False, slots=True)
 class SumOp(_LastDimReductionOp):
     """Sum of each row: ``y[...] = sum(x[..., i] for i)``.
 
@@ -116,7 +116,7 @@ class SumOp(_LastDimReductionOp):
         return x.placement
 
 
-@dataclass(frozen = True, eq = False, slots = True)
+@dataclass(frozen=True, eq=False, slots=True)
 class MaxOp(_LastDimReductionOp):
     """Largest element of each row: ``y[...] = max(x[..., i] for i)``.
 

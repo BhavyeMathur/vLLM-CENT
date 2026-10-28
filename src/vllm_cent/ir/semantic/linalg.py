@@ -16,7 +16,7 @@ __all__ = [
 ]
 
 
-@dataclass(frozen = True, eq = False, slots=True)
+@dataclass(frozen=True, eq=False, slots=True)
 class LinearOp(Operation):
     """Linear transform of the last dimension, with an optional bias.
 
@@ -33,16 +33,18 @@ class LinearOp(Operation):
     NUM_OPERANDS = (2, 3)
 
     def infer_result_types(self) -> tuple[TensorType, ...]:
-        """Matrix multiplication on inner-most dimensions of in_feature with weight"""
+        """Multiply x's last dimension (in_features) by the weight, plus the bias."""
 
-        if (self.x.type.dtype != self.weight.type.dtype):
+        if self.x.type.dtype != self.weight.type.dtype:
             raise ValueError("Operands should have the same datatype")
 
-        if (len(self.x.type.shape) < 1):
+        if len(self.x.type.shape) < 1:
             raise ValueError("x would have dimensions of [*, in_features]")
-        
-        if (len(self.weight.type.shape) != 2):
-            raise ValueError("Weight should have 2 dimensions [out_features, in_features]")
+
+        if len(self.weight.type.shape) != 2:
+            raise ValueError(
+                "Weight should have 2 dimensions [out_features, in_features]"
+            )
 
         bias = self.bias
         if bias is not None and bias.type.dtype != self.x.type.dtype:
@@ -56,7 +58,7 @@ class LinearOp(Operation):
         placement = self._result_placement()
         self._check_bias_placement(placement)
 
-        if (self.x.type.shape[-1] != self.weight.type.shape[-1]):
+        if self.x.type.shape[-1] != self.weight.type.shape[-1]:
             raise ValueError("Weight should have shape [out_features, in_features]")
 
         if bias is not None and bias.type.shape[0] != self.out_features:
@@ -77,11 +79,11 @@ class LinearOp(Operation):
 
         return (
             TensorType(
-                shape = self.x.type.shape[:-1] + (self.out_features,),
-                dtype = self.operands[0].type.dtype,
-                axes = self._result_axes(),
-                global_shape = global_shape,
-                placement = placement,
+                shape=(*self.x.type.shape[:-1], self.out_features),
+                dtype=self.operands[0].type.dtype,
+                axes=self._result_axes(),
+                global_shape=global_shape,
+                placement=placement,
             ),
         )
 

@@ -298,9 +298,7 @@ class PlacementTest(unittest.TestCase):
         self.assertEqual(Shard("q_head"), Shard("q_head"))
         self.assertNotEqual(Shard("q_head"), Shard("kv_head"))
         self.assertNotEqual(Partial(), Replicate())
-        self.assertEqual(
-            len({Replicate(), Replicate(), Partial(), Shard("q_head")}), 3
-        )
+        self.assertEqual(len({Replicate(), Replicate(), Partial(), Shard("q_head")}), 3)
 
     def test_unannotated_type_is_replicated(self) -> None:
         """Before tensor parallelism every tensor is whole on every rank."""
@@ -553,7 +551,9 @@ class OperationTest(unittest.TestCase):
         """Operands and results are structure, not printable attributes."""
 
         x = Value(type=VECTOR)
-        self.assertEqual(_Scale(operands=(x,), factor=3.0).attributes(), {"factor": 3.0})
+        self.assertEqual(
+            _Scale(operands=(x,), factor=3.0).attributes(), {"factor": 3.0}
+        )
         self.assertEqual(_Identity(operands=(x,)).attributes(), {})
 
     def test_subclass_may_declare_required_attribute(self) -> None:
@@ -1017,7 +1017,9 @@ class RebuildFunctionRewriteTest(unittest.TestCase):
 
         original = _scale_then_identity()
         with self.assertRaises(ValueError):
-            rebuild_function(original, _fresh_arguments(original), rewrite=lambda op: ())
+            rebuild_function(
+                original, _fresh_arguments(original), rewrite=lambda op: ()
+            )
 
     def test_rejects_result_count_mismatch(self) -> None:
         """The last op must have as many results as the op it replaces."""
@@ -1029,7 +1031,9 @@ class RebuildFunctionRewriteTest(unittest.TestCase):
 
         original = _scale_then_identity()
         with self.assertRaises(ValueError):
-            rebuild_function(original, _fresh_arguments(original), rewrite=end_with_sink)
+            rebuild_function(
+                original, _fresh_arguments(original), rewrite=end_with_sink
+            )
 
 
 if __name__ == "__main__":

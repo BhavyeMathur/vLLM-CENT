@@ -15,8 +15,7 @@ import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
 from torch.export import Dim
 
-from vllm_cent.frontend import aloi, export_model, import_exported_program
-from vllm_cent.frontend import importer
+from vllm_cent.frontend import aloi, export_model, import_exported_program, importer
 from vllm_cent.ir import print_module
 
 
@@ -323,8 +322,10 @@ class TransformerCustomOpTest(unittest.TestCase):
         torch.testing.assert_close(rotated, expected)
 
     def test_rope_gptj_style_rotates_adjacent_pairs(self) -> None:
-        """GPT-J style: elements 0 and 1 pair up, so [1, 0, 0, 0] gives
-        [cos 2, sin 2, 0, 0]."""
+        """GPT-J style: elements 0 and 1 pair up.
+
+        So [1, 0, 0, 0] gives [cos 2, sin 2, 0, 0].
+        """
 
         table = aloi.RotaryEmbedding(4, 4, 10000.0).cos_sin_cache
         x = torch.tensor([[[[1.0, 0.0, 0.0, 0.0]]]])

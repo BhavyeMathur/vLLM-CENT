@@ -183,9 +183,7 @@ def _nonnegative_int(section: str, key: str, value: object) -> int:
     """
 
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ValueError(
-            f"run spec {section}.{key} must be an int >= 0, got {value!r}"
-        )
+        raise ValueError(f"run spec {section}.{key} must be an int >= 0, got {value!r}")
     return value
 
 

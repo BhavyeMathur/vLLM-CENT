@@ -169,9 +169,7 @@ class Llama4Config:
             int((layer + 1) % _NO_ROPE_LAYER_INTERVAL != 0) for layer in range(layers)
         )
         step = int(text.get("interleave_moe_layer_step", 1))
-        moe_layers = tuple(
-            text.get("moe_layers") or range(step - 1, layers, step)
-        )
+        moe_layers = tuple(text.get("moe_layers") or range(step - 1, layers, step))
         scaling = text.get("rope_scaling")
         return cls(
             hidden_size=int(text["hidden_size"]),

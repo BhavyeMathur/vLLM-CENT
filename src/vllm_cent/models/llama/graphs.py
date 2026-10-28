@@ -71,7 +71,6 @@ def build_feed_forward_graph(
     hidden = model.hidden_size
     intermediate = model.intermediate_size
 
-
     def label(name: str) -> str:
         """Prefix a result name with the block label, as module paths do.
 
@@ -111,9 +110,7 @@ def build_feed_forward_graph(
     down_projection = LinearOp(
         operands=(*gate_product.results, down_weight), name_hint=label("projected")
     )
-    residual = AddOp(
-        operands=(x, *down_projection.results), name_hint=label("output")
-    )
+    residual = AddOp(operands=(x, *down_projection.results), name_hint=label("output"))
     function = Function(
         name="feed_forward",
         operands=(x, norm_weight, gate_weight, up_weight, down_weight),

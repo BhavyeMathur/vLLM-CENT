@@ -5,13 +5,13 @@ import unittest
 from dataclasses import replace
 
 from vllm_cent.cent import CentHardwareSpec
+from vllm_cent.ir import DType, Function, LinearOp, RMSNormOp, TensorType, Value
 from vllm_cent.pipeline import (
     AccumulatorPlacement,
     CentTargetProfile,
     ExecutionContract,
     compile_graph,
 )
-from vllm_cent.ir import DType, Function, LinearOp, RMSNormOp, TensorType, Value
 from vllm_cent.runtime import CentNamedScalars
 
 

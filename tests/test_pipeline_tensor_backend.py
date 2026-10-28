@@ -4,10 +4,10 @@ import unittest
 from dataclasses import replace
 
 from vllm_cent.cent import (
+    CentChannelSet,
     CentHardwareSpec,
     CentMemoryAddress,
     CentSharedBufferAddress,
-    CentChannelSet,
     ElementwiseMultiply,
     ReadSingleBank,
     WriteSingleBank,

@@ -20,7 +20,7 @@ __all__ = [
 ]
 
 
-@dataclass(frozen = True, eq = False, slots=True)
+@dataclass(frozen=True, eq=False, slots=True)
 class CopyOp(Operation):
     """A copy of x as a new value; every element stays where it is.
 
@@ -41,10 +41,10 @@ class CopyOp(Operation):
         part and summing later gives the same tensor as summing first.
         """
 
-        return (replace(self.x.type, role = TensorRole.ACTIVATION),)
+        return (replace(self.x.type, role=TensorRole.ACTIVATION),)
 
 
-@dataclass(frozen = True, eq = False, slots=True)
+@dataclass(frozen=True, eq=False, slots=True)
 class ReshapeOp(Operation):
     """View x's elements, in row-major order, with a new shape.
 
@@ -85,14 +85,12 @@ class ReshapeOp(Operation):
 
         x = self.x.type
         if any(d < 0 for d in self.shape) or prod(self.shape) != prod(x.shape):
-            raise ValueError(
-                f"{self.NAME}: cannot reshape {x.shape} to {self.shape}"
-            )
+            raise ValueError(f"{self.NAME}: cannot reshape {x.shape} to {self.shape}")
         if not isinstance(x.placement, Replicate):
             raise ValueError(
                 f"{self.NAME}: x is {x.placement}; only whole tensors are reshaped"
             )
-        return (TensorType(shape = tuple(self.shape), dtype = x.dtype),)
+        return (TensorType(shape=tuple(self.shape), dtype=x.dtype),)
 
 
 @dataclass(frozen=True, eq=False, slots=True)
@@ -144,7 +142,7 @@ class BroadcastOp(Operation):
             raise ValueError(f"{self.NAME}: size must be at least 1, got {self.size}")
         axes: tuple[str, ...] = ()
         if x.axes:
-            # If the axes have already been annotated, then the new axis must 
+            # If the axes have already been annotated, then the new axis must
             # also be annotated, and the name of the new axis may not repeat
             # existing axes names. Otherwise, Shard(axis) will hit two axes
             if self.axis is None or self.axis in x.axes:
@@ -156,10 +154,10 @@ class BroadcastOp(Operation):
         global_shape = None if x.global_shape is None else (*x.global_shape, self.size)
         return (
             replace(
-                x, 
-                shape=(*x.shape, self.size), 
+                x,
+                shape=(*x.shape, self.size),
                 role=TensorRole.ACTIVATION,
-                axes=axes, 
+                axes=axes,
                 global_shape=global_shape,
             ),
         )

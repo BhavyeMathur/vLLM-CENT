@@ -41,8 +41,12 @@ EXAMPLE_DIR = Path(__file__).resolve().parents[1] / "examples" / "llama4_scout"
 SCOUT_JSON = EXAMPLE_DIR / "llama4_scout.json"
 SCOUT = Llama4Config.from_hf(json.loads(SCOUT_JSON.read_text()))
 RUNS = {
-    "rope_layer": load_run_spec(EXAMPLE_DIR / "runs" / "llama4_scout_rope_tp8_decode.yaml"),
-    "nope_layer": load_run_spec(EXAMPLE_DIR / "runs" / "llama4_scout_nope_tp8_decode.yaml"),
+    "rope_layer": load_run_spec(
+        EXAMPLE_DIR / "runs" / "llama4_scout_rope_tp8_decode.yaml"
+    ),
+    "nope_layer": load_run_spec(
+        EXAMPLE_DIR / "runs" / "llama4_scout_nope_tp8_decode.yaml"
+    ),
 }
 
 # Golden IR of both layer types, tp=8, context 2048, written by
@@ -122,10 +126,18 @@ def _reference_layer(
     config = SMALL
     attn = layer.self_attn
     batch = x.shape[0]
-    h = F.rms_norm(x, (config.hidden_size,), layer.input_layernorm.weight, config.rms_norm_eps)
-    q = (h @ attn.q_proj.weight.T).view(batch, 1, config.num_attention_heads, config.head_dim)
-    k = (h @ attn.k_proj.weight.T).view(batch, 1, config.num_key_value_heads, config.head_dim)
-    v = (h @ attn.v_proj.weight.T).view(batch, 1, config.num_key_value_heads, config.head_dim)
+    h = F.rms_norm(
+        x, (config.hidden_size,), layer.input_layernorm.weight, config.rms_norm_eps
+    )
+    q = (h @ attn.q_proj.weight.T).view(
+        batch, 1, config.num_attention_heads, config.head_dim
+    )
+    k = (h @ attn.k_proj.weight.T).view(
+        batch, 1, config.num_key_value_heads, config.head_dim
+    )
+    v = (h @ attn.v_proj.weight.T).view(
+        batch, 1, config.num_key_value_heads, config.head_dim
+    )
     if config.uses_rope(layer_index):
         assert attn.rotary_emb is not None
         cos, sin = attn.rotary_emb.cos_sin_cache[positions].chunk(2, dim=-1)
@@ -136,7 +148,10 @@ def _reference_layer(
             pairs = torch.view_as_complex(t.float().reshape(*t.shape[:-1], -1, 2))
             return torch.view_as_real(pairs * freqs).flatten(3)
 
-        q, k = _rms(rotate(q), config.rms_norm_eps), _rms(rotate(k), config.rms_norm_eps)
+        q, k = (
+            _rms(rotate(q), config.rms_norm_eps),
+            _rms(rotate(k), config.rms_norm_eps),
+        )
     else:
         scale = torch.log1p(torch.floor((positions.float() + 1.0) / config.floor_scale))
         q = q * (scale * config.attn_scale + 1.0)[:, :, None, None]
@@ -153,7 +168,10 @@ def _reference_layer(
 
     moe = layer.feed_forward
     tokens = F.rms_norm(
-        hidden, (config.hidden_size,), layer.post_attention_layernorm.weight, config.rms_norm_eps
+        hidden,
+        (config.hidden_size,),
+        layer.post_attention_layernorm.weight,
+        config.rms_norm_eps,
     ).reshape(-1, config.hidden_size)
     logits = tokens @ moe.router.weight.T
     top_value, top_index = torch.topk(logits, config.num_experts_per_tok, dim=1)
@@ -163,7 +181,8 @@ def _reference_layer(
     experts = config.num_local_experts
     routed_in = tokens.repeat(experts, 1) * router_scores.transpose(0, 1).reshape(-1, 1)
     gate_up_proj = torch.cat(
-        (moe.experts.gate_proj.transpose(1, 2), moe.experts.up_proj.transpose(1, 2)), dim=-1
+        (moe.experts.gate_proj.transpose(1, 2), moe.experts.up_proj.transpose(1, 2)),
+        dim=-1,
     )
     gate_up = torch.bmm(routed_in.view(experts, -1, config.hidden_size), gate_up_proj)
     gate, up = gate_up.chunk(2, dim=-1)
@@ -185,7 +204,9 @@ def _sharded_module(layer: int, tp: int) -> Module:
     Returns:
         The IR one rank runs.
     """
-    program = export_model(build_meta_decoder_layer(SCOUT, layer), example_inputs(SCOUT))
+    program = export_model(
+        build_meta_decoder_layer(SCOUT, layer), example_inputs(SCOUT)
+    )
     plan = dataclasses.replace(RUNS["rope_layer"].parallel, tp=tp).build_plan()
     return PassManager(
         (
@@ -258,7 +279,10 @@ class MetaLayerTest(unittest.TestCase):
     def test_only_rope_layers_have_a_rotary_table(self) -> None:
         """The NoPE layer has the same parameters and no cos/sin buffer."""
         buffers = {
-            layer: [name for name, _ in build_meta_decoder_layer(SCOUT, layer).named_buffers()]
+            layer: [
+                name
+                for name, _ in build_meta_decoder_layer(SCOUT, layer).named_buffers()
+            ]
             for layer in (ROPE_LAYER, NOPE_LAYER)
         }
         self.assertEqual(buffers[ROPE_LAYER], ["self_attn.rotary_emb.cos_sin_cache"])

@@ -1,4 +1,4 @@
-"""Command line: compile a model as a run spec describes.
+r"""Command line: compile a model as a run spec describes.
 
     aloi-compile --model examples/llama_70b/llama3_1_70b.json \\
                  --run examples/llama_70b/runs/llama3_1_70b_tp8_decode.yaml

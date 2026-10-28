@@ -342,9 +342,9 @@ class MlirExecutionTests(unittest.TestCase):
 
     def test_mlir_multiply_add_chain_executes(self) -> None:
         """Run native multiplication through DRAM staging and then Shared Buffer addition."""
+        from tests.test_pipeline import target
         from vllm_cent.pipeline import compile_graph, compile_mlir
         from vllm_cent.runtime import CentNamedScalars
-        from tests.test_pipeline import target
 
         left, right = _arguments()
         product = MulOp(operands=(left, right), name_hint="product")

@@ -271,7 +271,9 @@ class Llama4DecoderLayer(nn.Module):
 
         super().__init__()
         if layer not in config.moe_layers:
-            raise NotImplementedError(f"layer {layer} is dense; only MoE layers are modeled")
+            raise NotImplementedError(
+                f"layer {layer} is dense; only MoE layers are modeled"
+            )
         self.input_layernorm = aloi.RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.self_attn = Llama4Attention(config, layer)
         self.post_attention_layernorm = aloi.RMSNorm(

@@ -147,7 +147,11 @@ class AnnotateRolesAndAxes(FunctionPass):
         for op in annotated.operations:
             for result in op.results:
                 if len(result.type.axes) != result.type.rank:
-                    label = op.NAME if op.name_hint is None else f"{op.NAME} ({op.name_hint})"
+                    label = (
+                        op.NAME
+                        if op.name_hint is None
+                        else f"{op.NAME} ({op.name_hint})"
+                    )
                     raise ValueError(f"{label} does not propagate axes to its result")
 
         return annotated
