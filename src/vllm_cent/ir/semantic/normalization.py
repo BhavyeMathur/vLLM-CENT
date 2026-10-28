@@ -9,33 +9,34 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from math import inf
 
-from ..base import Operation, Value
+from ..base import Decomposable, Operation, Value
 from ..types import Partial, Replicate, Shard, TensorRole, TensorType
+from .arith import MaxOp, SumOp
+from .elementwise import DivOp, ExpOp, SubOp
+from .tensor import BroadcastOp
 
 __all__ = [
     "RMSNormOp",
+    "RMSNormRules",
     "SoftmaxOp",
+    "SoftmaxRules",
 ]
 
 
 @dataclass(frozen = True, eq = False, slots=True)
-class RMSNormOp(Operation):
-    """RMS normalization over the last dimension, with an optional scale.
+class RMSNormRules(Operation):
+    """Type rules shared by every RMSNorm op, at any IR level; not an op itself.
 
-    ``y = x / sqrt(mean(x**2) + eps)``, then multiplied element-wise by
-    ``weight`` when one is given. Without a weight this is the unscaled form
-    of ``nn.RMSNorm(elementwise_affine=False)``, which Llama 4 applies to
-    queries and keys (its "L2Norm").
-
-    RMSNormOp(operands=(x, weight), eps=1e-5)
-    RMSNormOp(operands=(x,), eps=1e-5)
+    ``aloi.rms_norm`` and device RMSNorm ops (e.g. ``pnm.rms_norm``) derive
+    from this class, so they check shapes and placements identically. Once
+    ``aloi.rms_norm`` becomes ``Decomposable``, the device ops must not
+    inherit that: their parts would be semantic ops.
 
     Attributes:
         eps: Constant added to the mean square; None means the machine
             epsilon of x's dtype, as in ``torch.nn.RMSNorm``.
     """
 
-    NAME = "aloi.rms_norm"
     # x, and optionally the learned per-feature scale.
     NUM_OPERANDS = (1, 2)
 
@@ -130,14 +131,37 @@ class RMSNormOp(Operation):
         return (replace(self.x.type, role = TensorRole.ACTIVATION),)
 
 
-@dataclass(frozen = True, eq = False, slots=True)
-class SoftmaxOp(Operation):
-    """Softmax over the last dimension.
 
-    SoftmaxOp(operands=(x,))
+@dataclass(frozen = True, eq = False, slots=True)
+class RMSNormOp(RMSNormRules):
+    """RMS normalization over the last dimension, with an optional scale.
+
+    ``y = x / sqrt(mean(x**2) + eps)``, then multiplied element-wise by
+    ``weight`` when one is given. Without a weight this is the unscaled form
+    of ``nn.RMSNorm(elementwise_affine=False)``, which Llama 4 applies to
+    queries and keys (its "L2Norm").
+
+    RMSNormOp(operands=(x, weight), eps=1e-5)
+    RMSNormOp(operands=(x,), eps=1e-5)
     """
 
-    NAME = "aloi.softmax"
+    # TODO(RMSNorm decomposition): Implement Decomposable once the IR can
+    # express mean / sqrt / eps (constants or an rms_inverse op) and the
+    # weight's broadcast over the leading dimensions.
+
+    NAME = "aloi.rms_norm"
+
+
+@dataclass(frozen = True, eq = False, slots=True)
+class SoftmaxRules(Operation):
+    """Type rules shared by every softmax op, at any IR level; not an op itself.
+
+    ``aloi.softmax`` and device softmax ops (e.g. ``pnm.softmax``) derive
+    from this class, so they check shapes and placements identically. Only
+    ``aloi.softmax`` is ``Decomposable``: its decomposition yields semantic
+    ops, which a device op must not turn back into.
+    """
+
     NUM_OPERANDS = 1
 
     @property
@@ -163,3 +187,37 @@ class SoftmaxOp(Operation):
                 "softmax needs the whole dimension on every rank"
             )
         return (replace(self.x.type, role = TensorRole.ACTIVATION),)
+
+
+@dataclass(frozen = True, eq = False, slots=True)
+class SoftmaxOp(SoftmaxRules, Decomposable):
+    """Softmax over the last dimension.
+
+    SoftmaxOp(operands=(x,))
+    """
+
+    NAME = "aloi.softmax"
+
+    def decompose(self) -> tuple[Operation, ...]:
+        """exp(x - max(x)) / sum(exp(x - max(x))), row by row.
+
+        Subtracting the row maximum first keeps every exponent <= 0, so exp
+        cannot overflow; mathematically it cancels out.
+        """
+
+        x = self.x
+        hint = self.name_hint or "softmax"
+        width = x.type.shape[-1]
+        axis = x.type.axes[-1] if x.type.axes else None
+        
+        row_max = MaxOp(operands = (x,), name_hint = f"{hint}.max")
+        max_rows = BroadcastOp(operands = row_max.results, size = width, axis = axis, name_hint = f"{hint}.max_rows")
+        shifted = SubOp(operands=(x, *max_rows.results), name_hint=f"{hint}.shifted")
+        exps = ExpOp(operands=shifted.results, name_hint=f"{hint}.exp")
+        total = SumOp(operands=exps.results, name_hint=f"{hint}.sum")
+        total_rows = BroadcastOp(operands=total.results, size=width, axis=axis,
+                                name_hint=f"{hint}.sum_rows")
+        # The last op stands for the softmax; it keeps the softmax's own name,
+        # so later ops print the same operand names as before.
+        result = DivOp(operands=(*exps.results, *total_rows.results), name_hint=self.name_hint)
+        return (row_max, max_rows, shifted, exps, total, total_rows, result)

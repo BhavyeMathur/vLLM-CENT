@@ -292,6 +292,25 @@ def _tensor_op(op_class: type[Operation], *operand_names: str) -> _Converter:
     return convert
 
 
+def _convert_linear(
+    node: Node, env: dict[Node, Value], name_hint: str | None
+) -> Operation:
+    """Convert ``aloi::linear(x, weight, bias=None)`` into a ``LinearOp``.
+
+    A None bias gives the two-operand form.
+    """
+
+    arguments = _arguments(node)
+    bias = arguments["bias"]
+    operands: tuple[Value, ...] = (
+        _value(env, arguments["x"]),
+        _value(env, arguments["weight"]),
+    )
+    if bias is not None:
+        operands += (_value(env, bias),)
+    return LinearOp(operands=operands, name_hint=name_hint)
+
+
 def _convert_rms_norm(
     node: Node, env: dict[Node, Value], name_hint: str | None
 ) -> Operation:
@@ -521,7 +540,7 @@ def _convert_add(
 # model writes as F.silu(x), a * b, a + b, x.clone() and x.view(...).
 # Several aten activations map to one ActivationOp with different kinds.
 _CONVERTERS: dict[OpOverload, _Converter] = {
-    torch.ops.aloi.linear.default: _tensor_op(LinearOp, "x", "weight"),
+    torch.ops.aloi.linear.default: _convert_linear,
     torch.ops.aloi.rms_norm.default: _convert_rms_norm,
     torch.ops.aloi.split_heads.default: _convert_split_heads,
     torch.ops.aloi.merge_heads.default: _tensor_op(MergeHeadsOp, "x"),

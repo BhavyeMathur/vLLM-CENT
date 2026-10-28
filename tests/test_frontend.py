@@ -24,15 +24,16 @@ from vllm_cent.ir import print_module
 # real kernel produces. Routed to the linear converter, it makes PyTorch's and
 # ALOI's shape inference disagree. Registered once at import: registering the
 # same name twice raises.
+# Its signature matches aloi::linear's so that the linear converter can read it.
 @torch.library.custom_op("aloi_test::lying_linear", mutates_args=())
-def _lying_linear(x: Tensor, weight: Tensor) -> Tensor:
-    """Compute ``x @ weight.T``, like ``aloi::linear``."""
+def _lying_linear(x: Tensor, weight: Tensor, bias: Tensor | None = None) -> Tensor:
+    """Compute ``x @ weight.T + bias``, like ``aloi::linear``."""
 
-    return F.linear(x, weight)
+    return F.linear(x, weight, bias)
 
 
 @_lying_linear.register_fake
-def _(x: Tensor, weight: Tensor) -> Tensor:
+def _(x: Tensor, weight: Tensor, bias: Tensor | None = None) -> Tensor:
     """Return a result one column wider than the real kernel's."""
 
     return x.new_empty((*x.shape[:-1], weight.shape[0] + 1))
@@ -221,6 +222,34 @@ class LayerTest(unittest.TestCase):
             reference.weight.copy_(layer.weight)
         x = torch.randn(2, 3, 16)
         self.assertTrue(torch.equal(layer(x), reference(x)))
+
+    def test_linear_layer_with_bias(self) -> None:
+        """bias=True matches nn.Linear: a [4] bias parameter, added to every row."""
+
+        torch.manual_seed(0)
+        layer = aloi.Linear(16, 4, bias=True)
+        reference = nn.Linear(16, 4)
+        self.assertEqual(
+            {name: tuple(p.shape) for name, p in layer.named_parameters()},
+            {"weight": (4, 16), "bias": (4,)},
+        )
+        with torch.no_grad():
+            layer.weight.copy_(torch.randn(4, 16))
+            layer.bias.copy_(torch.randn(4))
+            reference.weight.copy_(layer.weight)
+            reference.bias.copy_(layer.bias)
+        x = torch.randn(2, 3, 16)
+        torch.testing.assert_close(layer(x), reference(x))
+        # Without a bias the attribute exists but holds no parameter.
+        self.assertIsNone(aloi.Linear(16, 4).bias)
+
+    def test_linear_fake_rejects_bad_bias(self) -> None:
+        """The fake kernel checks the bias against out_features at export time."""
+
+        with self.assertRaisesRegex(
+            ValueError, r"Bias should have shape \[out_features\]"
+        ):
+            export_model(_LinearWithBias(4, 3), (torch.empty(1, 4, device="meta"),))
 
     def test_rms_norm_layer(self) -> None:
         """Same parameter name, initial weight and result as nn.RMSNorm."""
@@ -737,6 +766,34 @@ class Llama4KernelTest(unittest.TestCase):
                 )
 
 
+class _LinearWithBias(nn.Module):
+    """Calls aloi.linear with a bias of a chosen length."""
+
+    def __init__(self, out_features: int, bias_width: int) -> None:
+        """Create a [out_features, 4] weight and a [bias_width] bias.
+
+        Args:
+            out_features: Rows of the weight.
+            bias_width: Length of the bias; differs from out_features to
+                test the fake kernel's check.
+        """
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(out_features, 4, device="meta"))
+        self.bias = nn.Parameter(torch.empty(bias_width, device="meta"))
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Compute ``x @ weight.T + bias``.
+
+        Args:
+            x: ``[*, 4]``.
+
+        Returns:
+            ``[*, out_features]``.
+        """
+        projected: Tensor = aloi.linear(x, self.weight, self.bias)
+        return projected
+
+
 class ConverterTest(unittest.TestCase):
     """aten elementwise ops, argument defaults and result names."""
 
@@ -800,6 +857,17 @@ class ConverterTest(unittest.TestCase):
             "aloi.moe_experts(%x, %routing_weights, %experts.gate_proj, "
             "%experts.up_proj, %experts.down_proj) {apply_router_weight_on_input = true}",
             text,
+        )
+
+    def test_linear_bias_is_the_third_operand(self) -> None:
+        """aloi.Linear(bias=True) imports as aloi.linear(%x, %w, %b)."""
+
+        with torch.device("meta"):
+            layer = aloi.Linear(4, 3, bias=True)
+        self.assertEqual(
+            _op_line(layer, 1, 4),
+            "%function = aloi.linear(%x, %function.weight, %function.bias) "
+            ": tensor<1x3xfp32>",
         )
 
     def test_aten_activations_become_one_op(self) -> None:

@@ -455,6 +455,13 @@ def _device_kind(op: Operation, name: str) -> DeviceOperationKind:
     if isinstance(op, (ReshapeOp, SplitHeadsOp, MergeHeadsOp)):
         return DeviceOperationKind.RESHAPE
     if isinstance(op, LinearOp):
+        # TODO(linear bias): The reference GEMV lowering computes x @ W.T
+        # only. A bias needs either an addition after it or a bias-aware
+        # accumulator initialization (CENT's WR_BIAS); neither is wired up.
+        if op.bias is not None:
+            raise NotImplementedError(
+                f"No device legalization for {op.NAME} with a bias ({name})"
+            )
         return DeviceOperationKind.LINEAR
     if isinstance(op, AttentionOp):
         return DeviceOperationKind.ATTENTION

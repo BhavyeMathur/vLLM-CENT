@@ -12,13 +12,19 @@ from dataclasses import dataclass, replace
 
 from ...activations import ActivationKind
 from ..base import Operation, Value
-from ..types import Partial, TensorRole, TensorType
+from ..types import DType, Partial, TensorRole, TensorType
 
 __all__ = [
     "ActivationOp",
     "AddOp",
+    "DivOp",
+    "ExpOp",
     "MulOp",
+    "SubOp",
 ]
+
+# Dtypes without a fractional part: exp and true division do not apply.
+_INTEGER_DTYPES = frozenset({DType.INT64, DType.INT32, DType.INT8})
 
 
 @dataclass(frozen = True, eq = False, slots = True)
@@ -56,6 +62,41 @@ class ActivationOp(Operation):
                 first.
         """
 
+        if isinstance(self.x.type.placement, Partial):
+            raise ValueError(f"{self.NAME}: x is a partial sum; all_reduce it first")
+        return (replace(self.x.type, role = TensorRole.ACTIVATION),)
+
+
+@dataclass(frozen = True, eq = False, slots=True)
+class ExpOp(Operation):
+    """Natural exponential ``e ** x``, element by element.
+
+    ExpOp(operands=(x,))
+    """
+
+    NAME = "aloi.exp"
+    NUM_OPERANDS = 1
+
+    @property
+    def x(self) -> Value:
+        return self.operands[0]
+
+    def infer_result_types(self) -> tuple[TensorType, ...]:
+        """The result has x's shape, dtype, axes and placement.
+
+        A split x stays split the same way: each element's result depends
+        only on that element.
+
+        Raises:
+            ValueError: If x has an integer dtype (e ** x is not an integer),
+                or x is a partial sum: exp(a) + exp(b) != exp(a + b), so the
+                parts must be summed first.
+        """
+
+        if self.x.type.dtype in _INTEGER_DTYPES:
+            raise ValueError(
+                f"{self.NAME}: x must be floating point, got {self.x.type.dtype}"
+            )
         if isinstance(self.x.type.placement, Partial):
             raise ValueError(f"{self.NAME}: x is a partial sum; all_reduce it first")
         return (replace(self.x.type, role = TensorRole.ACTIVATION),)
@@ -134,6 +175,16 @@ class AddOp(_ElementwiseBinaryOp):
 
 
 @dataclass(frozen = True, eq = False, slots=True)
+class SubOp(_ElementwiseBinaryOp):
+    """Elementwise difference ``lhs - rhs``, e.g. subtracting each row's maximum.
+
+    SubOp(operands=(lhs, rhs))
+    """
+
+    NAME = "aloi.sub"
+
+
+@dataclass(frozen = True, eq = False, slots=True)
 class MulOp(_ElementwiseBinaryOp):
     """Elementwise product, e.g. the SwiGLU gate times the up projection.
 
@@ -141,3 +192,31 @@ class MulOp(_ElementwiseBinaryOp):
     """
 
     NAME = "aloi.mul"
+
+
+@dataclass(frozen = True, eq = False, slots=True)
+class DivOp(_ElementwiseBinaryOp):
+    """Elementwise quotient ``lhs / rhs``, e.g. dividing by a softmax row sum.
+
+    This is true division of floating-point values. How a target computes it,
+    e.g. a reciprocal followed by a multiplication, is a lowering choice.
+
+    DivOp(operands=(lhs, rhs))
+    """
+
+    NAME = "aloi.div"
+
+    def infer_result_types(self) -> tuple[TensorType, ...]:
+        """Check the operands like the other binary ops, and reject integers.
+
+        Raises:
+            ValueError: As for the other binary ops, or if the operands are
+                integers (integer division would need a rounding mode).
+        """
+
+        if self.lhs.type.dtype in _INTEGER_DTYPES:
+            raise ValueError(
+                f"{self.NAME}: operands must be floating point, "
+                f"got {self.lhs.type.dtype}"
+            )
+        return super().infer_result_types()

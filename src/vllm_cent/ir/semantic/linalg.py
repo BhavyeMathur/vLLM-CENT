@@ -18,16 +18,19 @@ __all__ = [
 
 @dataclass(frozen = True, eq = False, slots=True)
 class LinearOp(Operation):
-    """
-    LinearOp(
-        operands=(x, weight),
-    )
+    """Linear transform of the last dimension, with an optional bias.
 
-    y = x @ weight.T
+    ``y = x @ weight.T``, plus ``bias`` added to every output row when given.
+    The weight uses the ``nn.Linear`` layout ``[out_features, in_features]``,
+    and the bias has ``out_features`` elements.
+
+    LinearOp(operands=(x, weight))
+    LinearOp(operands=(x, weight, bias))
     """
 
     NAME = "aloi.linear"
-    NUM_OPERANDS = 2
+    # x and weight, and optionally a bias.
+    NUM_OPERANDS = (2, 3)
 
     def infer_result_types(self) -> tuple[TensorType, ...]:
         """Matrix multiplication on inner-most dimensions of in_feature with weight"""
@@ -41,13 +44,26 @@ class LinearOp(Operation):
         if (len(self.weight.type.shape) != 2):
             raise ValueError("Weight should have 2 dimensions [out_features, in_features]")
 
+        bias = self.bias
+        if bias is not None and bias.type.dtype != self.x.type.dtype:
+            raise ValueError("Bias should have the same datatype as x")
+        if bias is not None and len(bias.type.shape) != 1:
+            raise ValueError("Bias should have 1 dimension [out_features]")
+
         # Check placements before shapes: when only one operand is sharded,
         # the local shapes disagree too, and "unsupported placements" says
         # what is actually wrong.
         placement = self._result_placement()
+        self._check_bias_placement(placement)
 
         if (self.x.type.shape[-1] != self.weight.type.shape[-1]):
             raise ValueError("Weight should have shape [out_features, in_features]")
+
+        if bias is not None and bias.type.shape[0] != self.out_features:
+            raise ValueError(
+                f"{self.NAME}: bias has {bias.type.shape[0]} elements, "
+                f"expected out_features {self.out_features}"
+            )
 
         # A sharded result remembers its whole size. Its leading dimensions
         # come from x and its last one is the weight's whole out_features.
@@ -113,6 +129,41 @@ class LinearOp(Operation):
             f"x={x.placement}, weight={weight.placement}"
         )
 
+    def _check_bias_placement(self, result_placement: Placement) -> None:
+        """Check that each rank holds the part of the bias its result needs.
+
+        The bias is added to each rank's local result, so it must be split
+        exactly like that result: whole for a whole result, and split along
+        the same axis for a column-parallel result.
+
+        Args:
+            result_placement: The placement derived from x and the weight.
+
+        Raises:
+            ValueError: If the result is a partial sum (row parallel): every
+                rank would add the whole bias, so the all_reduce would add it
+                tp times. The bias must be added after the all_reduce instead.
+                Also if the bias is split differently from the result.
+        """
+
+        # TODO(row-parallel bias): A model with a biased row-parallel layer
+        # (e.g. an o_proj with bias) needs the bias added after the
+        # all_reduce. The TP pass could split such a linear into a bias-free
+        # linear and an add; it does not yet, so the combination is rejected.
+        bias = self.bias
+        if bias is None:
+            return
+        if isinstance(result_placement, Partial):
+            raise ValueError(
+                f"{self.NAME}: the result is a partial sum, so adding the bias "
+                "on every rank would add it tp times; add it after the all_reduce"
+            )
+        if bias.type.placement != result_placement:
+            raise ValueError(
+                f"{self.NAME}: bias placement {bias.type.placement} must match "
+                f"the result's {result_placement}"
+            )
+
     def _result_axes(self) -> tuple[str, ...]:
         """Propagate axis names: x's leading axes, then weight's output axis.
 
@@ -127,6 +178,14 @@ class LinearOp(Operation):
 
         x_axes = self.x.type.axes
         weight_axes = self.weight.type.axes
+        # The bias is indexed by the output features, so once both are
+        # annotated it must name the weight's out_features axis.
+        bias_axes = () if self.bias is None else self.bias.type.axes
+        if weight_axes and bias_axes and bias_axes != (weight_axes[0],):
+            raise ValueError(
+                f"{self.NAME}: bias axes {bias_axes} must be the weight's "
+                f"out_features axis ({weight_axes[0]!r},)"
+            )
         if not x_axes or not weight_axes:
             return ()
 
@@ -145,6 +204,10 @@ class LinearOp(Operation):
     @property
     def weight(self) -> Value:
         return self.operands[1]
+
+    @property
+    def bias(self) -> Value | None:
+        return self.operands[2] if len(self.operands) == 3 else None
 
     @property
     def in_features(self) -> int:

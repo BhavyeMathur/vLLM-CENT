@@ -463,6 +463,16 @@ class LegalizeTests(unittest.TestCase):
 class LegalizeRejectionTests(unittest.TestCase):
     """Check that legalization rejects work the CENT backend cannot run."""
 
+    def test_linear_with_bias_is_unsupported(self) -> None:
+        """The reference GEMV has no bias term, so a bias must not be dropped."""
+        x, weight, bias = argument("x", 1, 4), argument("w", 3, 4), argument("b", 3)
+        linear = LinearOp(operands=(x, weight, bias), name_hint="proj")
+        with self.assertRaisesRegex(NotImplementedError, "with a bias"):
+            legalize(
+                function((x, weight, bias), (linear,), linear.results),
+                CapabilityProfile(),
+            )
+
     def test_rms_norm_without_weight_is_unsupported(self) -> None:
         """The reference RMSNorm emitter needs a weight; Llama 4's QK-norm has none."""
         x = argument("x", 2, 4)

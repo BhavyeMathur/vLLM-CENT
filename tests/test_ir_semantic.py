@@ -14,12 +14,18 @@ from vllm_cent.ir.semantic import (
     ActivationOp,
     AddOp,
     AllReduceOp,
+    BroadcastOp,
     CopyOp,
+    DivOp,
+    ExpOp,
     LinearOp,
+    MaxOp,
     MulOp,
     ReshapeOp,
     RMSNormOp,
     SoftmaxOp,
+    SubOp,
+    SumOp,
 )
 from vllm_cent.ir.types import (
     DType,
@@ -368,6 +374,119 @@ class LinearOpAxesTest(unittest.TestCase):
             )
         )
         self.assertIs(op.results[0].type.role, TensorRole.ACTIVATION)
+
+
+def _bias(
+    width: int,
+    axes: tuple[str, ...] = (),
+    placement: Placement = Replicate(),
+    global_shape: tuple[int, ...] | None = None,
+) -> Value:
+    """Return an fp16 bias vector of ``width`` elements.
+
+    Args:
+        width: Local number of elements.
+        axes: Its axis name, or () before annotation.
+        placement: Which part of the bias the rank holds.
+        global_shape: Whole shape, for a shard.
+
+    Returns:
+        A new weight-typed value.
+    """
+
+    return _placed(
+        (width,), axes, placement, global_shape=global_shape, role=TensorRole.WEIGHT
+    )
+
+
+class LinearOpBiasTest(unittest.TestCase):
+    """y = x @ weight.T + bias, and how the bias follows tensor parallelism."""
+
+    def test_bias_keeps_the_result_type(self) -> None:
+        """A bias adds values but changes no shape, axis or placement.
+
+        Unannotated [2, 4] x [3, 4]^T + [3] gives [2, 3]; whole Wq with a
+        whole bias gives the whole q.
+        """
+
+        x, weight, bias = _value(2, 4), _value(3, 4), _value(3)
+        op = LinearOp(operands=(x, weight, bias))
+        self.assertIs(op.bias, bias)
+        self.assertEqual(op.results[0].type, TensorType(shape=(2, 3), dtype=DType.FP16))
+        whole = LinearOp(
+            operands=(
+                _replicated_hidden(),
+                _replicated_weight((Q_PROJ_OUT, HIDDEN)),
+                _bias(HIDDEN_SIZE, (Q_PROJ_OUT,)),
+            )
+        )
+        self.assertEqual(
+            whole.results[0].type,
+            TensorType(
+                shape=(1, 1, HIDDEN_SIZE),
+                dtype=DType.FP16,
+                axes=(*TOKEN_AXES, Q_PROJ_OUT),
+            ),
+        )
+        self.assertIsNone(LinearOp(operands=(x, weight)).bias)
+
+    def test_column_parallel_bias_is_split_like_the_output(self) -> None:
+        """Wq's 1024 rows on this rank pair with the same 1024 bias elements."""
+
+        bias = _bias(
+            LOCAL_HEADS_WIDTH, (Q_PROJ_OUT,), Shard("q_head"), (HIDDEN_SIZE,)
+        )
+        op = LinearOp(operands=(_replicated_hidden(), _wq_shard(), bias))
+        self.assertEqual(op.results[0].type, _sharded_heads().type)
+
+    def test_rejected_placements(self) -> None:
+        """A row-parallel partial sum, or a bias split unlike the result.
+
+        o_proj's result is a partial sum: adding a whole bias on each of 8
+        ranks would add it 8 times after the all_reduce.
+        """
+
+        whole_bias = _bias(HIDDEN_SIZE, (HIDDEN,))
+        with self.assertRaisesRegex(ValueError, "after the all_reduce"):
+            LinearOp(operands=(_sharded_heads(), _wo_shard(), whole_bias))
+        with self.assertRaisesRegex(ValueError, "must match"):
+            LinearOp(
+                operands=(
+                    _replicated_hidden(),
+                    _wq_shard(),
+                    _bias(HIDDEN_SIZE, (Q_PROJ_OUT,)),
+                )
+            )
+
+    def test_rejected_shapes_dtypes_and_axes(self) -> None:
+        """The bias must be one out_features vector of x's dtype and axis."""
+
+        x, weight = _value(2, 4), _value(3, 4)
+        annotated_x = _annotated((1, 4), ("seq_len", "hidden"))
+        annotated_weight = _annotated((3, 4), ("out", "hidden"), TensorRole.WEIGHT)
+        cases = {
+            "length": ((x, weight, _value(4)), "out_features 3"),
+            "rank": ((x, weight, _value(1, 3)), "1 dimension"),
+            "dtype": ((x, weight, _value(3, dtype=DType.FP32)), "datatype"),
+            "axis": (
+                (annotated_x, annotated_weight, _annotated((3,), ("hidden",))),
+                "out_features axis",
+            ),
+        }
+        for name, (operands, message) in cases.items():
+            with self.subTest(case=name), self.assertRaisesRegex(ValueError, message):
+                LinearOp(operands=operands)
+
+    def test_prints_three_operands(self) -> None:
+        """The bias is the third operand of aloi.linear."""
+
+        op = LinearOp(
+            operands=(_value(1, 2, name="x"), _value(3, 2, name="w"), _value(3, name="b")),
+            name_hint="proj",
+        )
+        self.assertEqual(
+            _print_one(op), "%proj = aloi.linear(%x, %w, %b) : tensor<1x3xfp16>"
+        )
 
 
 class LinearOpPlacementTest(unittest.TestCase):
@@ -926,6 +1045,237 @@ class BinaryElementwiseOpTest(unittest.TestCase):
                 with self.subTest(case=name, op=op_class.NAME):
                     with self.assertRaises(ValueError):
                         op_class(operands=operands)
+
+
+def _attention_scores() -> Value:
+    """Return one rank's attention scores [1, 1, 8, 2048] under tp=8.
+
+    8 of 64 query heads per rank (split along q_head, dimension 2); every rank
+    holds all 2048 cached positions, the reduced last dimension.
+    """
+
+    return _placed(
+        (1, 1, 8, 2048),
+        (*TOKEN_AXES, "q_head", "context"),
+        Shard("q_head"),
+        global_shape=(1, 1, 64, 2048),
+    )
+
+
+class ReductionOpTest(unittest.TestCase):
+    """reduce_sum and reduce_max drop the last dimension."""
+
+    def test_drops_last_dimension_and_keeps_earlier_split(self) -> None:
+        """Softmax's row reductions: [1, 1, 8, 2048] scores give [1, 1, 8].
+
+        The q_head split stays, with the whole shape [1, 1, 64].
+        """
+
+        expected = TensorType(
+            shape=(1, 1, 8),
+            dtype=DType.FP16,
+            axes=(*TOKEN_AXES, "q_head"),
+            global_shape=(1, 1, 64),
+            placement=Shard("q_head"),
+        )
+        for op_class in (SumOp, MaxOp):
+            with self.subTest(op=op_class.NAME):
+                op = op_class(operands=(_attention_scores(),))
+                self.assertEqual(op.results[0].type, expected)
+
+    def test_vector_reduces_to_scalar_and_weight_becomes_activation(self) -> None:
+        """A [4] weight reduces to a scalar activation; a scalar has nothing to reduce."""
+
+        weight = _placed((4,), (HIDDEN,), Replicate(), role=TensorRole.WEIGHT)
+        for op_class in (SumOp, MaxOp):
+            with self.subTest(op=op_class.NAME):
+                result = op_class(operands=(weight,)).results[0].type
+                self.assertEqual(result, TensorType(shape=(), dtype=DType.FP16))
+                with self.assertRaisesRegex(ValueError, "dimension to reduce"):
+                    op_class(operands=(_value(),))
+
+    def test_sum_over_split_last_dimension_is_partial(self) -> None:
+        """q_head*head_dim split 8 ways: each rank sums 1024 of 8192 values.
+
+        Adding the 8 per-rank sums gives the whole sum, so the result is a
+        partial sum, like a row-parallel linear.
+        """
+
+        result = SumOp(operands=(_sharded_heads(),)).results[0].type
+        self.assertEqual(
+            result,
+            TensorType(
+                shape=(1, 1), dtype=DType.FP16, axes=TOKEN_AXES, placement=Partial()
+            ),
+        )
+
+    def test_sum_of_partial_is_partial(self) -> None:
+        """Summing each rank's part and adding the results is the whole sum."""
+
+        partial = _placed((1, 1, HIDDEN_SIZE), (*TOKEN_AXES, HIDDEN), Partial())
+        result = SumOp(operands=(partial,)).results[0].type
+        self.assertIs(type(result.placement), Partial)
+
+    def test_max_rejects_split_row_and_partial(self) -> None:
+        """A maximum needs whole rows; per-rank maxima have no collective."""
+
+        partial = _placed((1, 1, HIDDEN_SIZE), (*TOKEN_AXES, HIDDEN), Partial())
+        with self.assertRaisesRegex(ValueError, "whole row"):
+            MaxOp(operands=(_sharded_heads(),))
+        with self.assertRaisesRegex(ValueError, "partial sum"):
+            MaxOp(operands=(partial,))
+
+    def test_prints_its_name(self) -> None:
+        """reduce_sum of [2, 3] prints with a [2] result."""
+
+        op = SumOp(operands=(_value(2, 3, name="x"),), name_hint="total")
+        self.assertEqual(
+            _print_one(op), "%total = aloi.reduce_sum(%x) : tensor<2xfp16>"
+        )
+
+
+class ExpOpTest(unittest.TestCase):
+    """exp keeps the operand's type, like the activations."""
+
+    def test_type_is_kept(self) -> None:
+        """Split scores stay split; a weight-typed input becomes an activation."""
+
+        scores = _attention_scores()
+        self.assertEqual(ExpOp(operands=(scores,)).results[0].type, scores.type)
+        weight = _placed((4,), (HIDDEN,), Replicate(), role=TensorRole.WEIGHT)
+        result = ExpOp(operands=(weight,)).results[0].type
+        self.assertIs(result.role, TensorRole.ACTIVATION)
+
+    def test_rejections(self) -> None:
+        """Reject exp of a partial sum or of integers."""
+
+        partial = _placed((1, 1, HIDDEN_SIZE), (*TOKEN_AXES, HIDDEN), Partial())
+        with self.assertRaisesRegex(ValueError, "partial sum"):
+            ExpOp(operands=(partial,))
+        with self.assertRaisesRegex(ValueError, "floating point"):
+            ExpOp(operands=(_value(4, dtype=DType.INT32),))
+
+
+class DivOpTest(unittest.TestCase):
+    """div follows the binary elementwise rules and needs floating point."""
+
+    def test_matching_operands(self) -> None:
+        """Dividing two shards of the same layout keeps the layout."""
+
+        quotient = DivOp(operands=(_sharded_heads(), _sharded_heads()))
+        self.assertEqual(quotient.results[0].type, _sharded_heads().type)
+        self.assertEqual(DivOp.NAME, "aloi.div")
+
+    def test_rejections(self) -> None:
+        """No broadcasting, no partial sums, no integer division."""
+
+        partial = _placed((1, 1, HIDDEN_SIZE), (*TOKEN_AXES, HIDDEN), Partial())
+        cases = {
+            "shapes differ": ((_value(2, 3), _value(2, 1)), "shapes differ"),
+            "partial sums": ((partial, partial), "unsupported placements"),
+            "integers": (
+                (_value(3, dtype=DType.INT64), _value(3, dtype=DType.INT64)),
+                "floating point",
+            ),
+        }
+        for name, (operands, message) in cases.items():
+            with self.subTest(case=name), self.assertRaisesRegex(ValueError, message):
+                DivOp(operands=operands)
+
+
+class SubOpTest(unittest.TestCase):
+    """sub follows the binary elementwise rules."""
+
+    def test_matching_operands(self) -> None:
+        """Subtracting two shards of the same layout keeps the layout."""
+
+        difference = SubOp(operands=(_sharded_heads(), _sharded_heads()))
+        self.assertEqual(difference.results[0].type, _sharded_heads().type)
+        self.assertEqual(SubOp.NAME, "aloi.sub")
+
+    def test_rejects_broadcasting_and_partial_sums(self) -> None:
+        """A row value must be broadcast first; partial sums are reduced first."""
+
+        partial = _placed((1, 1, HIDDEN_SIZE), (*TOKEN_AXES, HIDDEN), Partial())
+        with self.assertRaisesRegex(ValueError, "shapes differ"):
+            SubOp(operands=(_value(2, 3), _value(2)))
+        with self.assertRaisesRegex(ValueError, "unsupported placements"):
+            SubOp(operands=(partial, partial))
+
+
+class BroadcastOpTest(unittest.TestCase):
+    """broadcast repeats each element along a new last dimension."""
+
+    def test_row_values_back_to_rows(self) -> None:
+        """Softmax's row maxima [1, 1, 8] become [1, 1, 8, 2048] again.
+
+        This is reduce_max of the tp=8 attention scores, so the q_head split
+        and its whole shape [1, 1, 64] carry over, plus the new 2048.
+        """
+
+        row_max = MaxOp(operands=(_attention_scores(),)).results[0]
+        op = BroadcastOp(operands=(row_max,), size=2048, axis="context")
+        self.assertEqual(op.results[0].type, _attention_scores().type)
+
+    def test_unannotated_operand_stays_unannotated(self) -> None:
+        """Before AnnotateRolesAndAxes there are no axes, so axis is ignored."""
+
+        expected = TensorType(shape=(2, 3), dtype=DType.FP16)
+        for axis in (None, "context"):
+            with self.subTest(axis=axis):
+                op = BroadcastOp(operands=(_value(2),), size=3, axis=axis)
+                self.assertEqual(op.results[0].type, expected)
+
+    def test_scalar_and_partial(self) -> None:
+        """A scalar becomes a vector; a partial sum stays partial (repeating is linear)."""
+
+        self.assertEqual(
+            BroadcastOp(operands=(_value(),), size=4).results[0].type,
+            TensorType(shape=(4,), dtype=DType.FP16),
+        )
+        partial = _placed((1, 1), TOKEN_AXES, Partial())
+        result = BroadcastOp(operands=(partial,), size=8, axis=HIDDEN).results[0].type
+        self.assertEqual(
+            result,
+            TensorType(
+                shape=(1, 1, 8),
+                dtype=DType.FP16,
+                axes=(*TOKEN_AXES, HIDDEN),
+                placement=Partial(),
+            ),
+        )
+
+    def test_weight_becomes_activation(self) -> None:
+        """The repeated values are computed, not a loaded weight."""
+
+        weight = _placed((4,), (HIDDEN,), Replicate(), role=TensorRole.WEIGHT)
+        result = BroadcastOp(operands=(weight,), size=2, axis="context").results[0]
+        self.assertIs(result.type.role, TensorRole.ACTIVATION)
+
+    def test_rejections(self) -> None:
+        """Reject a size below 1, and a missing or repeated axis name once annotated.
+
+        Repeating "q_head" would make Shard("q_head") match two dimensions.
+        """
+
+        annotated = _annotated((1, 8), ("seq_len", "q_head"))
+        cases = {
+            "size 0": ((_value(2), 0, None), "at least 1"),
+            "missing axis": ((annotated, 4, None), "new axis name"),
+            "repeated axis": ((annotated, 4, "q_head"), "new axis name"),
+        }
+        for name, ((x, size, axis), message) in cases.items():
+            with self.subTest(case=name), self.assertRaisesRegex(ValueError, message):
+                BroadcastOp(operands=(x,), size=size, axis=axis)
+
+    def test_prints_its_attributes(self) -> None:
+        """The size and axis attributes print in declaration order."""
+
+        x = _annotated((2,), ("q_head",))
+        op = BroadcastOp(operands=(x,), size=3, axis="context", name_hint="rows")
+        line = _print_one(op)
+        self.assertIn('aloi.broadcast(%0) {size = 3, axis = "context"}', line)
+        self.assertTrue(line.startswith("%rows = "))
 
 
 if __name__ == "__main__":

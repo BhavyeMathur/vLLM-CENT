@@ -39,14 +39,16 @@ def _(x: Tensor, weight: Tensor | None, eps: float | None = None) -> Tensor:
     "aloi::linear",
     mutates_args=(),
 )
-def linear(x: Tensor, weight: Tensor) -> Tensor:
-    return F.linear(x, weight)
+def linear(x: Tensor, weight: Tensor, bias: Tensor | None = None) -> Tensor:
+    return F.linear(x, weight, bias)
 
 
 @linear.register_fake
-def _(x: Tensor, weight: Tensor) -> Tensor:
+def _(x: Tensor, weight: Tensor, bias: Tensor | None = None) -> Tensor:
     if x.shape[-1] != weight.shape[-1]:
         raise ValueError("Weight should have shape [out_features, in_features]")
+    if bias is not None and tuple(bias.shape) != (weight.shape[0],):
+        raise ValueError("Bias should have shape [out_features]")
     return x.new_empty((*x.shape[:-1], weight.shape[0]))
 
 
@@ -448,30 +450,43 @@ def _(
 
 
 class Linear(nn.Module):
-    """Bias-free linear layer computing ``aloi.linear(x, weight)``.
+    """Linear layer computing ``aloi.linear(x, weight, bias)``.
 
-    Llama projections have no bias, so none is modeled.
+    Parameters have ``nn.Linear``'s names and layouts, so checkpoint keys
+    match. Unlike ``nn.Linear``, ``bias`` defaults to False: the Llama
+    projections this frontend started with have none, and a model with
+    biases (e.g. Qwen2's q/k/v projections) asks for them explicitly.
 
     Attributes:
         weight: ``[out_features, in_features]``, the ``nn.Linear`` layout; the
             layer computes ``x @ weight.T``.
+        bias: ``[out_features]`` added to every output row, or None.
     """
 
-    def __init__(self, in_features: int, out_features: int) -> None:
-        """Create the weight.
+    bias: nn.Parameter | None
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = False) -> None:
+        """Create the weight, and the bias if requested.
 
         Args:
             in_features: Length of each input vector.
             out_features: Length of each output vector.
+            bias: Whether to add a learned bias to each output.
         """
 
         super().__init__()
         # Uninitialized, like nn.Linear before reset_parameters. On the meta
         # device there are no values at all; a loader or test fills them.
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features))
+        else:
+            # Registering None keeps the attribute, as nn.Linear does, while
+            # adding no parameter to state_dict or to the exported graph.
+            self.register_parameter("bias", None)
 
     def forward(self, x: Tensor) -> Tensor:
-        """Compute ``x @ weight.T``.
+        """Compute ``x @ weight.T``, plus the bias when there is one.
 
         Args:
             x: ``[*, in_features]``.
@@ -480,7 +495,7 @@ class Linear(nn.Module):
             ``[*, out_features]``.
         """
 
-        projected: Tensor = linear(x, self.weight)
+        projected: Tensor = linear(x, self.weight, self.bias)
         return projected
 
 

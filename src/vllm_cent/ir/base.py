@@ -65,6 +65,21 @@ class Operation(ABC):
     def with_operands(self, new_operands: Iterable[Value]) -> Self:
         return replace(self, operands = tuple(new_operands))
 
+
+class Decomposable(ABC):
+    """An IR Operation that can be decomposed to multiple other IR Operations
+    in the SAME IR Hierarchy
+    """
+    __slots__ = ()
+
+    @abstractmethod
+    def decompose(self) -> tuple[Operation, ...]:
+        """Return IR Operations computing the same result from self.operands.
+
+        The last Op's result replaces this Op's result.
+        """
+
+
 @dataclass(frozen = True, eq = False, slots = True)
 class Function:
     """One straight-line SSA function"""
