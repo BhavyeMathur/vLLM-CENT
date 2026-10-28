@@ -62,6 +62,8 @@ def format_type(tensor_type: TensorType) -> str:
         annotations.append(f"placement=shard({tensor_type.placement.axis})")
     elif isinstance(tensor_type.placement, Partial):
         annotations.append("placement=partial")
+    if tensor_type.domain is not None:
+        annotations.append(f"domain={tensor_type.domain.value}")
 
     return f"tensor<{', '.join([shape_and_dtype, *annotations])}>"
 

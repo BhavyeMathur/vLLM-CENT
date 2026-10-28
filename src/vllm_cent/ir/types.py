@@ -7,6 +7,7 @@ from enum import StrEnum, auto
 from math import prod
 from typing import assert_never
 
+
 class DType(StrEnum):
     INT64 = "int64"
     INT32 = "int32"
@@ -73,6 +74,7 @@ class DType(StrEnum):
         except ValueError as e:
             raise ValueError(f"Unsupported dtype: {dtype!r}") from e
 
+
 class TensorRole(StrEnum):
     """What kind of tensor a value is, independent of the model.
 
@@ -92,6 +94,26 @@ class TensorRole(StrEnum):
     ACTIVATION = auto()
     WEIGHT = auto()
     KV_CACHE = auto()
+
+
+class ExecutionDomain(StrEnum):
+    """Where a Device IR tensor lives, and so which units can compute on it.
+
+    Semantic IR tensors have no domain: choosing one is the job of lowering to
+    Device IR. A device op reads and writes tensors of one domain;
+    ``device.transfer`` moves a tensor to another. Domains name kinds of
+    hardware, not addresses: which channel, bank, buffer or register holds a
+    tensor is decided later, by mapping.
+
+    Members:
+        PIM: Memory that processing-in-memory units compute in place, e.g. the
+            DRAM banks of a CENT device.
+        PNM: Memory of the processing-near-memory units beside the DRAM, e.g.
+            CENT's Shared Buffer read by its accumulators and RISC-V cores.
+    """
+
+    PIM = auto()
+    PNM = auto()
 
 
 # Joins the names of semantic axes that share one flat dimension.
@@ -181,6 +203,7 @@ class TensorType:
     axes: tuple[str, ...] = ()
     global_shape: tuple[int, ...] | None = None
     placement: Placement = Replicate()
+    domain: ExecutionDomain | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "shape", tuple(int(dim) for dim in self.shape))

@@ -35,6 +35,7 @@ from .semantic.transformer import (
 )
 from .types import (
     DType,
+    ExecutionDomain,
     Partial,
     Placement,
     Replicate,
@@ -57,6 +58,7 @@ __all__ = [
     "ClonePass",
     "CopyOp",
     "DType",
+    "ExecutionDomain",
     "DivOp",
     "ExpOp",
     "Function",
