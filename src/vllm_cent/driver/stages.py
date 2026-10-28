@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from ..frontend import export_model, import_exported_program
 from ..ir import AnnotateRolesAndAxes, Module, PassManager, print_module
-from ..parallel import ApplyTensorParallel
+from ..ir.passes import ApplyTensorParallel
 from .loader import LoadedModel
 from .run_spec import Phase, RunSpec
 

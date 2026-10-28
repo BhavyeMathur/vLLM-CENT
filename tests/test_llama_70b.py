@@ -34,7 +34,7 @@ from vllm_cent.ir import (
     Replicate,
     Shard,
 )
-from vllm_cent.parallel import ApplyTensorParallel
+from vllm_cent.ir.passes import ApplyTensorParallel
 from vllm_cent.driver import STAGES, compile_stages, load_model, load_run_spec
 
 # The example's model files (HF config.json) and run specs.

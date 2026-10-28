@@ -20,12 +20,8 @@ from vllm_cent.ir import (
     Value,
     value_names,
 )
-from vllm_cent.pipeline import (
-    CentTargetProfile,
-    ExecutionContract,
-    compile_graph,
-    fuse_attention,
-)
+from vllm_cent.ir.passes import FuseAttention
+from vllm_cent.pipeline import CentTargetProfile, ExecutionContract, compile_graph
 from vllm_cent.pipeline.ir import CapabilityProfile, legalize
 from vllm_cent.runtime import CentNamedScalars
 
@@ -174,7 +170,7 @@ class FuseAttentionTests(unittest.TestCase):
         same scale, and a reshape back that keeps gqa_sv's name.
         """
         source = _import(_DecodeAttention(), _decode_inputs(kv_heads=1))
-        fused = fuse_attention(source)
+        fused = FuseAttention().run_on_function(source)
         self.assertEqual(
             [type(op) for op in fused.operations],
             [ReshapeOp, ReshapeOp, ReshapeOp, AttentionOp, ReshapeOp],
@@ -206,7 +202,7 @@ class FuseAttentionTests(unittest.TestCase):
         The chain stays decomposed, and legalization names the gqa_qk.
         """
         source = _import(_DecodeAttention(), _decode_inputs(kv_heads=2))
-        fused = fuse_attention(source)
+        fused = FuseAttention().run_on_function(source)
         self.assertEqual(
             [type(op) for op in fused.operations], [GqaQKOp, SoftmaxOp, GqaSVOp]
         )
@@ -227,7 +223,7 @@ class FuseAttentionTests(unittest.TestCase):
             operations=(qk, softmax, sv),
             results=(sv.results[0], softmax.results[0]),
         )
-        self.assertEqual(fuse_attention(source).operations, source.operations)
+        self.assertEqual(FuseAttention().run_on_function(source).operations, source.operations)
 
     def test_keeps_tensor_parallel_chain(self) -> None:
         """Heads split across ranks stay decomposed until the fused form has a TP rule.
@@ -279,13 +275,13 @@ class FuseAttentionTests(unittest.TestCase):
             operations=(qk, softmax, sv),
             results=sv.results,
         )
-        self.assertEqual(fuse_attention(source).operations, source.operations)
+        self.assertEqual(FuseAttention().run_on_function(source).operations, source.operations)
 
     def test_returns_the_same_function_without_chains(self) -> None:
         """Nothing to fuse leaves the input function itself, not a rebuilt copy."""
         x = Value(type=TensorType(shape=(2,), dtype=DType.FP32), name="x")
         source = Function(name="main", operands=(x,), operations=(), results=(x,))
-        self.assertIs(fuse_attention(source), source)
+        self.assertIs(FuseAttention().run_on_function(source), source)
 
 
 class FusedAttentionExecutionTests(unittest.TestCase):

@@ -5,9 +5,9 @@ from __future__ import annotations
 import unittest
 from dataclasses import dataclass
 
-from vllm_cent.ir.annotate import AnnotateRolesAndAxes, TensorAnnotation
 from vllm_cent.ir.base import Function, Module, Operation, Value
-from vllm_cent.ir.passes import PassManager
+from vllm_cent.ir.pass_manager import PassManager
+from vllm_cent.ir.passes import AnnotateRolesAndAxes, TensorAnnotation
 from vllm_cent.ir.printer import print_module
 from vllm_cent.ir.semantic import LinearOp, RMSNormOp
 from vllm_cent.ir.types import DType, TensorRole, TensorType

@@ -1,6 +1,9 @@
-"""Tensor parallelism: who owns what, and the communication that implies."""
+"""Tensor parallelism: the plan of who owns what.
+
+The pass that applies a plan, deriving the communication it implies, is
+``vllm_cent.ir.passes.ApplyTensorParallel``.
+"""
 
 from .plan import ParallelPlan
-from .tensor_parallel import ApplyTensorParallel
 
-__all__ = ["ApplyTensorParallel", "ParallelPlan"]
+__all__ = ["ParallelPlan"]

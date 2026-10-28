@@ -74,7 +74,7 @@ legalization remains a separate decision: `legalize()` maps each operation to a
 device kind and rejects an operation that has no device lowering yet, such as
 KV-cache update, the decomposed GQA steps, or all-reduce. RoPE lowers to the
 `ReferenceRotaryEmbedding` service. Before legalization, `compile_graph()` runs
-`fuse_attention()`, an adaptor that rewrites `gqa_qk → softmax → gqa_sv` into
+the `FuseAttention` pass, an adaptor that rewrites `gqa_qk → softmax → gqa_sv` into
 `AttentionOp` when reshapes can convert the layouts and no tensor is split
 across ranks; it is to be replaced by lowering the decomposed steps directly.
 

@@ -10,8 +10,8 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 
-from .base import Decomposable, Function, Operation, Value, rebuild_function
-from .passes import FunctionPass
+from ..base import Decomposable, Function, Operation, Value, rebuild_function
+from ..pass_manager import FunctionPass
 
 __all__ = ["DecomposeOps"]
 

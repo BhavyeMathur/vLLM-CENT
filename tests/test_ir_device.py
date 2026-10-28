@@ -21,7 +21,6 @@ from vllm_cent.ir import (
     print_function,
 )
 from vllm_cent.ir.base import Decomposable
-from vllm_cent.ir.decompose import DecomposeOps
 from vllm_cent.ir.device import (
     CXLAllReduceOp,
     DeviceBroadcastOp,
@@ -48,6 +47,7 @@ from vllm_cent.ir.device import (
     PNMSubOp,
     PNMSumOp,
 )
+from vllm_cent.ir.passes import DecomposeOps
 
 PIM = ExecutionDomain.PIM
 PNM = ExecutionDomain.PNM

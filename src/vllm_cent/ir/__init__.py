@@ -1,8 +1,8 @@
 """ALOI IR: generic SSA core, semantic dialect, printer, and pass infrastructure."""
 
-from .annotate import AnnotateRolesAndAxes, TensorAnnotation
 from .base import Function, Module, Operation, Value, clone_function, rebuild_function
-from .passes import ClonePass, FunctionPass, Pass, PassManager
+from .pass_manager import FunctionPass, Pass, PassManager
+from .passes import AnnotateRolesAndAxes, ClonePass, TensorAnnotation
 from .printer import format_type, print_function, print_module, value_names
 from .semantic import (
     ActivationOp,

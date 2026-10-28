@@ -22,11 +22,11 @@ import copy
 from collections.abc import Mapping
 from dataclasses import replace
 
-from ..ir.base import Function, Module, Operation, Value, rebuild_function
-from ..ir.passes import FunctionPass
-from ..ir.semantic import AllReduceOp
-from ..ir.types import Partial, Replicate, Shard, outermost_axis
-from .plan import ParallelPlan
+from ...parallel.plan import ParallelPlan
+from ..base import Function, Module, Operation, Value, rebuild_function
+from ..pass_manager import FunctionPass
+from ..semantic import AllReduceOp
+from ..types import Partial, Replicate, Shard, outermost_axis
 
 __all__ = ["ApplyTensorParallel"]
 

@@ -7,8 +7,8 @@ coexists with the older model-specific structural compiler.
 """
 
 from ..ir import Function
+from ..ir.passes import FuseAttention
 from .artifact import CompiledArtifact, compile_target
-from .fuse_attention import fuse_attention
 from .ir import CapabilityProfile, legalize
 from .mapping import (
     AccumulatorPlacement,
@@ -44,7 +44,6 @@ __all__ = [
     "compile_mlir",
     "compile_target",
     "emit_program",
-    "fuse_attention",
     "lower_target",
     "verify_mapping",
 ]
@@ -99,7 +98,7 @@ def compile_graph(
     # first. Legalization then names every value and chooses device-supported
     # operations.
     device = legalize(
-        fuse_attention(graph),
+        FuseAttention().run_on_function(graph),
         CapabilityProfile() if capabilities is None else capabilities,
     )
     # Physical limits enter here. Manual and generated plans share the same

@@ -34,7 +34,7 @@ from vllm_cent.ir import (
     Replicate,
     Shard,
 )
-from vllm_cent.parallel import ApplyTensorParallel
+from vllm_cent.ir.passes import ApplyTensorParallel
 
 # The example's model file (HF config.json) and run specs.
 EXAMPLE_DIR = Path(__file__).resolve().parents[1] / "examples" / "llama4_scout"

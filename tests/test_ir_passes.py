@@ -7,7 +7,7 @@ import unittest
 from dataclasses import dataclass
 
 from vllm_cent.ir.base import Function, Module, Operation, Value
-from vllm_cent.ir.passes import Pass, PassManager
+from vllm_cent.ir.pass_manager import Pass, PassManager
 from vllm_cent.ir.printer import print_module
 from vllm_cent.ir.types import DType, TensorType
 
@@ -257,13 +257,13 @@ def _import_pass_class(name: str) -> type[Pass]:
     class from breaking every other test in this file.
 
     Args:
-        name: Class name in ``vllm_cent.ir.passes``.
+        name: Class name exported by ``vllm_cent.ir``.
 
     Returns:
         The class.
     """
 
-    return getattr(importlib.import_module("vllm_cent.ir.passes"), name)
+    return getattr(importlib.import_module("vllm_cent.ir"), name)
 
 
 class FunctionPassTest(unittest.TestCase):

@@ -13,7 +13,7 @@ from typing import Any
 
 from torch import Tensor, nn
 
-from ..ir.annotate import TensorAnnotation
+from ..ir import TensorAnnotation
 
 __all__ = ["ModelRegistration", "get_registration", "register_model"]
 

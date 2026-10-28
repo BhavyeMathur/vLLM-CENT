@@ -16,9 +16,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 
-from .base import Function, Module, Value, rebuild_function
-from .passes import FunctionPass
-from .types import TensorRole
+from ..base import Function, Module, Value, rebuild_function
+from ..pass_manager import FunctionPass
+from ..types import TensorRole
 
 __all__ = ["AnnotateRolesAndAxes", "TensorAnnotation"]
 

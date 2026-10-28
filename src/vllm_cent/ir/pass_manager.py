@@ -1,4 +1,7 @@
-"""Infrastructure for implementing IR passes"""
+"""Infrastructure for IR passes: the Pass interface and the PassManager.
+
+Concrete passes live in ``vllm_cent.ir.passes``.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +9,7 @@ from dataclasses import dataclass
 from typing import ClassVar, Callable
 from abc import ABC, abstractmethod
 
-from .base import Function, Module, clone_function
+from .base import Function, Module
 
 class Pass(ABC):
     """Abstract class for IR passes"""
@@ -35,15 +38,6 @@ class FunctionPass(Pass):
             name = module.name,
             functions = tuple(self.run_on_function(func) for func in module.functions),
         )
-
-
-class ClonePass(FunctionPass):
-    """Copy every function with fresh values; the IR itself is unchanged."""
-
-    NAME = "clone"
-
-    def run_on_function(self, function: Function) -> Function:
-        return clone_function(function)
 
 
 @dataclass(frozen = True)

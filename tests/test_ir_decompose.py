@@ -26,7 +26,7 @@ from vllm_cent.ir import (
     print_function,
 )
 from vllm_cent.ir.base import Decomposable
-from vllm_cent.ir.decompose import DecomposeOps
+from vllm_cent.ir.passes import DecomposeOps
 
 # One rank's attention scores under tp=8: 8 of 64 query heads, all 2048
 # cached positions. Softmax normalizes over the positions (last dimension).
