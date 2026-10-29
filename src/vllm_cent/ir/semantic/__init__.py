@@ -11,13 +11,22 @@
 
 from .arith import MaxOp, SumOp
 from .collective import AllReduceOp
-from .elementwise import ActivationOp, AddOp, DivOp, ExpOp, MulOp, SubOp
+from .elementwise import (
+    ActivationOp,
+    ActivationRules,
+    AddOp,
+    DivOp,
+    ExpOp,
+    MulOp,
+    SubOp,
+)
 from .linalg import LinearOp
 from .normalization import RMSNormOp, RMSNormRules, SoftmaxOp, SoftmaxRules
 from .tensor import BroadcastOp, CopyOp, ReshapeOp
 
 __all__ = [
     "ActivationOp",
+    "ActivationRules",
     "AddOp",
     "AllReduceOp",
     "BroadcastOp",

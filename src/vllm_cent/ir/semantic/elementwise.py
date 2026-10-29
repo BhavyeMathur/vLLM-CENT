@@ -11,11 +11,12 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from ...activations import ActivationKind
-from ..base import Operation, Value
+from ..base import Decomposable, Operation, Value
 from ..types import DType, Partial, TensorRole, TensorType
 
 __all__ = [
     "ActivationOp",
+    "ActivationRules",
     "AddOp",
     "DivOp",
     "ExpOp",
@@ -28,20 +29,22 @@ _INTEGER_DTYPES = frozenset({DType.INT64, DType.INT32, DType.INT8})
 
 
 @dataclass(frozen=True, eq=False, slots=True)
-class ActivationOp(Operation):
-    """A parameter-free activation applied to every element.
+class ActivationRules(Operation):
+    """Type rules shared by every activation op, at any IR level; not an op itself.
+
+    ``aloi.activation`` and the device activation ops (``pim.activation``,
+    ``pnm.activation``) derive from this class, so they check types
+    identically. Only ``aloi.activation`` is ``Decomposable``: a device op's
+    parts would be semantic ops.
 
     ``function`` picks the formula: SiLU, ReLU, sigmoid, tanh, or one of the
     two GELU formulas. The exact (erf) GELU and its tanh approximation are
     different choices; no pass may exchange them.
 
-    ActivationOp(operands=(x,), function=ActivationKind.SILU)
-
     Attributes:
         function: Which formula to apply.
     """
 
-    NAME = "aloi.activation"
     NUM_OPERANDS = 1
 
     function: ActivationKind
@@ -65,6 +68,52 @@ class ActivationOp(Operation):
         if isinstance(self.x.type.placement, Partial):
             raise ValueError(f"{self.NAME}: x is a partial sum; all_reduce it first")
         return (replace(self.x.type, role=TensorRole.ACTIVATION),)
+
+
+@dataclass(frozen=True, eq=False, slots=True)
+class ActivationOp(ActivationRules, Decomposable):
+    """A parameter-free activation applied to every element.
+
+    SiLU can be decomposed, as ``x * sigmoid(x)``, for a target that computes
+    sigmoid but not SiLU; the other functions have no decomposition.
+
+    ActivationOp(operands=(x,), function=ActivationKind.SILU)
+    """
+
+    NAME = "aloi.activation"
+
+    def can_decompose(self) -> bool:
+        """Tell whether ``function`` has a decomposition: only SiLU does.
+
+        Returns:
+            True for SiLU.
+        """
+
+        return self.function is ActivationKind.SILU
+
+    def decompose(self) -> tuple[Operation, ...]:
+        """Return SiLU as ``x * sigmoid(x)``: a sigmoid, then a product.
+
+        The product keeps this op's name_hint, so later ops print the same
+        operand names as before; the sigmoid is named ``<hint>.sigmoid``.
+
+        Returns:
+            The sigmoid op and the product op, in order.
+
+        Raises:
+            ValueError: If ``function`` is not SiLU.
+        """
+
+        if not self.can_decompose():
+            raise ValueError(f"{self.NAME}: {self.function.value} has no decomposition")
+        hint = self.name_hint or "silu"
+        sigmoid = ActivationOp(
+            operands=(self.x,),
+            function=ActivationKind.SIGMOID,
+            name_hint=f"{hint}.sigmoid",
+        )
+        product = MulOp(operands=(self.x, *sigmoid.results), name_hint=self.name_hint)
+        return (sigmoid, product)
 
 
 @dataclass(frozen=True, eq=False, slots=True)

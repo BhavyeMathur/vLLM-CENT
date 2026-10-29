@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ..semantic import ActivationOp, LinearOp, MulOp
+from ..semantic import ActivationRules, LinearOp, MulOp
 from .domain import _PIMOp
 
 __all__ = [
@@ -33,16 +33,14 @@ class PIMEwmulOp(_PIMOp, MulOp):
 
 
 @dataclass(frozen=True, eq=False, slots=True)
-class PIMActivationOp(_PIMOp, ActivationOp):
+class PIMActivationOp(_PIMOp, ActivationRules):
     """``aloi.activation`` applied by the PIM units.
 
     On CENT this is the AiM ``AF`` instruction, which reads the function from
     a lookup table written beforehand.
     """
 
-    # TODO(PIM activation functions): AF evaluates whatever lookup table was
-    # loaded, so which ActivationKinds it supports, and at what accuracy, is
-    # a target property. It belongs in the DeviceSpec (lesson 1.3), and a
-    # lowering recipe must check it before choosing this op over
-    # pnm.activation.
+    # AF evaluates whatever lookup table was loaded, so which functions it
+    # supports is a target property: DeviceCapability.pim_activations lists
+    # them with their AFid, and LowerToDevice checks it.
     NAME = "pim.activation"

@@ -312,6 +312,7 @@ class LoadDeviceSpecTest(unittest.TestCase):
             PNMSumOp,
             PNMRMSNormOp,
             PNMRopeOp,
+            PNMActivationOp,
         )
         other_ops = (
             PIMCacheWriteOp,
@@ -331,7 +332,7 @@ class LoadDeviceSpecTest(unittest.TestCase):
                         op: frozenset({BF16}) for op in (*pim_ops, *pnm_ops, *other_ops)
                     },
                     pim_activations={ActivationKind.SIGMOID: 0},
-                    pnm_activations=frozenset(),
+                    pnm_activations=frozenset({ActivationKind.SIGMOID}),
                     pim_gemv_bias=False,
                 ),
             ),

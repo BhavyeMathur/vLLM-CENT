@@ -110,16 +110,30 @@ class Decomposable(ABC):
     """An IR Operation that can be decomposed into other IR Operations.
 
     The decomposition uses ops of the same IR level, e.g. a semantic op
-    decomposes into semantic ops only.
+    decomposes into semantic ops only. Some ops can be decomposed only for
+    some attribute values: an activation op decomposes SiLU into a sigmoid
+    and a product, but has no decomposition for ReLU. Such an op overrides
+    ``can_decompose()``.
     """
 
     __slots__ = ()
+
+    def can_decompose(self) -> bool:
+        """Tell whether this op instance has a decomposition.
+
+        Returns:
+            True by default; an op whose decomposition depends on its
+            attributes returns False when ``decompose()`` would fail.
+        """
+
+        return True
 
     @abstractmethod
     def decompose(self) -> tuple[Operation, ...]:
         """Return IR Operations computing the same result from self.operands.
 
-        The last Op's result replaces this Op's result.
+        The last Op's result replaces this Op's result. Only called when
+        ``can_decompose()`` is True.
         """
 
 

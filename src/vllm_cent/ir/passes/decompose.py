@@ -2,7 +2,8 @@
 
 An op that implements ``Decomposable`` (e.g. ``aloi.softmax``) knows an
 equivalent sequence of simpler semantic ops. This pass applies those
-decompositions, for example before lowering to a target that has no unit for
+decompositions to the ops whose ``can_decompose()`` is True (an activation
+op, for example, decomposes only SiLU), for example before lowering to a target that has no unit for
 the composite op but does have one for each of its parts.
 """
 
@@ -112,16 +113,17 @@ class DecomposeOps(FunctionPass):
         return [op.NAME for op in function.operations if self._wants(op)]
 
     def _wants(self, op: Operation) -> bool:
-        """Tell whether ``op`` is decomposable and selected.
+        """Tell whether ``op`` has a decomposition and is selected.
 
         Args:
             op: Any op.
 
         Returns:
-            Whether this pass replaces ``op``.
+            Whether this pass replaces ``op``. ``select`` is only asked about
+            ops that can be decomposed.
         """
 
-        return isinstance(op, Decomposable) and self._select(op)
+        return isinstance(op, Decomposable) and op.can_decompose() and self._select(op)
 
     def _rewrite(self, op: Operation) -> Sequence[Operation]:
         """Return op's decomposition if it is selected, else op itself.
@@ -138,6 +140,6 @@ class DecomposeOps(FunctionPass):
 
         # isinstance (not _wants) so that the type checker knows op has
         # decompose().
-        if isinstance(op, Decomposable) and self._select(op):
+        if isinstance(op, Decomposable) and op.can_decompose() and self._select(op):
             return op.decompose()
         return (op,)

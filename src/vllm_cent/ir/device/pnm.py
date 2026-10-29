@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ..semantic import (
-    ActivationOp,
+    ActivationRules,
     AddOp,
     DivOp,
     ExpOp,
@@ -87,7 +87,7 @@ class PNMSumOp(_PNMOp, SumOp):
 
 
 @dataclass(frozen=True, eq=False, slots=True)
-class PNMActivationOp(_PNMOp, ActivationOp):
+class PNMActivationOp(_PNMOp, ActivationRules):
     """``aloi.activation`` computed near memory, e.g. by the RISC-V cores."""
 
     NAME = "pnm.activation"

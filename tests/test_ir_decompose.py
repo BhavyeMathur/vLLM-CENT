@@ -5,7 +5,9 @@ from __future__ import annotations
 import unittest
 from dataclasses import dataclass
 
+from vllm_cent.activations import ActivationKind
 from vllm_cent.ir import (
+    ActivationOp,
     BroadcastOp,
     CopyOp,
     DivOp,
@@ -15,6 +17,7 @@ from vllm_cent.ir import (
     LinearOp,
     MaxOp,
     Module,
+    MulOp,
     Operation,
     PassManager,
     Shard,
@@ -225,6 +228,75 @@ class DecomposeOpsTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "at least 1"):
             DecomposeOps(max_rounds=0)
+
+
+class SiluDecompositionTest(unittest.TestCase):
+    """SiLU decomposes into x * sigmoid(x); other activations do not."""
+
+    def test_only_silu_can_decompose(self) -> None:
+        """can_decompose() is True for SiLU alone."""
+
+        x = Value(type=SCORES, name="x")
+        self.assertEqual(
+            {
+                kind: ActivationOp(operands=(x,), function=kind).can_decompose()
+                for kind in ActivationKind
+            },
+            {kind: kind is ActivationKind.SILU for kind in ActivationKind},
+        )
+
+    def test_decomposition(self) -> None:
+        """A sigmoid of x, then x times it; the product keeps the SiLU's name."""
+
+        x = Value(type=SCORES, name="x")
+        silu = ActivationOp(
+            operands=(x,), function=ActivationKind.SILU, name_hint="mlp.silu"
+        )
+        sigmoid, product = silu.decompose()
+
+        assert isinstance(sigmoid, ActivationOp)
+        self.assertEqual(
+            (sigmoid.operands, sigmoid.function, sigmoid.name_hint),
+            ((x,), ActivationKind.SIGMOID, "mlp.silu.sigmoid"),
+        )
+        self.assertIsInstance(product, MulOp)
+        self.assertEqual(
+            (product.operands, product.name_hint), ((x, *sigmoid.results), "mlp.silu")
+        )
+        # Same type as the SiLU result: shape, axes and the q_head shard.
+        self.assertEqual(product.results[0].type, silu.results[0].type)
+
+    def test_other_functions_raise(self) -> None:
+        """decompose() on ReLU names the function."""
+
+        relu = ActivationOp(
+            operands=(Value(type=SCORES),), function=ActivationKind.RELU
+        )
+        with self.assertRaisesRegex(ValueError, "relu has no decomposition"):
+            relu.decompose()
+
+    def test_pass_decomposes_silu_and_keeps_gelu(self) -> None:
+        """DecomposeOps asks can_decompose() before select."""
+
+        x = Value(type=SCORES, name="x")
+        silu = ActivationOp(operands=(x,), function=ActivationKind.SILU)
+        gelu = ActivationOp(operands=silu.results, function=ActivationKind.GELU_TANH)
+        function = Function(
+            name="main", operands=(x,), operations=(silu, gelu), results=gelu.results
+        )
+        decomposed = DecomposeOps().run_on_function(function)
+        self.assertEqual(
+            [op.NAME for op in decomposed.operations],
+            ["aloi.activation", "aloi.mul", "aloi.activation"],
+        )
+        self.assertEqual(
+            [
+                op.function
+                for op in decomposed.operations
+                if isinstance(op, ActivationOp)
+            ],
+            [ActivationKind.SIGMOID, ActivationKind.GELU_TANH],
+        )
 
 
 if __name__ == "__main__":

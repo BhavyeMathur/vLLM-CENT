@@ -51,7 +51,7 @@ from vllm_cent.ir.device import (
 from vllm_cent.ir.device.domain import _PNMOp
 from vllm_cent.ir.passes import DecomposeOps
 from vllm_cent.ir.semantic import (
-    ActivationOp,
+    ActivationRules,
     AddOp,
     AllReduceOp,
     BroadcastOp,
@@ -483,8 +483,9 @@ class DeviceOpTest(unittest.TestCase):
     def test_semantic_of_every_device_op(self) -> None:
         """Each op's semantic base, as listed after its device mixin.
 
-        ``pnm.softmax`` and ``pnm.rms_norm`` inherit only the shared type
-        rules, and ``device.transfer`` implements no semantic op.
+        The activation, softmax and RMSNorm device ops inherit only the
+        shared type rules, so they never inherit a decomposition;
+        ``device.transfer`` implements no semantic op.
         """
 
         expected: dict[type[DeviceOp], type[Operation] | None] = {
@@ -495,13 +496,13 @@ class DeviceOpTest(unittest.TestCase):
             DeviceReshapeOp: ReshapeOp,
             DeviceSplitHeadsOp: SplitHeadsOp,
             DeviceTransferOp: None,
-            PIMActivationOp: ActivationOp,
+            PIMActivationOp: ActivationRules,
             PIMCacheWriteOp: KvUpdateOp,
             PIMEwmulOp: MulOp,
             PIMGemvOp: LinearOp,
             PIMQKOp: GqaQKOp,
             PIMSVOp: GqaSVOp,
-            PNMActivationOp: ActivationOp,
+            PNMActivationOp: ActivationRules,
             PNMAddOp: AddOp,
             PNMDivOp: DivOp,
             PNMExpOp: ExpOp,

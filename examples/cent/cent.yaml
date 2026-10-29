@@ -42,6 +42,7 @@ capabilities:
       reduce_sum: [bf16]
       rms_norm: [bf16]
       rope: [bf16]
+      activation: [bf16]
       # TODO(paper): Whether the PNM side has a softmax unit, or softmax must
       # be decomposed into exp, reduce_sum and div, is not settled.
       # softmax: [bf16]
@@ -57,9 +58,12 @@ capabilities:
   pim_activations:
     sigmoid: 0
 
-  # TODO(paper): Which activation functions the PNM units compute directly is
-  # not stated; none are listed until a source or a recipe needs one.
-  pnm_activations: []
+  # Activation functions the PNM units compute. SiLU itself is in neither
+  # list: it is lowered as x * sigmoid(x).
+  # TODO(paper): The paper does not state which functions PNM computes;
+  # sigmoid here is a local assumption, so a sigmoid of a PNM value need not
+  # be moved to the PIM lookup tables.
+  pnm_activations: [sigmoid]
 
   # The GEMV lowering adds no model bias: its WR_BIAS writes only reload
   # partial sums (lowering/linear.py).

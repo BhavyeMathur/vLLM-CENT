@@ -344,29 +344,86 @@ class DecomposeOrLowerTest(unittest.TestCase):
             ],
         )
 
+    def test_silu_without_a_silu_unit(self) -> None:
+        """SiLU of a GEMV result becomes AF (sigmoid) and EW_MUL in the banks.
+
+        No unit computes SiLU, so it is decomposed into ``x * sigmoid(x)``.
+        The GEMV result is in PIM and the PIM tables hold sigmoid, so both
+        parts run there with no transfer; the activation result is then
+        returned to PNM.
+        """
+
+        x, w = _value("x"), _value("w", (4, 4), TensorRole.WEIGHT)
+        gate = LinearOp(operands=(x, w), name_hint="gate")
+        silu = ActivationOp(
+            operands=gate.results, function=ActivationKind.SILU, name_hint="silu"
+        )
+        spec = _spec(
+            PIMGemvOp,
+            PIMActivationOp,
+            PIMEwmulOp,
+            PNMActivationOp,
+            PNMMulOp,
+            DeviceTransferOp,
+            pim_activations={ActivationKind.SIGMOID: 0},
+            pnm_activations=frozenset({ActivationKind.SIGMOID}),
+        )
+        lowered = LowerToDevice(spec).run_on_function(
+            _function(gate, silu, arguments=(x, w))
+        )
+
+        self.assertEqual(
+            _op_classes(lowered),
+            [
+                DeviceTransferOp,
+                PIMGemvOp,
+                PIMActivationOp,
+                PIMEwmulOp,
+                DeviceTransferOp,
+            ],
+        )
+        sigmoid, product = lowered.operations[2:4]
+        assert isinstance(sigmoid, PIMActivationOp)
+        self.assertEqual(
+            (sigmoid.function, sigmoid.name_hint, product.name_hint),
+            (ActivationKind.SIGMOID, "silu.sigmoid", "silu"),
+        )
+
+    def test_silu_unit_is_used_whole(self) -> None:
+        """A target whose PNM computes SiLU gets one pnm.activation, no product."""
+
+        x = _value("x")
+        silu = ActivationOp(operands=(x,), function=ActivationKind.SILU)
+        spec = _spec(
+            PNMActivationOp, PNMMulOp, pnm_activations=frozenset({ActivationKind.SILU})
+        )
+        lowered = LowerToDevice(spec).run_on_function(_function(silu, arguments=(x,)))
+        self.assertEqual(_op_classes(lowered), [PNMActivationOp])
+
     def test_unsupported_activation_function(self) -> None:
-        """Sigmoid is in the PIM tables but SiLU nowhere, so SiLU fails.
+        """GELU has no unit and no decomposition, so it fails.
 
         Both candidates are listed with their own reason.
         """
 
         x = _value("x")
-        silu = ActivationOp(
-            operands=(x,), function=ActivationKind.SILU, name_hint="silu"
+        gelu = ActivationOp(
+            operands=(x,), function=ActivationKind.GELU_ERF, name_hint="gelu"
         )
         spec = _spec(
             PIMActivationOp,
             PNMActivationOp,
             DeviceTransferOp,
             pim_activations={ActivationKind.SIGMOID: 0},
+            pnm_activations=frozenset({ActivationKind.SIGMOID}),
         )
         with self.assertRaisesRegex(
             ValueError,
-            r"cannot lower aloi.activation \(silu\): "
-            r"pim.activation has no lookup table for silu; "
-            r"pnm.activation cannot compute silu",
+            r"cannot lower aloi.activation \(gelu\): "
+            r"pim.activation has no lookup table for gelu_erf; "
+            r"pnm.activation cannot compute gelu_erf",
         ):
-            LowerToDevice(spec).run_on_function(_function(silu, arguments=(x,)))
+            LowerToDevice(spec).run_on_function(_function(gelu, arguments=(x,)))
 
 
 class LowerToDeviceErrorTest(unittest.TestCase):
