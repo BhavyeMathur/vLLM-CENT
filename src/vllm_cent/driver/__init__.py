@@ -16,9 +16,10 @@ from .run_spec import (
     load_run_spec,
     parse_run_spec,
 )
-from .stages import STAGES, compile_stages
+from .stages import DEVICE_STAGE, STAGES, compile_stages
 
 __all__ = [
+    "DEVICE_STAGE",
     "STAGES",
     "LoadedModel",
     "ModelRegistration",

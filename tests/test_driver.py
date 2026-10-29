@@ -11,7 +11,11 @@ import textwrap
 import unittest
 from pathlib import Path
 
+import yaml  # type: ignore[import-untyped]
+
+from vllm_cent.device import load_device_spec, snapshot
 from vllm_cent.driver import (
+    DEVICE_STAGE,
     STAGES,
     Phase,
     RunSpec,
@@ -70,6 +74,25 @@ _TINY_REGISTRY = textwrap.dedent(
 
 _TP2_RUN = "parallel:\n  tp: 2\n  split: [out]\nworkload:\n  batch: 3\n"
 
+_EXAMPLE_DEVICE = (
+    Path(__file__).resolve().parents[1] / "examples" / "cent" / "cent.yaml"
+)
+
+
+def _fp32_device_yaml() -> str:
+    """Return the example CENT device spec, with GEMV and transfers in fp32.
+
+    The tiny model computes in fp32, which the bf16 example does not run.
+
+    Returns:
+        The YAML text.
+    """
+
+    document = snapshot(load_device_spec(_EXAMPLE_DEVICE))
+    document["capabilities"]["ops"]["pim"]["gemv"] = ["fp32"]
+    document["capabilities"]["ops"]["device"]["transfer"] = ["fp32"]
+    return str(yaml.safe_dump(document))
+
 
 class _ModelDirectoryTestCase(unittest.TestCase):
     """A fresh model directory: tiny.json (width 8), registry.py, run.yaml."""
@@ -90,6 +113,8 @@ class _ModelDirectoryTestCase(unittest.TestCase):
         self.config.write_text(json.dumps({"model_type": self.model_type, "width": 8}))
         self.run_path = self.directory / "run.yaml"
         self.run_path.write_text(_TP2_RUN)
+        self.device_path = self.directory / "device.yaml"
+        self.device_path.write_text(_fp32_device_yaml())
         self.addCleanup(sys.modules.pop, "registry", None)
         self.addCleanup(registry_module._REGISTRY.pop, self.model_type, None)
         self.addCleanup(self._remove_from_path)
@@ -253,6 +278,29 @@ class CompileStagesTest(_ModelDirectoryTestCase):
             texts["02_sharded"],
         )
 
+    def test_device_stage(self) -> None:
+        """With a device spec, 03_device lowers the projection to pim.gemv.
+
+        x is an activation, so it starts in PNM and moves to PIM for the
+        GEMV; the result, also an activation, moves back to PNM.
+        """
+
+        texts = compile_stages(
+            load_model(self.config),
+            load_run_spec(self.run_path),
+            load_device_spec(self.device_path),
+        )
+        self.assertEqual(tuple(texts), (*STAGES, DEVICE_STAGE))
+        body = [line.strip() for line in texts[DEVICE_STAGE].splitlines()[3:-2]]
+        self.assertEqual(
+            [line.split(" : ")[0] for line in body],
+            [
+                "%0 = device.transfer(%x) {to = pim}",
+                "%proj = pim.gemv(%0, %proj.weight)",
+                "%proj_1 = device.transfer(%proj) {to = pnm}",
+            ],
+        )
+
     def test_unsupported_runs(self) -> None:
         """Prefill and more than one layer are not compiled yet."""
 
@@ -294,7 +342,10 @@ class CommandLineTest(_ModelDirectoryTestCase):
         self.assertEqual(headers, [f"// ===== {stage} =====" for stage in STAGES])
 
     def test_writes_stage_files(self) -> None:
-        """--out-dir gets one .aloi file per stage, equal to compile_stages."""
+        """--out-dir gets one .aloi file per stage, equal to compile_stages.
+
+        --device adds the 03_device stage.
+        """
 
         out_dir = self.directory / "ir"
         status, _, _ = self._run(
@@ -302,12 +353,18 @@ class CommandLineTest(_ModelDirectoryTestCase):
             str(self.config),
             "--run",
             str(self.run_path),
+            "--device",
+            str(self.device_path),
             "--out-dir",
             str(out_dir),
         )
-        expected = compile_stages(load_model(self.config), load_run_spec(self.run_path))
+        expected = compile_stages(
+            load_model(self.config),
+            load_run_spec(self.run_path),
+            load_device_spec(self.device_path),
+        )
         self.assertEqual(status, 0)
-        for stage in STAGES:
+        for stage in (*STAGES, DEVICE_STAGE):
             self.assertEqual((out_dir / f"{stage}.aloi").read_text(), expected[stage])
 
     def test_bad_inputs_are_usage_errors(self) -> None:
@@ -315,17 +372,25 @@ class CommandLineTest(_ModelDirectoryTestCase):
 
         bad_run = self.directory / "bad.yaml"
         bad_run.write_text("parallel:\n  tpp: 8\n")
+        bad_device = self.directory / "bad_device.yaml"
+        bad_device.write_text('schema_version: "0.0"\n')
         cases = {
             "missing model": (
-                self.directory / "missing.json",
-                self.run_path,
+                (self.directory / "missing.json", self.run_path),
                 "not found",
             ),
-            "bad run spec": (self.config, bad_run, "unknown keys"),
+            "bad run spec": ((self.config, bad_run), "unknown keys"),
+            "bad device spec": (
+                (self.config, self.run_path, bad_device),
+                "schema_version",
+            ),
         }
-        for name, (model, run, message) in cases.items():
+        for name, (paths, message) in cases.items():
             with self.subTest(case=name):
-                status, _, err = self._run("--model", str(model), "--run", str(run))
+                args = ["--model", str(paths[0]), "--run", str(paths[1])]
+                if len(paths) == 3:
+                    args += ["--device", str(paths[2])]
+                status, _, err = self._run(*args)
                 self.assertEqual(status, 2)
                 self.assertIn(message, err)
 
