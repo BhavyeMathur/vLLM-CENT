@@ -16,10 +16,11 @@ Only ``device.transfer`` moves a tensor to another domain.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import replace
 from typing import ClassVar
 
-from ..base import Operation
+from ..base import Operation, Value
 from ..types import ExecutionDomain, TensorType
 
 __all__ = ["DeviceOp"]
@@ -35,6 +36,10 @@ class DeviceOp(Operation):
     which device ops implement a semantic op without a separate table.
 
     Attributes:
+        INDEX_OPERANDS: Positions of operands that only say where to read or
+            write, such as the cache positions of ``pim.cache_write``. The
+            units do not compute on them, so they may be in any domain; they
+            still need one, like every Device IR value.
         SEMANTIC: The semantic op class this device op implements, or
             ``None`` for an op with no semantic counterpart, such as
             ``device.transfer``, and for the mixins. It may be a class of
@@ -49,7 +54,27 @@ class DeviceOp(Operation):
     """
 
     __slots__ = ()
+    INDEX_OPERANDS: ClassVar[frozenset[int]] = frozenset()
     SEMANTIC: ClassVar[type[Operation] | None] = None
+
+    @classmethod
+    def operand_domain(cls, operands: Sequence[Value]) -> ExecutionDomain | None:
+        """Return the domain this op needs its operands in.
+
+        Lowering moves every other operand, except index operands, there
+        before building the op. By default an op runs where its first
+        operand already is (views, copies, broadcasts); ops that compute in
+        one domain override this.
+
+        Args:
+            operands: The operands the op would be built from, in order.
+
+        Returns:
+            The required domain, or ``None`` if the first operand has no
+            domain yet (a Semantic IR value).
+        """
+
+        return operands[0].type.domain
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         """Register the op by name, then record its semantic base class.
@@ -84,18 +109,26 @@ class _DomainOp(DeviceOp):
 
     Subclasses set ``DOMAIN`` and list this mixin before their semantic op,
     so that ``super().infer_result_types()`` runs the semantic op's rules.
-
-    An op may list ``INDEX_OPERANDS``: operands that only say where to read
-    or write, such as the cache positions of ``pim.cache_write``. The units
-    do not compute on them, so they may be in any domain; they still need
-    one, like every Device IR value.
+    Operands listed in ``INDEX_OPERANDS`` may be in any domain.
     """
 
     # No instance attributes: without empty slots, every op instance of a
     # slotted dataclass that mixes this in would also get a __dict__.
     __slots__ = ()
     DOMAIN: ClassVar[ExecutionDomain]
-    INDEX_OPERANDS: ClassVar[frozenset[int]] = frozenset()
+
+    @classmethod
+    def operand_domain(cls, operands: Sequence[Value]) -> ExecutionDomain:
+        """Return ``DOMAIN``: the op computes there, wherever its operands are now.
+
+        Args:
+            operands: Unused; the domain is fixed by the op class.
+
+        Returns:
+            ``DOMAIN``.
+        """
+
+        return cls.DOMAIN
 
     def infer_result_types(self) -> tuple[TensorType, ...]:
         """Check operand domains, then apply the semantic op's type rules.

@@ -1,6 +1,8 @@
 """Infrastructure for IR passes: the Pass interface and the PassManager.
 
-Concrete passes live in ``vllm_cent.ir.passes``.
+Target-independent passes live in ``vllm_cent.ir.passes``; passes that
+need a target description live in their own packages, e.g.
+``vllm_cent.legalize.LowerToDevice``.
 """
 
 from __future__ import annotations
