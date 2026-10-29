@@ -14,11 +14,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-from ..base import Operation, Value
+from ..base import Value
 from ..semantic import BroadcastOp, CopyOp, ReshapeOp
 from ..semantic.transformer import MergeHeadsOp, SplitHeadsOp
 from ..types import ExecutionDomain, TensorType
-from .domain import _SameDomainOp
+from .domain import DeviceOp, _SameDomainOp
 
 __all__ = [
     "DeviceBroadcastOp",
@@ -32,7 +32,7 @@ __all__ = [
 
 
 @dataclass(frozen=True, eq=False, slots=True)
-class DeviceTransferOp(Operation):
+class DeviceTransferOp(DeviceOp):
     """Move a tensor to another execution domain, e.g. a GEMV result to PNM.
 
     The values and the type are unchanged except for the domain. Each rank

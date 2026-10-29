@@ -17,6 +17,7 @@ from .data import (
     DeviceTransferOp,
     ViewOp,
 )
+from .domain import DeviceOp
 from .pim import PIMActivationOp, PIMEwmulOp, PIMGemvOp
 from .pnm import (
     PNMActivationOp,
@@ -37,6 +38,7 @@ __all__ = [
     "DeviceBroadcastOp",
     "DeviceCopyOp",
     "DeviceMergeHeadsOp",
+    "DeviceOp",
     "DeviceReshapeOp",
     "DeviceSplitHeadsOp",
     "DeviceTransferOp",

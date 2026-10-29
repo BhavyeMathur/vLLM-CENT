@@ -1,9 +1,10 @@
 """Execution-domain rules shared by Device IR ops.
 
-A Device IR op reuses the type rules of the semantic op it implements and
-adds one rule about where its tensors live (``TensorType.domain``). The
-mixins here add that rule; a device op lists one before its semantic op,
-e.g. ``class PIMGemvOp(_PIMOp, LinearOp)``.
+Every Device IR op derives from ``DeviceOp``. A device op reuses the type
+rules of the semantic op it implements and adds one rule about where its
+tensors live (``TensorType.domain``). The mixins here add that rule; a device
+op lists one before its semantic op, e.g. ``class PIMGemvOp(_PIMOp, LinearOp)``.
+``DeviceOp.SEMANTIC`` records which semantic op that is.
 
 - A compute op runs in one domain: every operand must already be there, and
   its results are there too.
@@ -21,10 +22,64 @@ from typing import ClassVar
 from ..base import Operation
 from ..types import ExecutionDomain, TensorType
 
-__all__: list[str] = []
+__all__ = ["DeviceOp"]
 
 
-class _DomainOp(Operation):
+class DeviceOp(Operation):
+    """Base of every Device IR op; records the semantic op it implements.
+
+    A device op class inherits from device classes (``DeviceOp``, a domain
+    mixin such as ``_PIMOp``, or another device op) and from at most one
+    semantic op class, whose type rules it reuses. That semantic class is
+    stored in ``SEMANTIC`` when the class is defined, so lowering can find
+    which device ops implement a semantic op without a separate table.
+
+    Attributes:
+        SEMANTIC: The semantic op class this device op implements, or
+            ``None`` for an op with no semantic counterpart, such as
+            ``device.transfer``, and for the mixins. It may be a class of
+            shared type rules rather than the semantic op itself:
+            ``pnm.softmax`` inherits ``SoftmaxRules``, not the decomposable
+            ``SoftmaxOp``. A class that inherits only device classes keeps
+            its parent's value.
+
+    Examples:
+        ``PIMGemvOp(_PIMOp, LinearOp)`` has ``SEMANTIC is LinearOp``;
+        ``DeviceTransferOp(DeviceOp)`` has ``SEMANTIC is None``.
+    """
+
+    __slots__ = ()
+    SEMANTIC: ClassVar[type[Operation] | None] = None
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        """Register the op by name, then record its semantic base class.
+
+        Only direct bases are inspected: a base that is an ``Operation`` but
+        not a ``DeviceOp`` is the semantic op. ``@dataclass(slots=True)``
+        creates the class a second time with the same bases, which gives the
+        same result.
+
+        Raises:
+            TypeError: If the class inherits from two semantic op classes.
+        """
+
+        super().__init_subclass__(**kwargs)
+        semantic = [
+            base
+            for base in cls.__bases__
+            if issubclass(base, Operation) and not issubclass(base, DeviceOp)
+        ]
+        if len(semantic) > 1:
+            names = [base.__name__ for base in semantic]
+            raise TypeError(
+                f"{cls.__name__} inherits several semantic ops {names}; "
+                "a device op implements one"
+            )
+        if semantic:
+            cls.SEMANTIC = semantic[0]
+
+
+class _DomainOp(DeviceOp):
     """Mixin: every operand must be in ``DOMAIN``; results are put in ``DOMAIN``.
 
     Subclasses set ``DOMAIN`` and list this mixin before their semantic op,
@@ -85,7 +140,7 @@ class _PNMOp(_DomainOp):
     DOMAIN = ExecutionDomain.PNM
 
 
-class _SameDomainOp(Operation):
+class _SameDomainOp(DeviceOp):
     """Mixin: the op runs where its operands are; results stay in that domain.
 
     For ops whose work does not depend on the domain: views move no data,

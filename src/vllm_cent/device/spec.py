@@ -23,7 +23,13 @@ from types import MappingProxyType
 
 from ..activations import ActivationKind
 from ..ir.base import Operation
-from ..ir.device import PIMActivationOp, PIMGemvOp, PNMActivationOp, ViewOp
+from ..ir.device import (
+    DeviceOp,
+    PIMActivationOp,
+    PIMGemvOp,
+    PNMActivationOp,
+    ViewOp,
+)
 from ..ir.types import DType, ExecutionDomain
 
 __all__ = [
@@ -35,10 +41,6 @@ __all__ = [
     "TargetDescriptor",
     "TraceFormat",
 ]
-
-# Name prefixes of Device IR ops: an op whose NAME starts with one of these,
-# followed by a dot, is a device op (``pim.gemv``); others are semantic.
-DEVICE_OP_NAMESPACES = frozenset({"pim", "pnm", "cxl", "device"})
 
 
 class MemorySpace(StrEnum):
@@ -200,7 +202,7 @@ class DeviceCapability:
         object.__setattr__(self, "pnm_activations", frozenset(self.pnm_activations))
 
         for op, dtypes in self.ops.items():
-            if op.NAME.partition(".")[0] not in DEVICE_OP_NAMESPACES:
+            if not issubclass(op, DeviceOp):
                 raise ValueError(f"{op.NAME} is not a Device IR op")
             if issubclass(op, ViewOp):
                 raise ValueError(f"{op.NAME} is a view and always supported")

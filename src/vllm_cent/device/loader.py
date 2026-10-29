@@ -31,16 +31,15 @@ from typing import Any
 import yaml  # type: ignore[import-untyped]
 
 from ..activations import ActivationKind
-from ..ir.base import Operation, operation_class
+from ..ir.base import Operation, operation_class, registered_operations
 
 # Importing ir.device also defines every Device IR op class, which registers
 # its name for the operation_class() lookups below.
-from ..ir.device import ViewOp
+from ..ir.device import DeviceOp, ViewOp
 from ..ir.types import DType
 from ..utils import config
 from .cent import CentArchitecture
 from .spec import (
-    DEVICE_OP_NAMESPACES,
     Architecture,
     DeviceCapability,
     DeviceSpec,
@@ -305,7 +304,7 @@ def _ops(capabilities: Mapping[str, Any]) -> dict[type[Operation], frozenset[DTy
     """
 
     groups = config.section(
-        _DEVICE_SPEC, capabilities, "capabilities.ops", set(DEVICE_OP_NAMESPACES)
+        _DEVICE_SPEC, capabilities, "capabilities.ops", _device_namespaces()
     )
     ops: dict[type[Operation], frozenset[DType]] = {}
     for namespace, entries in groups.items():
@@ -328,6 +327,24 @@ def _ops(capabilities: Mapping[str, Any]) -> dict[type[Operation], frozenset[DTy
                 for name in config.names(_DEVICE_SPEC, path, dtype_names)
             )
     return ops
+
+
+def _device_namespaces() -> set[str]:
+    """Return the name prefixes of the Device IR ops, e.g. ``pim`` of ``pim.gemv``.
+
+    These are the groups allowed under ``capabilities.ops``. They are read
+    from the registered ``DeviceOp`` classes, so a new kind of device op needs
+    no change here.
+
+    Returns:
+        The prefixes before the dot in every device op's ``NAME``.
+    """
+
+    return {
+        op.NAME.partition(".")[0]
+        for op in registered_operations().values()
+        if issubclass(op, DeviceOp)
+    }
 
 
 def _dtype(path: str, name: str) -> DType:

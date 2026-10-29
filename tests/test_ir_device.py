@@ -23,6 +23,7 @@ from vllm_cent.ir import (
 from vllm_cent.ir.base import Decomposable
 from vllm_cent.ir.device import (
     CXLAllReduceOp,
+    DeviceOp,
     DeviceBroadcastOp,
     DeviceCopyOp,
     DeviceMergeHeadsOp,
@@ -47,7 +48,33 @@ from vllm_cent.ir.device import (
     PNMSubOp,
     PNMSumOp,
 )
+from vllm_cent.ir.device.domain import _PNMOp
 from vllm_cent.ir.passes import DecomposeOps
+from vllm_cent.ir.semantic import (
+    ActivationOp,
+    AddOp,
+    AllReduceOp,
+    BroadcastOp,
+    CopyOp,
+    DivOp,
+    ExpOp,
+    LinearOp,
+    MaxOp,
+    MulOp,
+    ReshapeOp,
+    RMSNormRules,
+    SoftmaxRules,
+    SubOp,
+    SumOp,
+)
+from vllm_cent.ir.semantic.transformer import (
+    GqaQKOp,
+    GqaSVOp,
+    KvUpdateOp,
+    MergeHeadsOp,
+    RopeOp,
+    SplitHeadsOp,
+)
 
 PIM = ExecutionDomain.PIM
 PNM = ExecutionDomain.PNM
@@ -448,6 +475,67 @@ class TransformerDeviceOpTest(unittest.TestCase):
                 self.assertEqual(norm.attributes(), {"eps": 1e-5})
         self.assertNotIsInstance(PNMRMSNormOp(operands=(x,)), Decomposable)
         self.assertEqual(PNMRMSNormOp.NAME, "pnm.rms_norm")
+
+
+class DeviceOpTest(unittest.TestCase):
+    """Every device op records the semantic op it implements."""
+
+    def test_semantic_of_every_device_op(self) -> None:
+        """Each op's semantic base, as listed after its device mixin.
+
+        ``pnm.softmax`` and ``pnm.rms_norm`` inherit only the shared type
+        rules, and ``device.transfer`` implements no semantic op.
+        """
+
+        expected: dict[type[DeviceOp], type[Operation] | None] = {
+            CXLAllReduceOp: AllReduceOp,
+            DeviceBroadcastOp: BroadcastOp,
+            DeviceCopyOp: CopyOp,
+            DeviceMergeHeadsOp: MergeHeadsOp,
+            DeviceReshapeOp: ReshapeOp,
+            DeviceSplitHeadsOp: SplitHeadsOp,
+            DeviceTransferOp: None,
+            PIMActivationOp: ActivationOp,
+            PIMCacheWriteOp: KvUpdateOp,
+            PIMEwmulOp: MulOp,
+            PIMGemvOp: LinearOp,
+            PIMQKOp: GqaQKOp,
+            PIMSVOp: GqaSVOp,
+            PNMActivationOp: ActivationOp,
+            PNMAddOp: AddOp,
+            PNMDivOp: DivOp,
+            PNMExpOp: ExpOp,
+            PNMMaxOp: MaxOp,
+            PNMMulOp: MulOp,
+            PNMRMSNormOp: RMSNormRules,
+            PNMRopeOp: RopeOp,
+            PNMSoftmaxOp: SoftmaxRules,
+            PNMSubOp: SubOp,
+            PNMSumOp: SumOp,
+        }
+        self.assertEqual({op: op.SEMANTIC for op in expected}, expected)
+
+    def test_device_subclass_keeps_the_semantic(self) -> None:
+        """A subclass that adds only device behavior still implements linear.
+
+        The probe defines no NAME, so it is not registered as an op.
+        """
+
+        class _Probe(PIMGemvOp):
+            """A device op derived from another device op."""
+
+        self.assertIs(_Probe.SEMANTIC, LinearOp)
+
+    def test_two_semantic_ops_are_rejected(self) -> None:
+        """One device op cannot implement both add and mul."""
+
+        with self.assertRaisesRegex(
+            TypeError, r"several semantic ops \['AddOp', 'MulOp'\]"
+        ):
+            # mypy also rejects this class (the two ops' dataclass methods
+            # differ); the test defines it on purpose to see it rejected.
+            class _Both(_PNMOp, AddOp, MulOp):  # type: ignore[misc]
+                """Inherits two semantic ops."""
 
 
 if __name__ == "__main__":
