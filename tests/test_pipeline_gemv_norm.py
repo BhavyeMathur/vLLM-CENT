@@ -11,9 +11,21 @@ from vllm_cent.pipeline import (
     ExecutionContract,
     compile_graph,
 )
-from vllm_cent.pipeline.ir import SemanticGraph, TensorType, Value
-from vllm_cent.pipeline.operations import LinearOperation, RmsNormOperation
+from vllm_cent.ir import DType, Function, LinearOp, RMSNormOp, TensorType, Value
 from vllm_cent.runtime import CentNamedScalars
+
+
+def _fp32(name: str, *shape: int) -> Value:
+    """Create a named fp32 function argument, the only format the pipeline runs.
+
+    Args:
+        name: Argument name; the compiled program's input of the same name.
+        shape: Tensor dimensions, outermost first.
+
+    Returns:
+        A new graph input value with the requested shape.
+    """
+    return Value(type=TensorType(shape=shape, dtype=DType.FP32), name=name)
 
 
 def target() -> CentTargetProfile:
@@ -39,22 +51,21 @@ def target() -> CentTargetProfile:
     )
 
 
-def linear_graph() -> SemanticGraph:
+def linear_graph() -> Function:
     """Return a batched matrix-vector graph with odd widths and preserved inputs.
 
     Returns:
-        Two five-value vectors multiplied by a three-row weight matrix.
+        Two five-value vectors multiplied by a three-row weight matrix. The
+        ``(2, 3)`` result is named ``out``; that name also names the linear
+        operation in mapping schedules and accumulator placements.
     """
-    return SemanticGraph(
-        inputs=(Value("x", TensorType((2, 5))), Value("w", TensorType((3, 5)))),
-        operations=(
-            LinearOperation(
-                name="linear",
-                inputs=("x", "w"),
-                output=Value("out", TensorType((2, 3))),
-            ),
-        ),
-        outputs=("out", "x", "w"),
+    x, w = _fp32("x", 2, 5), _fp32("w", 3, 5)
+    linear = LinearOp(operands=(x, w), name_hint="out")
+    return Function(
+        name="main",
+        operands=(x, w),
+        operations=(linear,),
+        results=(*linear.results, x, w),
     )
 
 
@@ -112,7 +123,7 @@ class GemvNormTests(unittest.TestCase):
         )
         mapping = replace(
             artifact.target_ir.mapping,
-            accumulators=(AccumulatorPlacement(operation="linear", register=1),),
+            accumulators=(AccumulatorPlacement(operation="out", register=1),),
         )
         selected = compile_graph(linear_graph(), target(), mapping=mapping)
         self.assertEqual(
@@ -136,19 +147,14 @@ class GemvNormTests(unittest.TestCase):
 
     def test_rms_uses_logical_width_gamma_and_epsilon(self) -> None:
         """Normalize each row independently, excluding padding from the mean."""
-        tensor = TensorType((2, 5))
         epsilon = 0.25
-        graph = SemanticGraph(
-            inputs=(Value("x", tensor), Value("gamma", TensorType((5,)))),
-            operations=(
-                RmsNormOperation(
-                    name="norm",
-                    inputs=("x", "gamma"),
-                    output=Value("out", tensor),
-                    epsilon=epsilon,
-                ),
-            ),
-            outputs=("out", "x"),
+        x_value, gamma_value = _fp32("x", 2, 5), _fp32("gamma", 5)
+        norm = RMSNormOp(operands=(x_value, gamma_value), eps=epsilon, name_hint="out")
+        graph = Function(
+            name="main",
+            operands=(x_value, gamma_value),
+            operations=(norm,),
+            results=(*norm.results, x_value),
         )
         artifact = compile_graph(graph, target())
         gamma = (1.0, -2.0, 0.5, 3.0, 0.0)
@@ -186,7 +192,7 @@ class GemvNormTests(unittest.TestCase):
                     mapping=replace(
                         artifact.target_ir.mapping,
                         accumulators=(
-                            AccumulatorPlacement(operation="linear", register=register),
+                            AccumulatorPlacement(operation="out", register=register),
                         ),
                     ),
                 )
@@ -199,18 +205,14 @@ class GemvNormTests(unittest.TestCase):
 
     def test_global_buffer_limits_tiles_and_output_groups_continue(self) -> None:
         """A small Global Buffer limits input tiles; extra outputs start a new bank group."""
-        source = TensorType((1, 2, 5))
-        weights = TensorType((7, 5))
-        graph = SemanticGraph(
-            inputs=(Value("x", source), Value("w", weights)),
-            operations=(
-                LinearOperation(
-                    name="linear",
-                    inputs=("x", "w"),
-                    output=Value("out", TensorType((1, 2, 7))),
-                ),
-            ),
-            outputs=("out",),
+        x_value, w_value = _fp32("x", 1, 2, 5), _fp32("w", 7, 5)
+        # The (1, 2, 5) input and (7, 5) weight infer a (1, 2, 7) result.
+        linear = LinearOp(operands=(x_value, w_value), name_hint="out")
+        graph = Function(
+            name="main",
+            operands=(x_value, w_value),
+            operations=(linear,),
+            results=linear.results,
         )
         device = target()
         device = replace(
@@ -273,15 +275,13 @@ class GemvNormTests(unittest.TestCase):
         """Equal input/output storage sizes do not make a matrix transform safely in-place."""
         from vllm_cent.pipeline import ValuePlacement
 
-        tensor = TensorType((5,))
-        graph = SemanticGraph(
-            inputs=(Value("x", tensor), Value("w", TensorType((5, 5)))),
-            operations=(
-                LinearOperation(
-                    name="linear", inputs=("x", "w"), output=Value("out", tensor)
-                ),
-            ),
-            outputs=("out",),
+        x_value, w_value = _fp32("x", 5), _fp32("w", 5, 5)
+        linear = LinearOp(operands=(x_value, w_value), name_hint="out")
+        graph = Function(
+            name="main",
+            operands=(x_value, w_value),
+            operations=(linear,),
+            results=linear.results,
         )
         with self.assertRaisesRegex(ValueError, "live"):
             compile_graph(
@@ -297,16 +297,13 @@ class GemvNormTests(unittest.TestCase):
         """A one-value dot product needs two staging slots, even on a wide device."""
         from vllm_cent.cent import WriteGlobalBuffer
 
-        graph = SemanticGraph(
-            inputs=(Value("x", TensorType((1,))), Value("w", TensorType((1, 1)))),
-            operations=(
-                LinearOperation(
-                    name="linear",
-                    inputs=("x", "w"),
-                    output=Value("out", TensorType((1,))),
-                ),
-            ),
-            outputs=("out",),
+        x_value, w_value = _fp32("x", 1), _fp32("w", 1, 1)
+        linear = LinearOp(operands=(x_value, w_value), name_hint="out")
+        graph = Function(
+            name="main",
+            operands=(x_value, w_value),
+            operations=(linear,),
+            results=linear.results,
         )
         device = replace(
             target(),

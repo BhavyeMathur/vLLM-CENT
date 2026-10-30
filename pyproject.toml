@@ -8,6 +8,9 @@ version = "0.0.0"
 description = "A vLLM integration and compiler interface for CENT."
 requires-python = ">=3.14"
 
+[project.scripts]
+aloi-compile = "vllm_cent.driver.cli:main"
+
 [project.optional-dependencies]
 mlir = ["iree-base-compiler==3.11.0"]
 dev = [

@@ -1,0 +1,17 @@
+# Llama 3.1 70B, one decode step on 8 tensor-parallel ranks, Megatron style.
+#
+#   aloi-compile --model examples/llama_70b/llama3_1_70b.json \
+#                --run examples/llama_70b/runs/llama3_1_70b_tp8_decode.yaml
+parallel:
+  tp: 8                  # must divide the 8 KV heads
+  split:
+    - q_head             # q_proj rows, o_proj columns, per-head attention
+    - kv_head            # k_proj/v_proj rows, both KV caches
+    - intermediate       # gate/up rows, down_proj columns
+  replicate: []          # per-tensor exceptions, e.g. [self_attn.k_proj.weight]
+workload:
+  phase: decode
+  batch: 1
+  context_len: 2048      # KV cache positions, including the new token
+scope:
+  layers: 1

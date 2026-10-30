@@ -4,15 +4,44 @@ import math
 import unittest
 from dataclasses import replace
 
+from vllm_cent.activations import ActivationKind
+from vllm_cent.ir import ActivationOp, DType, Function, SoftmaxOp, TensorType, Value
 from vllm_cent.pipeline import ExecutionContract, compile_graph
-from vllm_cent.pipeline.ir import SemanticGraph, TensorType, Value
-from vllm_cent.pipeline.operations import (
-    ActivationKind,
-    ActivationOperation,
-    SoftmaxOperation,
-)
 from vllm_cent.runtime import CentNamedScalars
 from tests.test_pipeline_gemv_norm import target
+
+
+def _fp32(name: str, *shape: int) -> Value:
+    """Create a named fp32 function argument, the only format the pipeline runs.
+
+    Args:
+        name: Argument name; the compiled program's input of the same name.
+        shape: Tensor dimensions, outermost first. No dimensions make a scalar.
+
+    Returns:
+        A new graph input value with the requested shape.
+    """
+    return Value(type=TensorType(shape=shape, dtype=DType.FP32), name=name)
+
+
+def _softmax_graph(x: Value, *, preserve: bool) -> Function:
+    """Apply softmax to one input and name the result ``out``.
+
+    Args:
+        x: Graph input normalized along its last dimension.
+        preserve: Whether the function also returns ``x`` after ``out``, which
+            keeps the input's storage alive and observable.
+
+    Returns:
+        Function computing ``out = softmax(x)``.
+    """
+    softmax = SoftmaxOp(operands=(x,), name_hint="out")
+    return Function(
+        name="main",
+        operands=(x,),
+        operations=(softmax,),
+        results=(*softmax.results, x) if preserve else softmax.results,
+    )
 
 
 class ActivationTests(unittest.TestCase):
@@ -38,18 +67,17 @@ class ActivationTests(unittest.TestCase):
         for function, formula in formulas.items():
             for preserve in (False, True):
                 with self.subTest(function=function, preserve=preserve):
-                    tensor = TensorType((5,))
-                    graph = SemanticGraph(
-                        inputs=(Value("x", tensor),),
-                        operations=(
-                            ActivationOperation(
-                                name="act",
-                                inputs=("x",),
-                                output=Value("out", tensor),
-                                function=function,
-                            ),
+                    x = _fp32("x", 5)
+                    activation = ActivationOp(
+                        operands=(x,), function=function, name_hint="out"
+                    )
+                    graph = Function(
+                        name="main",
+                        operands=(x,),
+                        operations=(activation,),
+                        results=(
+                            (*activation.results, x) if preserve else activation.results
                         ),
-                        outputs=("out", "x") if preserve else ("out",),
                     )
                     artifact = compile_graph(graph, target())
                     actual = artifact.execute(
@@ -67,16 +95,7 @@ class ActivationTests(unittest.TestCase):
 
     def test_softmax_rows_are_stable_and_independent(self) -> None:
         """Odd-width rows start inside slots and large logits do not overflow."""
-        tensor = TensorType((2, 3))
-        graph = SemanticGraph(
-            inputs=(Value("x", tensor),),
-            operations=(
-                SoftmaxOperation(
-                    name="softmax", inputs=("x",), output=Value("out", tensor)
-                ),
-            ),
-            outputs=("out", "x"),
-        )
+        graph = _softmax_graph(_fp32("x", 2, 3), preserve=True)
         values = (1000.0, 1001.0, 1002.0, -1000.0, -1002.0, -1004.0)
         artifact = compile_graph(graph, target())
         actual = artifact.execute((CentNamedScalars(name="x", values=values),))
@@ -90,24 +109,14 @@ class ActivationTests(unittest.TestCase):
 
     def test_reference_gate_and_semantic_shape(self) -> None:
         """Reject missing opt-in and softmax without a last dimension."""
-        tensor = TensorType((3,))
-        graph = SemanticGraph(
-            inputs=(Value("x", tensor),),
-            operations=(
-                SoftmaxOperation(
-                    name="softmax", inputs=("x",), output=Value("out", tensor)
-                ),
-            ),
-            outputs=("out",),
-        )
+        graph = _softmax_graph(_fp32("x", 3), preserve=False)
         with self.assertRaisesRegex(ValueError, "REFERENCE"):
             compile_graph(
                 graph, replace(target(), execution_contract=ExecutionContract.STANDARD)
             )
-        with self.assertRaises(ValueError):
-            SoftmaxOperation(
-                name="bad", inputs=("x",), output=Value("out", TensorType(()))
-            ).verify((TensorType(()),))
+        # A scalar has no last dimension to normalize over.
+        with self.assertRaisesRegex(ValueError, "dimension"):
+            SoftmaxOp(operands=(_fp32("x"),))
 
     def test_masks_singletons_and_in_place_rows(self) -> None:
         """Masks get zero probability and last-use rows can reuse input storage."""
@@ -119,16 +128,7 @@ class ActivationTests(unittest.TestCase):
             ),
             ((2, 1), (10000.0, -10000.0), (1.0, 1.0)),
         ):
-            tensor = TensorType(shape)
-            graph = SemanticGraph(
-                inputs=(Value("x", tensor),),
-                operations=(
-                    SoftmaxOperation(
-                        name="softmax", inputs=("x",), output=Value("out", tensor)
-                    ),
-                ),
-                outputs=("out",),
-            )
+            graph = _softmax_graph(_fp32("x", *shape), preserve=False)
             artifact = compile_graph(graph, target())
             placements = {
                 item.value: item.storage
@@ -147,19 +147,20 @@ class ActivationTests(unittest.TestCase):
         from vllm_cent.pipeline import compile_target
         from vllm_cent.pipeline.ir import CapabilityProfile, DeviceOperationKind
 
-        tensor = TensorType((3,))
-        operation = ActivationOperation(
-            name="act",
-            inputs=("x",),
-            output=Value("out", tensor),
-            function=ActivationKind.GELU_ERF,
+        x = _fp32("x", 3)
+        operation = ActivationOp(
+            operands=(x,), function=ActivationKind.GELU_ERF, name_hint="out"
         )
-        graph = SemanticGraph(
-            inputs=(Value("x", tensor),), operations=(operation,), outputs=("out",)
+        graph = Function(
+            name="main",
+            operands=(x,),
+            operations=(operation,),
+            results=operation.results,
         )
-        for types in ((), (TensorType((2,)),)):
-            with self.assertRaises(ValueError):
-                operation.verify(types)
+        # An activation reads exactly one tensor.
+        for operands in ((), (x, x)):
+            with self.subTest(count=len(operands)), self.assertRaises(ValueError):
+                ActivationOp(operands=operands, function=ActivationKind.GELU_ERF)
         with self.assertRaises(NotImplementedError):
             compile_graph(
                 graph,

@@ -8,6 +8,7 @@ from random import Random
 from vllm_cent.cent import CentHardwareSpec, MacAllBanks, render_text_program
 from vllm_cent.cent.reference import ReferenceSoftmax
 from vllm_cent.graphs import build_attention_graph
+from vllm_cent.ir import AddOp, Function, Value, value_names
 from vllm_cent.pipeline import (
     AccumulatorPlacement,
     CentTargetProfile,
@@ -16,8 +17,6 @@ from vllm_cent.pipeline import (
     ValuePlacement,
     compile_graph,
 )
-from vllm_cent.pipeline.ir import SemanticGraph, Value
-from vllm_cent.pipeline.operations import AddOperation
 from vllm_cent.runtime import CentNamedScalars
 from vllm_cent.simulator import CentExecutionFault, execute_functionally
 
@@ -49,27 +48,33 @@ def _target(burst: int) -> CentTargetProfile:
     )
 
 
-def _manual(graph: SemanticGraph) -> MappingPlan:
+def _manual(graph: Function) -> MappingPlan:
     """Give each tensor separate storage and run attention on register one.
 
     Args:
-        graph: One-operation attention graph with optional extra observed inputs.
+        graph: One-operation attention function with optional extra observed
+            results.
 
     Returns:
-        Valid complete mapping independent of the automatic mapper.
+        Valid complete mapping independent of the automatic mapper. The
+        schedule and accumulator refer to the attention operation by its
+        result name, ``attention.output``, which also names the device
+        operation.
     """
-    values = (*graph.inputs, graph.operations[0].output)
+    names = value_names(graph)
+    operation = names[graph.operations[0].results[0]]
     return MappingPlan(
         placements=tuple(
-            ValuePlacement(value=v.name, storage=f"buffer_{v.name}") for v in values
+            ValuePlacement(value=name, storage=f"buffer_{name}")
+            for name in names.values()
         ),
-        schedule=("attention",),
-        accumulators=(AccumulatorPlacement(operation="attention", register=1),),
+        schedule=(operation,),
+        accumulators=(AccumulatorPlacement(operation=operation, register=1),),
     )
 
 
 def _oracle(
-    graph: SemanticGraph,
+    graph: Function,
     data: dict[str, tuple[float, ...]],
     *,
     causal: bool,
@@ -79,7 +84,8 @@ def _oracle(
     """Evaluate scaled attention directly without using compiler packing helpers.
 
     Args:
-        graph: Declared shapes for query, key, value, and optional mask.
+        graph: Function whose arguments give the query, key, value, and
+            optional mask shapes, in that order.
         data: Flattened values for those tensors in batch/head/sequence/lane order.
         causal: Whether each query may read only keys at or before its position.
         offset: Position of the first query in the supplied key sequence.
@@ -88,13 +94,13 @@ def _oracle(
     Returns:
         Flattened output retaining batch and query-head dimensions.
     """
-    batch, heads, queries, width = graph.inputs[0].type.shape
-    _, kv_heads, keys, _ = graph.inputs[1].type.shape
-    value_width = graph.inputs[2].type.shape[-1]
+    batch, heads, queries, width = graph.operands[0].type.shape
+    _, kv_heads, keys, _ = graph.operands[1].type.shape
+    value_width = graph.operands[2].type.shape[-1]
     factor = 1 / math.sqrt(width) if scale is None else scale
     output: list[float] = []
     mask = data.get("mask")
-    full_mask = len(graph.inputs) == 4 and len(graph.inputs[3].type.shape) == 4
+    full_mask = len(graph.operands) == 4 and graph.operands[3].type.rank == 4
     for b in range(batch):
         for h in range(heads):
             kv_head = h // (heads // kv_heads)
@@ -185,17 +191,25 @@ class AttentionLayerTests(unittest.TestCase):
                     query_position_offset=offset,
                     scale=scale,
                 )
-                graph = replace(graph, outputs=("output", "query", "key", "value"))
+                # Also return the unchanged query, key, and value so the test
+                # can check that attention scratch never overwrites an input.
+                graph = Function(
+                    name=graph.name,
+                    operands=graph.operands,
+                    operations=graph.operations,
+                    results=(*graph.results, *graph.operands[:3]),
+                )
+                names = value_names(graph)
                 for burst, mapping in ((1, None), (2, _manual(graph)), (4, None)):
                     with self.subTest(shape=query_shape, mask=mask_mode, burst=burst):
                         artifact = compile_graph(graph, _target(burst), mapping=mapping)
                         for _ in range(2):
                             data = {
-                                v.name: tuple(
+                                names[v]: tuple(
                                     random.randrange(-6, 7) / 4
                                     for _ in range(v.type.numel)
                                 )
-                                for v in graph.inputs
+                                for v in graph.operands
                             }
                             if mask_shape is not None:
                                 # Key zero stays available, so even the first
@@ -263,7 +277,7 @@ class AttentionLayerTests(unittest.TestCase):
             )
             self.assertEqual(
                 compile_graph(graph, _target(2)).execute(inputs),
-                (CentNamedScalars(name="output", values=(expected,)),),
+                (CentNamedScalars(name="attention.output", values=(expected,)),),
             )
 
     def test_all_masked_row_is_rejected(self) -> None:
@@ -285,36 +299,28 @@ class AttentionLayerTests(unittest.TestCase):
     def test_attention_composes_with_producers_and_residual_consumers(self) -> None:
         """Consume a computed query and preserve attention output through an addition."""
         base = build_attention_graph((1, 2, 2, 3), (1, 1, 3, 3), (1, 1, 3, 3))
-        query_type = base.inputs[0].type
-        output_type = base.operations[0].output.type
-        graph = SemanticGraph(
-            inputs=(
-                *base.inputs,
-                Value("delta", query_type),
-                Value("residual", output_type),
-            ),
-            operations=(
-                AddOperation(
-                    name="prepare_query",
-                    inputs=("query", "delta"),
-                    output=Value("prepared", query_type),
-                ),
-                replace(
-                    base.operations[0],
-                    inputs=("prepared", "key", "value"),
-                    output=Value("attended", output_type),
-                ),
-                AddOperation(
-                    name="add_residual",
-                    inputs=("attended", "residual"),
-                    output=Value("output", output_type),
-                ),
-            ),
-            outputs=("output", "attended", "query"),
+        query, key, value = base.operands
+        delta = Value(type=query.type, name="delta")
+        residual = Value(type=base.results[0].type, name="residual")
+        prepare_query = AddOp(operands=(query, delta), name_hint="prepared")
+        # Keep the builder's attention options but read the computed query.
+        # replace() runs result inference again for the new operands.
+        attend = replace(
+            base.operations[0],
+            operands=(prepare_query.results[0], key, value),
+            name_hint="attended",
         )
+        add_residual = AddOp(operands=(attend.results[0], residual), name_hint="output")
+        graph = Function(
+            name="main",
+            operands=(query, key, value, delta, residual),
+            operations=(prepare_query, attend, add_residual),
+            results=(add_residual.results[0], attend.results[0], query),
+        )
+        names = value_names(graph)
         data = {
-            v.name: tuple((i % 7 - 3) / 4 for i in range(v.type.numel))
-            for v in graph.inputs
+            names[v]: tuple((i % 7 - 3) / 4 for i in range(v.type.numel))
+            for v in graph.operands
         }
         adjusted = dict(data)
         adjusted["query"] = tuple(

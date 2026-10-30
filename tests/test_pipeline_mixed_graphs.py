@@ -4,19 +4,23 @@ import unittest
 from random import Random
 
 from vllm_cent.cent import CentHardwareSpec
+from vllm_cent.ir import (
+    AddOp,
+    CopyOp,
+    DType,
+    Function,
+    MulOp,
+    Operation,
+    ReshapeOp,
+    TensorType,
+    Value,
+    value_names,
+)
 from vllm_cent.pipeline import (
     CentTargetProfile,
     MappingPlan,
     ValuePlacement,
     compile_graph,
-)
-from vllm_cent.pipeline.ir import SemanticGraph, TensorType, Value
-from vllm_cent.pipeline.operations import (
-    AddOperation,
-    CopyOperation,
-    MultiplyOperation,
-    Operation,
-    ReshapeOperation,
 )
 from vllm_cent.runtime import CentNamedScalars
 
@@ -49,7 +53,7 @@ def _target() -> CentTargetProfile:
 
 def _case(
     random: Random, case_index: int
-) -> tuple[SemanticGraph, tuple[CentNamedScalars, ...], tuple[CentNamedScalars, ...]]:
+) -> tuple[Function, tuple[CentNamedScalars, ...], tuple[CentNamedScalars, ...]]:
     """Build a bounded graph while separately calculating each tensor's values.
 
     Args:
@@ -57,99 +61,104 @@ def _case(
         case_index: Selects the input shape and rotates the operation sequence.
 
     Returns:
-        Graph, caller input values, and independently calculated requested outputs.
-        The first input is always returned so its original contents must survive.
+        Function, caller input values, and independently calculated requested
+        outputs. The first input is always returned so its original contents
+        must survive. Operation ``index`` names its result ``value{index}``.
     """
     # Cycling, rather than randomly sampling, guarantees scalar, odd-tail, and
     # multi-row coverage. A scalar and a one-element vector can reshape into
     # each other without changing their one flattened value.
     shapes = ((), (1,), (3,), (5,), (6,), (8,))
-    tensor_type = TensorType(shapes[case_index % len(shapes)])
-    inputs = (Value("x", tensor_type), Value("y", tensor_type))
+    tensor_type = TensorType(shape=shapes[case_index % len(shapes)], dtype=DType.FP32)
+    input_names = ("x", "y")
+    inputs = tuple(Value(type=tensor_type, name=name) for name in input_names)
     values = list(inputs)
+    # Host values are keyed by IR value; only the requested outputs need names.
     host = {
-        name: tuple(float(random.randrange(-2, 3)) for _ in range(tensor_type.numel))
-        for name in ("x", "y")
+        value: tuple(float(random.randrange(-2, 3)) for _ in range(tensor_type.numel))
+        for value in inputs
     }
     bindings = tuple(
-        CentNamedScalars(name=value.name, values=host[value.name]) for value in inputs
+        CentNamedScalars(name=name, values=host[value])
+        for name, value in zip(input_names, inputs, strict=True)
     )
     operations: list[Operation] = []
-    choices = (AddOperation, MultiplyOperation, CopyOperation, ReshapeOperation)
+    choices: tuple[type[Operation], ...] = (AddOp, MulOp, CopyOp, ReshapeOp)
     for index in range(_OPERATION_COUNT):
         # Every graph includes each operation twice. Earlier results remain
         # eligible as operands, creating branches and longer-lived values.
         operation_type = choices[(index + case_index) % len(choices)]
         left = random.choice(values)
-        operand_names = (left.name,)
-        output_type = left.type
-        if operation_type in (AddOperation, MultiplyOperation):
+        name = f"value{index}"
+        operation: Operation
+        if operation_type is AddOp or operation_type is MulOp:
             right = random.choice(
                 [value for value in values if value.type == left.type]
             )
-            operand_names += (right.name,)
             # The oracle uses ordinary host arithmetic and no compiler layouts,
             # instruction helpers, or functional-simulator kernels.
-            if operation_type is AddOperation:
+            if operation_type is AddOp:
+                operation = AddOp(operands=(left, right), name_hint=name)
                 expected = tuple(
-                    a + b
-                    for a, b in zip(host[left.name], host[right.name], strict=True)
+                    a + b for a, b in zip(host[left], host[right], strict=True)
                 )
             else:
+                operation = MulOp(operands=(left, right), name_hint=name)
                 expected = tuple(
-                    a * b
-                    for a, b in zip(host[left.name], host[right.name], strict=True)
+                    a * b for a, b in zip(host[left], host[right], strict=True)
                 )
+        elif operation_type is CopyOp:
+            operation = CopyOp(operands=(left,), name_hint=name)
+            expected = host[left]
         else:
-            expected = host[left.name]
-            if operation_type is ReshapeOperation:
-                if left.type.numel == 1:
-                    shape = (1,) if left.type.shape == () else ()
-                else:
-                    shape = (
-                        (1, left.type.numel)
-                        if len(left.type.shape) == 1
-                        else (left.type.numel,)
-                    )
-                output_type = TensorType(shape)
-        output = Value(f"value{index}", output_type)
-        operations.append(
-            operation_type(
-                name=f"operation{index}", inputs=operand_names, output=output
-            )
-        )
+            if left.type.numel == 1:
+                shape: tuple[int, ...] = (1,) if left.type.shape == () else ()
+            else:
+                shape = (
+                    (1, left.type.numel)
+                    if len(left.type.shape) == 1
+                    else (left.type.numel,)
+                )
+            operation = ReshapeOp(operands=(left,), shape=shape, name_hint=name)
+            expected = host[left]
+        operations.append(operation)
+        output = operation.results[0]
         values.append(output)
-        host[output.name] = expected
+        host[output] = expected
     # Returning both an intermediate and the final result tests preservation
     # even when that intermediate's other consumers have already finished.
-    intermediate = random.choice(values[2:-1]).name
-    output_names = ("x", intermediate, values[-1].name)
-    graph = SemanticGraph(
-        inputs=inputs, operations=tuple(operations), outputs=output_names
+    intermediate = random.choice(values[2:-1])
+    results = (inputs[0], intermediate, values[-1])
+    graph = Function(
+        name="main", operands=inputs, operations=tuple(operations), results=results
     )
+    names = value_names(graph)
     expected_outputs = tuple(
-        CentNamedScalars(name=name, values=host[name]) for name in output_names
+        CentNamedScalars(name=names[value], values=host[value]) for value in results
     )
     return graph, bindings, expected_outputs
 
 
-def _separate_storage(graph: SemanticGraph) -> MappingPlan:
+def _separate_storage(graph: Function) -> MappingPlan:
     """Give every tensor a separate named buffer without using mapper internals.
 
     Args:
-        graph: Ordered tensor calculations with all inputs and results named.
+        graph: Ordered tensor calculations; arguments and results are named
+            as the IR printer names them.
 
     Returns:
         Manual mapping in graph order, with no storage reuse. This deliberately
-        exercises copies that the generated mapping may safely eliminate.
+        exercises copies that the generated mapping may safely eliminate. Each
+        schedule entry is an operation's result name, which also names the
+        device operation.
     """
-    values = (*graph.inputs, *(operation.output for operation in graph.operations))
+    names = value_names(graph)
     return MappingPlan(
         placements=tuple(
-            ValuePlacement(value=value.name, storage=f"buffer_{value.name}")
-            for value in values
+            ValuePlacement(value=name, storage=f"buffer_{name}")
+            for name in names.values()
         ),
-        schedule=tuple(operation.name for operation in graph.operations),
+        schedule=tuple(names[operation.results[0]] for operation in graph.operations),
     )
 
 
@@ -162,11 +171,7 @@ class MixedGraphOracleTests(unittest.TestCase):
         target = _target()
         for case_index in range(_CASE_COUNT):
             graph, bindings, expected = _case(random, case_index)
-            value_types = {value.name: value.type for value in graph.inputs}
-            value_types.update(
-                (op.output.name, op.output.type) for op in graph.operations
-            )
-            expected_types = tuple(value_types[name] for name in graph.outputs)
+            expected_types = tuple(value.type for value in graph.results)
             for mapping in (None, _separate_storage(graph)):
                 with self.subTest(case=case_index, manual=mapping is not None):
                     artifact = compile_graph(graph, target, mapping=mapping)

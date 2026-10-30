@@ -5,8 +5,7 @@ Compilation, input loading, and execution remain separate. Model-family graph
 builders, such as Llama's feed-forward block, live in their model package.
 """
 
-from .pipeline.ir import SemanticGraph, TensorType, Value, verify_semantic
-from .pipeline.operations import AttentionOperation
+from .ir import AttentionOp, DType, Function, TensorType, Value
 
 __all__ = ["build_attention_graph"]
 
@@ -21,7 +20,7 @@ def build_attention_graph(
     query_position_offset: int = 0,
     scale: float | None = None,
     block: str = "attention",
-) -> SemanticGraph:
+) -> Function:
     """Describe scaled attention over already-projected query, key, and value tensors.
 
     The caller supplies ``query``, ``key``, and ``value`` in
@@ -51,10 +50,11 @@ def build_attention_graph(
             use ``key_count - query_count`` for an aligned suffix when nonnegative.
         scale: Finite multiplier applied to dot products before the mask.
             ``None`` selects ``1 / sqrt(key_width)``.
-        block: Source label retained by the operation for diagnostics.
+        block: Model-block label. The result is called ``block.output``, as a
+            module path would name it, or ``output`` when the label is empty.
 
     Returns:
-        Verified SemanticGraph with named inputs and one ``output`` tensor.
+        Verified function with named inputs and one ``output`` tensor.
         Compile separately using ``ExecutionContract.REFERENCE``. Execution
         rejects a probability row with no available finite score.
 
@@ -74,29 +74,30 @@ def build_attention_graph(
     """
     if any(len(shape) != 4 for shape in (query_shape, key_shape, value_shape)):
         raise ValueError("Attention query, key, and value shapes must have rank four")
-    inputs: tuple[Value, ...] = (
-        Value("query", TensorType(query_shape)),
-        Value("key", TensorType(key_shape)),
-        Value("value", TensorType(value_shape)),
-    )
+    shapes: tuple[tuple[int, ...], ...] = (query_shape, key_shape, value_shape)
     if mask_shape is not None:
-        inputs += (Value("mask", TensorType(mask_shape)),)
-    graph = SemanticGraph(
-        inputs=inputs,
-        operations=(
-            AttentionOperation(
-                name="attention",
-                inputs=tuple(value.name for value in inputs),
-                output=Value(
-                    "output", TensorType((*query_shape[:-1], value_shape[-1]))
-                ),
-                causal=causal,
-                query_position_offset=query_position_offset,
-                scale=scale,
-                block=block,
-            ),
-        ),
-        outputs=("output",),
+        shapes += (mask_shape,)
+    if any(dim <= 0 for shape in shapes for dim in shape):
+        raise ValueError("Attention dimensions must be positive")
+    names = ("query", "key", "value", "mask")
+    inputs = tuple(
+        Value(type=TensorType(shape=shape, dtype=DType.FP32), name=name)
+        for name, shape in zip(names, shapes, strict=False)
     )
-    verify_semantic(graph)
-    return graph
+    # AttentionOp checks the remaining shape rules: head grouping, widths,
+    # mask shape, offset, and scale.
+    attention = AttentionOp(
+        operands=inputs,
+        causal=causal,
+        query_position_offset=query_position_offset,
+        scale=scale,
+        name_hint=f"{block}.output" if block else "output",
+    )
+    function = Function(
+        name="attention",
+        operands=inputs,
+        operations=(attention,),
+        results=attention.results,
+    )
+    function.verify()
+    return function

@@ -6,6 +6,7 @@ from random import Random
 from unittest.mock import Mock
 
 from vllm_cent.cent import Accumulate, CentHardwareSpec
+from vllm_cent.ir import AddOp, DType, Function, TensorType, Value
 from vllm_cent.pipeline import (
     CentTargetProfile,
     MappingPlan,
@@ -18,46 +19,47 @@ from vllm_cent.pipeline import (
 )
 from vllm_cent.pipeline.ir import (
     CapabilityProfile,
-    ParallelPlan,
-    SemanticGraph,
-    TensorType,
-    Value,
+    NameValue,
     legalize,
-    shard,
 )
-from vllm_cent.pipeline.operations import AddOperation
 from vllm_cent.runtime import CentNamedScalars
 
 
-def graph(*, fanout: bool = False) -> SemanticGraph:
-    """Build z = x + y followed by out = z + y on three-element vectors.
+def argument(name: str, shape: tuple[int, ...]) -> Value:
+    """Build a named fp32 function argument.
+
+    Args:
+        name: Argument name, which also names the compiled program's input.
+        shape: Tensor dimensions, outermost first.
+
+    Returns:
+        A new value suitable as a function operand.
+    """
+    return Value(type=TensorType(shape=shape, dtype=DType.FP32), name=name)
+
+
+def graph(*, fanout: bool = False, shape: tuple[int, ...] = (3,)) -> Function:
+    """Build z = x + y followed by out = z + y.
 
     Args:
         fanout: If True, also return x so its original contents must survive
             both additions. Otherwise x can be overwritten after its last read.
+        shape: Dimensions shared by every tensor. The default three-element
+            vector needs one trailing padding lane with two lanes per slot.
 
     Returns:
-        Two-addition graph returning out, and optionally x. With the test target's
-        two lanes per slot, each tensor will need one trailing padding lane.
+        Two-addition function returning out, and optionally x. Its operations
+        and results are named ``z`` and ``out`` after their name hints.
     """
-    kind = TensorType(shape=(3,))
-    return SemanticGraph(
-        inputs=(Value(name="x", type=kind), Value(name="y", type=kind)),
-        operations=(
-            AddOperation(
-                name="first",
-                inputs=("x", "y"),
-                output=Value(name="z", type=kind),
-                block="block0",
-            ),
-            AddOperation(
-                name="second",
-                inputs=("z", "y"),
-                output=Value(name="out", type=kind),
-                block="block1",
-            ),
-        ),
-        outputs=("out", "x") if fanout else ("out",),
+    x = argument("x", shape)
+    y = argument("y", shape)
+    first = AddOp(operands=(x, y), name_hint="z")
+    second = AddOp(operands=(first.results[0], y), name_hint="out")
+    return Function(
+        name="main",
+        operands=(x, y),
+        operations=(first, second),
+        results=(second.results[0], x) if fanout else second.results,
     )
 
 
@@ -97,7 +99,7 @@ def request(*, fanout: bool = False) -> MappingRequest:
     Returns:
         Single-device mapping request for graph() on the small test target.
     """
-    device = legalize(shard(graph(fanout=fanout), ParallelPlan()), CapabilityProfile())
+    device = legalize(graph(fanout=fanout), CapabilityProfile())
     return MappingRequest(graph=device, target=target())
 
 
@@ -148,12 +150,15 @@ class PipelineTests(unittest.TestCase):
 
     def test_target_tiling_and_manual_mapping_match(self) -> None:
         """A stricter target splits two slots into separate ACC commands."""
-        original = compile_graph(graph(), target())
-        tiled = compile_graph(graph(), target(tile=1))
+        # IR functions compare by identity, and an artifact keeps its source
+        # function, so both compilations must start from the same function.
+        source = graph()
+        original = compile_graph(source, target())
+        tiled = compile_graph(source, target(tile=1))
         self.assertEqual(len(tiled.executable.program.instructions), 4)
         req = request()
         manual = baseline_mapping(req)
-        self.assertEqual(compile_graph(graph(), target(), mapping=manual), original)
+        self.assertEqual(compile_graph(source, target(), mapping=manual), original)
 
     def test_invalid_mapping_is_rejected(self) -> None:
         """Reject plans that overwrite a needed input, omit storage, or run uses first."""
@@ -223,11 +228,9 @@ class MappingBoundaryTests(unittest.TestCase):
     def test_dead_storage_and_self_add(self) -> None:
         """Self-add reads initialized lanes; later values may reuse expired space."""
         original = graph()
-        single = replace(
-            original,
-            operations=(replace(original.operations[0], inputs=("x", "x")),),
-            outputs=("z",),
-        )
+        x = original.operands[0]
+        double = AddOp(operands=(x, x), name_hint="z")
+        single = replace(original, operations=(double,), results=double.results)
         artifact = compile_graph(single, target())
         self.assertEqual(
             artifact.execute(
@@ -239,7 +242,7 @@ class MappingBoundaryTests(unittest.TestCase):
             (CentNamedScalars(name="z", values=(2.0, 4.0, 6.0)),),
         )
         # x is retained; unused y dies at entry and becomes z's destination.
-        retained = replace(single, outputs=("z", "x"))
+        retained = replace(single, results=(double.results[0], x))
         plan = compile_graph(retained, target()).target_ir.mapping
         self.assertEqual(plan.placements[-1].storage, "y")
 
@@ -248,7 +251,7 @@ class MappingBoundaryTests(unittest.TestCase):
         req = request()
         plan = baseline_mapping(req)
         forms = (
-            replace(plan, schedule=("first", "first")),
+            replace(plan, schedule=("z", "z")),
             replace(plan, placements=(*plan.placements, plan.placements[0])),
             replace(
                 plan,
@@ -295,12 +298,17 @@ class MappingBoundaryTests(unittest.TestCase):
             replace(target(), name="")
         with self.assertRaises(ValueError):
             replace(target(), max_accumulate_slots=0)
-        with self.assertRaisesRegex(ValueError, "device zero"):
-            compile_graph(graph(), target(), parallel=ParallelPlan(device_ids=(1,)))
+        # Legalization only produces rank zero on device zero, so a device
+        # graph claiming another device no longer matches its source.
+        device = legalize(graph(), CapabilityProfile())
+        remote = replace(device, ranks=(replace(device.ranks[0], device_id=1),))
+        with self.assertRaisesRegex(ValueError, "legalization"):
+            baseline_mapping(MappingRequest(graph=remote, target=target()))
 
     def test_identity_graph_runs_without_instructions(self) -> None:
         """A graph returning an input needs bindings but no device instructions."""
-        identity = replace(graph(), operations=(), outputs=("x",))
+        original = graph()
+        identity = replace(original, operations=(), results=original.operands[:1])
         artifact = compile_graph(identity, target())
         self.assertEqual(artifact.executable.program.instructions, ())
         values = (
@@ -327,16 +335,7 @@ class MappingBoundaryTests(unittest.TestCase):
 
     def test_copy_tiles_across_scratch_row_and_rebinds(self) -> None:
         """Nine values need five slots, so a four-slot row needs two copy chunks."""
-        kind = TensorType(shape=(9,))
-        template = graph(fanout=True)
-        large = replace(
-            template,
-            inputs=tuple(replace(v, type=kind) for v in template.inputs),
-            operations=tuple(
-                replace(op, output=replace(op.output, type=kind))
-                for op in template.operations
-            ),
-        )
+        large = graph(fanout=True, shape=(9,))
         artifact = compile_graph(large, target(tile=2))
         # Two W/R pairs plus two adds with three ACC tiles apiece.
         self.assertEqual(len(artifact.executable.program.instructions), 10)
@@ -356,12 +355,12 @@ class MappingBoundaryTests(unittest.TestCase):
 
         self.assertEqual(_fresh_storage("x", {"x", "x.0", "x.1"}), "x.2")
         self.assertEqual(_fresh_storage("x", set()), "x")
-        self.assertEqual(
-            _slots(Value(name="a", type=TensorType(shape=())), target()), 1
-        )
-        self.assertEqual(
-            _slots(Value(name="a", type=TensorType(shape=(2, 3))), target()), 3
-        )
+        # A scalar still occupies one slot. Six values with two lanes per
+        # slot fill exactly three slots.
+        scalar = TensorType(shape=(), dtype=DType.FP32)
+        matrix = TensorType(shape=(2, 3), dtype=DType.FP32)
+        self.assertEqual(_slots(NameValue(name="a", type=scalar), target()), 1)
+        self.assertEqual(_slots(NameValue(name="a", type=matrix), target()), 3)
 
 
 class GraphDataflowTests(unittest.TestCase):
@@ -372,31 +371,38 @@ class GraphDataflowTests(unittest.TestCase):
         # A fixed seed makes failures repeatable. The small integer inputs keep
         # every sum exact in reference math, so this checks data flow, not rounding.
         random = Random(17)
-        tensor = TensorType(shape=(5,))
         for case in range(12):
-            inputs = tuple(Value(name=f"input{i}", type=tensor) for i in range(4))
+            inputs = tuple(argument(f"input{i}", (5,)) for i in range(4))
+            # Every value is looked up by its printed name, which for these
+            # unique hints is the hint itself.
+            values = {value.name: value for value in inputs}
             oracle = {
-                v.name: tuple(float(random.randrange(-4, 5)) for _ in range(5))
-                for v in inputs
+                name: tuple(float(random.randrange(-4, 5)) for _ in range(5))
+                for name in values
             }
             bindings = tuple(
-                CentNamedScalars(name=v.name, values=oracle[v.name]) for v in inputs
+                CentNamedScalars(name=name, values=oracle[name]) for name in values
             )
             names = list(oracle)
             operations = []
             for index in range(20):
                 left, right = random.choices(names, k=2)
-                output = Value(name=f"v{index}", type=tensor)
-                operations.append(
-                    AddOperation(name=f"op{index}", inputs=(left, right), output=output)
+                name = f"v{index}"
+                operation = AddOp(
+                    operands=(values[left], values[right]), name_hint=name
                 )
-                oracle[output.name] = tuple(
+                operations.append(operation)
+                values[name] = operation.results[0]
+                oracle[name] = tuple(
                     a + b for a, b in zip(oracle[left], oracle[right], strict=True)
                 )
-                names.append(output.name)
+                names.append(name)
             outputs = tuple(random.sample(names, 4))
-            source = SemanticGraph(
-                inputs=inputs, operations=tuple(operations), outputs=outputs
+            source = Function(
+                name="main",
+                operands=inputs,
+                operations=tuple(operations),
+                results=tuple(values[name] for name in outputs),
             )
             with self.subTest(case=case):
                 artifact = compile_graph(source, target(capacity=80))
@@ -411,11 +417,15 @@ class GraphDataflowTests(unittest.TestCase):
     def test_manual_topological_order_is_obeyed(self) -> None:
         """Independent operations can run in either dependency-valid order."""
         source = graph()
-        second = replace(source.operations[1], inputs=("y", "x"))
+        x, y = source.operands
+        first = source.operations[0]
+        second = AddOp(operands=(y, x), name_hint="out")
         source = replace(
-            source, operations=(source.operations[0], second), outputs=("z", "out")
+            source,
+            operations=(first, second),
+            results=(first.results[0], second.results[0]),
         )
-        device = legalize(shard(source, ParallelPlan()), CapabilityProfile())
+        device = legalize(source, CapabilityProfile())
         req = MappingRequest(graph=device, target=target())
         # Give every tensor its own buffer so this test isolates execution order
         # from storage reuse. Neither addition depends on the other anymore.
@@ -424,11 +434,12 @@ class GraphDataflowTests(unittest.TestCase):
                 ValuePlacement(value=name, storage=name)
                 for name in ("x", "y", "z", "out")
             ),
-            schedule=("second", "first"),
+            # Schedules name each operation by its result.
+            schedule=("out", "z"),
         )
         verify_mapping(req, plan)
         artifact = compile_graph(source, target(), mapping=plan)
-        self.assertEqual(artifact.target_ir.commands[0].operation, "second")
+        self.assertEqual(artifact.target_ir.commands[0].operation, "out")
         self.assertEqual(
             artifact.execute(
                 (

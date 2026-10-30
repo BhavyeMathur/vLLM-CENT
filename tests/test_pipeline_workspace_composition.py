@@ -5,17 +5,20 @@ import unittest
 from dataclasses import replace
 
 from vllm_cent.cent import CentSharedBufferAddress
+from vllm_cent.ir import (
+    AttentionOp,
+    DType,
+    Function,
+    LinearOp,
+    RMSNormOp,
+    TensorType,
+    Value,
+)
 from vllm_cent.pipeline import compile_graph
 from vllm_cent.pipeline.attention_codegen import (
     AttentionCommand,
     _AttentionWorkspace,
     _attention_workspace,
-)
-from vllm_cent.pipeline.ir import SemanticGraph, TensorType, Value
-from vllm_cent.pipeline.operations import (
-    AttentionOperation,
-    LinearOperation,
-    RmsNormOperation,
 )
 from vllm_cent.runtime import CentNamedScalars
 from tests.test_pipeline_gemv_norm import target
@@ -58,33 +61,40 @@ class WorkspaceCompositionTests(unittest.TestCase):
 
     def test_attention_norm_linear_attention_share_only_scratch(self) -> None:
         """Different emitters reuse one region without clobbering preserved graph values."""
-        query_type = TensorType((1, 1, 2, 3))
-        graph = SemanticGraph(
-            inputs=(
-                Value("q", query_type),
-                Value("k", TensorType((1, 1, 3, 3))),
-                Value("v", TensorType((1, 1, 3, 3))),
-                Value("__reference_workspace", TensorType((3,))),
-                Value("w", TensorType((3, 3))),
+        query, key, value, scale, weight = (
+            Value(type=TensorType(shape=shape, dtype=DType.FP32), name=name)
+            for name, shape in (
+                ("q", (1, 1, 2, 3)),
+                ("k", (1, 1, 3, 3)),
+                ("v", (1, 1, 3, 3)),
+                # The learned norm scale takes the name the target would pick
+                # first for its scratch region, so the target must pick another.
+                ("__reference_workspace", (3,)),
+                ("w", (3, 3)),
+            )
+        )
+        first_attention = AttentionOp(operands=(query, key, value), name_hint="a")
+        norm = RMSNormOp(
+            operands=(first_attention.results[0], scale),
+            eps=1e-5,
+            name_hint="n",
+        )
+        linear = LinearOp(operands=(norm.results[0], weight), name_hint="z")
+        last_attention = AttentionOp(
+            operands=(linear.results[0], key, value), name_hint="out"
+        )
+        graph = Function(
+            name="main",
+            operands=(query, key, value, scale, weight),
+            operations=(first_attention, norm, linear, last_attention),
+            results=(
+                first_attention.results[0],
+                norm.results[0],
+                linear.results[0],
+                last_attention.results[0],
+                scale,
+                query,
             ),
-            operations=(
-                AttentionOperation(
-                    name="first", inputs=("q", "k", "v"), output=Value("a", query_type)
-                ),
-                RmsNormOperation(
-                    name="norm",
-                    inputs=("a", "__reference_workspace"),
-                    output=Value("n", query_type),
-                    epsilon=1e-5,
-                ),
-                LinearOperation(
-                    name="linear", inputs=("n", "w"), output=Value("z", query_type)
-                ),
-                AttentionOperation(
-                    name="last", inputs=("z", "k", "v"), output=Value("out", query_type)
-                ),
-            ),
-            outputs=("a", "n", "z", "out", "__reference_workspace", "q"),
         )
         q = (1.0, -2.0, 3.0, 2.0, 1.0, -1.0)
         keys = (1.0, 0.0, -1.0, 2.0, 1.0, 0.0, -1.0, 1.0, 2.0)

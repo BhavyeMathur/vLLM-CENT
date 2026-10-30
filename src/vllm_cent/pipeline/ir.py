@@ -1,31 +1,44 @@
-"""Describe tensor calculations and split them into work for each device.
+"""Choose device operations for an IR function, before any address exists.
 
-The compiler keeps three versions of the graph here: the original calculation,
-one copy for each device's portion of the tensors, and the operations each
-device must support. These are intermediate representations (IRs): structured
-Python objects that later passes turn into instructions.
+The compiler's operations live in ``vllm_cent.ir``: values there are Python
+objects, and a function may have unnamed intermediate results. This module is
+the boundary to the CENT backend. ``legalize()`` gives every value a name (the
+same name the IR printer shows), checks that the backend supports each
+operation, and records the device operation kind and the storage each operand
+needs. Mapping and target lowering then refer to tensors and operations by
+these names.
 
-No stage in this module chooses physical addresses. Operations create new
-named results and do not modify their inputs. Adapters must reject cache
-updates, shared-storage mutation, communication, and control flow because these
-objects cannot describe them yet. Addition, multiplication, copy, and contiguous
-reshape, linear transforms, normalization, activations, softmax, and attention reach
-supported Device IR. Other operation types can supply their
-own shape checks without changing the graph container or its verifier.
+No stage in this module chooses physical addresses. Additions,
+multiplications, copies, order-preserving reshapes, linear transforms, RMS
+normalization, activations, softmax, rotary embedding, and fused attention
+reach the device form. Other IR operations, such as KV-cache updates, the
+decomposed attention steps, and all-reduce, are rejected with
+``NotImplementedError``.
 """
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from enum import Enum
-from .operations.activation import ActivationKind, ActivationOperation, SoftmaxOperation
-from .operations.attention import AttentionOperation
-from .operations.transformer import RmsNormOperation
-from .operations.base import Operation, ScalarType, TensorType, Value
-from .operations.tensor import (
-    AddOperation,
-    CopyOperation,
-    MultiplyOperation,
-    LinearOperation,
-    ReshapeOperation,
+
+from ..activations import ActivationKind
+from ..ir import (
+    ActivationOp,
+    AddOp,
+    AttentionOp,
+    CopyOp,
+    DType,
+    Function,
+    LinearOp,
+    MergeHeadsOp,
+    MulOp,
+    Operation,
+    ReshapeOp,
+    RMSNormOp,
+    RopeOp,
+    SoftmaxOp,
+    SplitHeadsOp,
+    TensorType,
+    Value,
+    value_names,
 )
 
 __all__ = [
@@ -37,327 +50,37 @@ __all__ = [
     "DeviceOperationKind",
     "DeviceRankGraph",
     "DeviceRmsNormOperation",
+    "DeviceRopeOperation",
     "MemorySpace",
-    "Operation",
-    "ParallelPlan",
-    "RankGraph",
-    "ScalarType",
-    "SemanticGraph",
-    "ShardedGraph",
-    "ShardedValue",
-    "TensorType",
-    "Value",
+    "NameValue",
     "legalize",
-    "shard",
     "verify_device",
-    "verify_semantic",
-    "verify_sharded",
 ]
 
-
-@dataclass(frozen=True, slots=True)
-class SemanticGraph:
-    """Describe a tensor calculation without choosing how hardware runs it.
-
-    The graph records named tensors, the calculations that produce new tensors,
-    and the results the caller wants back. It describes the calculation itself;
-    later compiler passes decide how to split it across devices and where to store
-    the data.
-
-    Attributes:
-        inputs: Named tensors the caller must supply, in argument order.
-        operations: Calculations in order. Each operation can read only the graph
-            inputs or results produced earlier in this tuple.
-        outputs: Names of tensors returned to the caller, in result order.
-
-    Examples:
-        For ``z = x + y`` followed by ``out = z + y``, ``inputs`` contains
-        ``x`` and ``y``, ``operations`` contains the two additions in that order,
-        and ``outputs`` can contain ``out``. Listing ``x`` in ``outputs`` too
-        means its original value must remain available.
-    """
-
-    inputs: tuple[Value, ...]
-    operations: tuple[Operation, ...]
-    outputs: tuple[str, ...]
-
-
-def verify_semantic(graph: SemanticGraph) -> None:
-    """Check that every calculation refers to existing, correctly shaped tensors.
-
-    Walk the operations in order, remembering which tensors have been defined.
-    An operation can read an earlier result, but not a future result or an
-    unknown name. Each result must have a new name and the expected shape.
-    This verifies the graph's description; it does not run any tensor arithmetic.
-
-    Args:
-        graph: Input tensors, ordered operations, and requested outputs to check.
-            The graph is not modified.
-
-    Raises:
-        ValueError: If names repeat or are missing, inputs are used before they
-            exist, or a concrete operation rejects its input/output types.
-    """
-    # Only names already in this table may be read. Adding results as we go
-    # makes a forward reference fail at the operation that tries to use it.
-    values: dict[str, TensorType] = {}
-    operation_names: set[str] = set()
-    for value in graph.inputs:
-        _define(values, value)
-    for operation in graph.operations:
-        if not operation.name or operation.name in operation_names:
-            raise ValueError("Operation names must be nonempty and unique")
-        operation_names.add(operation.name)
-        if any(name not in values for name in operation.inputs):
-            raise ValueError(f"Undefined operand in {operation.name}")
-        # The graph owns naming and dependencies. The concrete operation owns
-        # its mathematical rules, so a new operation needs no branch here.
-        operation.verify(tuple(values[name] for name in operation.inputs))
-        _define(values, operation.output)
-    if (
-        not graph.outputs
-        or len(set(graph.outputs)) != len(graph.outputs)
-        or any(name not in values for name in graph.outputs)
-    ):
-        raise ValueError("Graph outputs must name unique defined values")
-
-
-def _define(values: dict[str, TensorType], value: Value) -> None:
-    """Remember a tensor's type after checking that its name is unused.
-
-    Args:
-        values: Lookup table of previously defined tensor names and types.
-            This function adds one entry to it.
-        value: New graph input or operation result to record.
-
-    Raises:
-        ValueError: If the name is empty or already in the table.
-    """
-    if not value.name or value.name in values:
-        raise ValueError("SSA value names must be nonempty and unique")
-    values[value.name] = value.type
+# Machine epsilon of fp32, 2**-23: the distance from 1.0 to the next float.
+# An RMSNorm without an explicit eps uses it, as torch.nn.RMSNorm(eps=None)
+# does for fp32 inputs.
+_FP32_EPSILON = 2.0**-23
 
 
 @dataclass(frozen=True, slots=True)
-class ParallelPlan:
-    """Describe how to split the graph's tensors across logical devices.
+class NameValue:
+    """Give a tensor a name so device operations can refer to it.
 
-    The ``shard()`` pass applies this choice; this object only records it.
-    With one device, tensors stay whole. Physical channels, banks, and addresses
-    are selected later.
-
-    The same equal split applies to every tensor. Multi-device splitting
-    supports equal-shape addition, multiplication, and copy. Reshape needs an
-    ownership transformation that is not implemented. Code generation requires one rank
-    on logical device zero. This is not yet a general plan for model parallelism.
+    IR values are identified by object; device work is identified by name,
+    because schedules and storage plans are written as names. A name is
+    defined only once in a device graph.
 
     Attributes:
-        device_ids: Devices that receive the pieces, in order. A device's
-            position in this tuple is its rank. These IDs do not select physical
-            channels.
-        shard_axis: Tensor dimension to split equally. For a matrix, ``0`` splits
-            rows and ``1`` splits columns. Ignored when there is only one device.
+        name: Tensor name, unique within this graph.
+        type: Tensor dimensions and element format. The actual data arrives later.
 
     Examples:
-        For an eight-element vector, ``device_ids=(0, 1)`` and ``shard_axis=0``
-        assign entries ``[0:4]`` to device 0 and ``[4:8]`` to device 1.
-        With ``device_ids=(3, 7)``, rank 0 uses device 3 and rank 1 uses device 7.
+        For ``z = x + y``, ``x`` and ``y`` name the inputs and ``z`` names a new result.
     """
 
-    device_ids: tuple[int, ...] = (0,)
-    shard_axis: int = 0
-
-    def __post_init__(self) -> None:
-        """Check device IDs and the axis before any graph is supplied.
-
-        Whether the axis exists and divides each tensor evenly is checked later,
-        when ``shard()`` knows the shapes.
-
-        Raises:
-            ValueError: If there are no devices, a device ID repeats or is negative,
-                or the axis is negative.
-        """
-        if not self.device_ids or len(set(self.device_ids)) != len(self.device_ids):
-            raise ValueError("Logical device ids must be nonempty and unique")
-        if self.shard_axis < 0 or any(device < 0 for device in self.device_ids):
-            raise ValueError("Device ids and shard axis must be nonnegative")
-
-
-@dataclass(frozen=True, slots=True)
-class ShardedValue:
-    """Record which part of a full tensor belongs to one device.
-
-    The record connects a local tensor to the full tensor it came from.
-    Its interval includes ``start`` and excludes ``stop``, like a Python slice.
-
-    Attributes:
-        global_value: Name and type of the complete tensor before splitting.
-        local_value: Same tensor name, with the smaller shape used on this device.
-        axis: Dimension that was split. The value ``-1`` marks an unsplit tensor on
-            a single device.
-        start: First coordinate owned along the split dimension; zero if unsplit.
-        stop: First coordinate after the owned part. For an unsplit tensor this
-            instead records its total element count.
-
-    Examples:
-        For the second half of an eight-element vector, ``global_value`` has
-        ``shape=(8,)``, ``local_value`` has ``shape=(4,)``, and the interval is
-        ``start=4``, ``stop=8``.
-    """
-
-    global_value: Value
-    local_value: Value
-    axis: int
-    start: int
-    stop: int
-
-
-@dataclass(frozen=True, slots=True)
-class RankGraph:
-    """Collect the tensor pieces and calculations assigned to one device.
-
-    Attributes:
-        rank: Position of this device in ``ParallelPlan``.device_ids.
-        device_id: Logical device ID at that position.
-        graph: Calculations with input and result shapes changed to this device's
-            portions. Tensor names still match the original graph.
-        values: Records connecting each local tensor to its part of the full
-            tensor. Inputs come first, followed by operation results.
-    """
-
-    rank: int
-    device_id: int
-    graph: SemanticGraph
-    values: tuple[ShardedValue, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class ShardedGraph:
-    """Keep the original calculation together with its per-device versions.
-
-    Retaining the original lets a verifier check that no part was lost or
-    assigned twice when tensors were split.
-
-    Attributes:
-        source: Full graph before splitting.
-        parallel: Caller-supplied rule for splitting the tensors.
-        shards: One graph per device, in the order given by ``parallel.device_ids``.
-    """
-
-    source: SemanticGraph
-    parallel: ParallelPlan
-    shards: tuple[RankGraph, ...]
-
-
-def _partition(value: Value, plan: ParallelPlan, rank: int) -> ShardedValue:
-    """Find one device's piece of a tensor without moving any data.
-
-    Args:
-        value: Name and shape of the complete tensor.
-        plan: Participating device IDs and the dimension to split equally.
-        rank: This device's position in ``plan.device_ids``, supplied by ``shard()``.
-
-    Returns:
-        The original and local tensor types plus the interval this device owns.
-
-    Raises:
-        ValueError: If the selected dimension is absent or its length cannot be
-            divided equally among the devices.
-
-    Examples:
-        With two devices and eight entries, rank 1 gets ``start=4`` and ``stop=8``.
-    """
-    count = len(plan.device_ids)
-    if count == 1:
-        return ShardedValue(value, value, -1, 0, value.type.numel)
-    axis = plan.shard_axis
-    if axis >= len(value.type.shape) or value.type.shape[axis] % count:
-        raise ValueError("Shard axis must exist and divide evenly across devices")
-    # Only the chosen dimension shrinks. For a (4, 6) matrix split along
-    # axis 1 across two devices, both local matrices have shape (4, 3).
-    extent = value.type.shape[axis] // count
-    shape = (*value.type.shape[:axis], extent, *value.type.shape[axis + 1 :])
-    local = replace(value, type=TensorType(shape, value.type.dtype))
-    # Equal consecutive intervals tile the full dimension without gaps:
-    # rank 0 owns [0:extent], rank 1 owns [extent:2*extent], and so on.
-    return ShardedValue(value, local, axis, rank * extent, (rank + 1) * extent)
-
-
-def shard(graph: SemanticGraph, parallel: ParallelPlan) -> ShardedGraph:
-    """Build a version of the calculation for each device's tensor pieces.
-
-    Each device receives operations over its own tensor pieces. Supported
-    addition, multiplication, and copy need no communication because each output
-    element depends only on corresponding input elements. A single-device plan leaves all shapes unchanged.
-
-    Args:
-        graph: Full calculation before splitting, with no physical addresses.
-        parallel: Caller-supplied device IDs and dimension to divide equally.
-
-    Returns:
-        Original graph plus one local graph and tensor-ownership records per device.
-
-    Raises:
-        ValueError: If the graph is invalid or a tensor cannot be split as requested.
-        NotImplementedError: If a multi-device graph contains an operation other
-            than addition, multiplication, or copy. In particular, reshape does
-            not yet define how output coordinates preserve device ownership.
-
-    Examples:
-        For ``z = x + y``, split ``x``, ``y``, and ``z`` in the same way, then
-        give every device an addition over its own pieces.
-    """
-    verify_semantic(graph)
-    if len(parallel.device_ids) > 1 and any(
-        not isinstance(operation, (AddOperation, MultiplyOperation, CopyOperation))
-        for operation in graph.operations
-    ):
-        raise NotImplementedError(
-            "Multi-rank sharding supports only addition, multiplication, and copy"
-        )
-    global_values = (
-        *graph.inputs,
-        *(operation.output for operation in graph.operations),
-    )
-    ranks: list[RankGraph] = []
-    for rank, device_id in enumerate(parallel.device_ids):
-        values = tuple(_partition(value, parallel, rank) for value in global_values)
-        local_values = {value.local_value.name: value.local_value for value in values}
-        # Every operand keeps its name; only its shape changes. Reusing the
-        # original operation order preserves which results feed later work.
-        local = SemanticGraph(
-            tuple(local_values[value.name] for value in graph.inputs),
-            tuple(
-                replace(operation, output=local_values[operation.output.name])
-                for operation in graph.operations
-            ),
-            graph.outputs,
-        )
-        verify_semantic(local)
-        ranks.append(RankGraph(rank, device_id, local, values))
-    return ShardedGraph(graph, parallel, tuple(ranks))
-
-
-def verify_sharded(graph: ShardedGraph) -> None:
-    """Check that device graphs contain exactly the pieces the plan assigns.
-
-    Rebuild the expected split from the original graph and compare every field.
-    This catches missing ranks, incorrect intervals, and local operations that
-    were changed after splitting.
-
-    Args:
-        graph: Original graph, parallel plan, and per-device results to compare.
-
-    Raises:
-        ValueError: If a device, owned interval, tensor shape, or operation differs
-            from the split required by the plan, or the source graph is invalid.
-        NotImplementedError: If the source needs unsupported multi-device operations.
-    """
-    expected = shard(graph.source, graph.parallel)
-    if graph != expected:
-        raise ValueError(
-            "Sharded graph violates rank coverage or local tensor semantics"
-        )
+    name: str
+    type: TensorType
 
 
 class DeviceOperationKind(Enum):
@@ -380,6 +103,8 @@ class DeviceOperationKind(Enum):
         SOFTMAX: Normalize each last-dimension row into probabilities.
         RMS_NORM: Per-row square mean, reciprocal root, and learned scaling.
             Execution requires the reference scalar and broadcast contract.
+        ROPE: Rotate head vectors by angles looked up per token position.
+            Execution requires the reference rotary-embedding service.
     """
 
     PNM_ADD = "pnm_add"
@@ -391,6 +116,7 @@ class DeviceOperationKind(Enum):
     ACTIVATION = "activation"
     SOFTMAX = "softmax"
     ATTENTION = "attention"
+    ROPE = "rope"
 
 
 class MemorySpace(Enum):
@@ -416,11 +142,12 @@ class CapabilityProfile:
         supported_operations: Device operation kinds that the backend can lower.
             An empty set rejects every operation; the default enables addition,
             multiplication, copy, reshape, linear transforms, normalization,
-            nonlinear functions, and supplied-tensor attention. Target mapping separately requires reference
+            nonlinear functions, rotary embedding, and supplied-tensor
+            attention. Target mapping separately requires reference
             opt-in for accumulator, scalar, and nonlinear computations.
 
     Examples:
-        An ``AddOperation`` requires ``DeviceOperationKind.PNM_ADD`` in
+        An ``AddOp`` requires ``DeviceOperationKind.PNM_ADD`` in
         ``supported_operations``.
     """
 
@@ -435,6 +162,7 @@ class CapabilityProfile:
             DeviceOperationKind.ACTIVATION,
             DeviceOperationKind.SOFTMAX,
             DeviceOperationKind.ATTENTION,
+            DeviceOperationKind.ROPE,
         }
     )
 
@@ -448,7 +176,8 @@ class DeviceOperation:
     before this operation can read their results.
 
     Attributes:
-        name: ``Operation`` name carried forward from the semantic graph.
+        name: Name of the source operation's result. One name identifies both
+            the operation (in schedules) and the tensor it produces.
         kind: Device operation selected to implement the calculation.
         inputs: Names of this device's operand tensors, in calculation order.
         output: Name and shape of the tensor produced on this device.
@@ -466,7 +195,7 @@ class DeviceOperation:
     name: str
     kind: DeviceOperationKind
     inputs: tuple[str, ...]
-    output: Value
+    output: NameValue
     dependencies: tuple[str, ...]
     memory_space: MemorySpace = MemorySpace.SHARED_BUFFER
     block: str = ""
@@ -531,6 +260,25 @@ class DeviceRmsNormOperation(DeviceOperation):
     epsilon: float
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class DeviceRopeOperation(DeviceOperation):
+    """Retain how a rotary embedding pairs the rotated elements.
+
+    Attributes:
+        name: Name of the rotated result.
+        kind: ``DeviceOperationKind.ROPE``.
+        inputs: Head vectors, positions, and angle table names, in that order.
+        output: Rotated result name with the unchanged head-vector type.
+        dependencies: Operations producing the inputs.
+        memory_space: Shared Buffer storage at operation boundaries.
+        block: Source model-block label.
+        is_neox_style: True pairs element ``i`` with ``i + rotary_dim // 2``;
+            False pairs ``2i`` with ``2i + 1``.
+    """
+
+    is_neox_style: bool
+
+
 @dataclass(frozen=True, slots=True)
 class DeviceRankGraph:
     """Collect device-supported calculations for one logical device.
@@ -545,7 +293,7 @@ class DeviceRankGraph:
 
     rank: int
     device_id: int
-    inputs: tuple[Value, ...]
+    inputs: tuple[NameValue, ...]
     operations: tuple[DeviceOperation, ...]
     outputs: tuple[str, ...]
 
@@ -558,131 +306,237 @@ class DeviceGraph:
     objects hold these tensors and whether their memory can be reused.
 
     Attributes:
-        source: Per-device semantic graphs and their original parallel plan.
+        source: The IR function this device work was selected for.
         capabilities: Available operations used when choosing device operations.
         ranks: Work for every device, in the same order as the parallel plan.
     """
 
-    source: ShardedGraph
+    source: Function
     capabilities: CapabilityProfile
     ranks: tuple[DeviceRankGraph, ...]
 
 
-def legalize(graph: ShardedGraph, capabilities: CapabilityProfile) -> DeviceGraph:
-    """Turn each requested calculation into an operation the device supports.
+def legalize(function: Function, capabilities: CapabilityProfile) -> DeviceGraph:
+    """Turn each IR operation into an operation the device supports.
 
-    Legalization selects tensor arithmetic, copying, reshaping, normalization,
-    nonlinear functions, and attention when the required capabilities are present.
-    Unsupported calculations are
-    rejected rather than emitted as incomplete commands. No address is chosen.
-    Shared Buffer inputs and outputs are the boundary even for multiplication,
-    whose later target commands stage operands through DRAM banks.
+    First give every value its printed name. Then, for each operation in
+    order, select the device operation kind, check that the target provides
+    it, and record which earlier operations produce its inputs. Unsupported
+    calculations are rejected rather than emitted as incomplete commands. No
+    address is chosen. Shared Buffer inputs and outputs are the boundary even
+    for multiplication, whose later target commands stage operands through
+    DRAM banks.
+
+    The function runs on one device. A tensor-parallel function can be
+    legalized too: its shapes are already one rank's local shapes, and each
+    rank would run the same program on its own pieces.
 
     Args:
-        graph: Per-device graphs produced by splitting the original calculation.
+        function: Verified IR function with static shapes. Its values may carry
+            semantic axes and placements; legalization ignores them.
         capabilities: Device operation kinds available to implement each calculation.
 
     Returns:
         Device operations with their required memory kind and the names of any
-        earlier operations that must produce their inputs.
+        earlier operations that must produce their inputs, for device zero.
 
     Raises:
-        ValueError: If the per-device graphs do not match the original graph and plan.
-        NotImplementedError: If a calculation has no implementation or the target
-            lacks the operation needed to implement it.
+        ValueError: If the function is invalid, an argument's name is missing
+            or repeated, a tensor has a zero-length dimension, or the results
+            are empty or repeat a value.
+        NotImplementedError: If a tensor is not fp32, a calculation has no
+            device implementation, or the target lacks the operation needed to
+            implement it.
     """
-    verify_sharded(graph)
-    ranks: list[DeviceRankGraph] = []
-    for rank in graph.shards:
-        producers: dict[str, str] = {}
-        operations: list[DeviceOperation] = []
-        for operation in rank.graph.operations:
-            if isinstance(operation, AddOperation):
-                kind = DeviceOperationKind.PNM_ADD
-            elif isinstance(operation, MultiplyOperation):
-                kind = DeviceOperationKind.PIM_MULTIPLY
-            elif isinstance(operation, CopyOperation):
-                kind = DeviceOperationKind.COPY
-            elif isinstance(operation, ReshapeOperation):
-                kind = DeviceOperationKind.RESHAPE
-            elif isinstance(operation, LinearOperation):
-                kind = DeviceOperationKind.LINEAR
-            elif isinstance(operation, AttentionOperation):
-                kind = DeviceOperationKind.ATTENTION
-            elif isinstance(operation, ActivationOperation):
-                kind = DeviceOperationKind.ACTIVATION
-            elif isinstance(operation, SoftmaxOperation):
-                kind = DeviceOperationKind.SOFTMAX
-            elif isinstance(operation, RmsNormOperation):
-                kind = DeviceOperationKind.RMS_NORM
-            else:
-                raise NotImplementedError(
-                    f"No device legalization for {type(operation).__name__}"
-                )
-            if kind not in capabilities.supported_operations:
-                raise NotImplementedError(
-                    f"Target capability {kind.name} is unavailable"
-                )
-            # Graph inputs arrive from the caller and have no producer here.
-            # dict.fromkeys removes repeated producers while keeping input order;
-            # z + z needs to wait for z's producer only once.
-            dependencies = tuple(
-                dict.fromkeys(
-                    producers[name] for name in operation.inputs if name in producers
-                )
+    # TODO(multi-device): Target lowering accepts exactly one rank on logical
+    # device zero. Running a tensor-parallel function needs one rank graph per
+    # device plus all-reduce lowering; neither exists yet.
+    #
+    # Names come from the printer's rules, so a device graph uses the same
+    # names as the IR dump of the function it came from.
+    function.verify()
+    names = value_names(function)
+    # Report an unsupported operation before an unsupported tensor type: RoPE's
+    # int64 positions would otherwise hide that RoPE itself has no lowering.
+    kinds = [_device_kind(op, names[op.results[0]]) for op in function.operations]
+    _check_backend_types(function, names)
+    if not function.results or len(set(function.results)) != len(function.results):
+        raise ValueError("Function results must name unique values")
+    # Argument names are the compiled program's input names, which callers
+    # bind values to. The printer would quietly rename a repeated name (x,
+    # x_1) or number a missing one, so require each name to survive as given.
+    for argument in function.operands:
+        if not argument.name or names[argument] != argument.name:
+            raise ValueError(
+                f"Function arguments need unique, non-empty names; "
+                f"{argument.name!r} would become {names[argument]!r}"
             )
-            lowered = DeviceOperation(
-                operation.name,
-                kind,
-                operation.inputs,
-                operation.output,
-                dependencies,
-                block=operation.block,
-            )
-            if isinstance(operation, RmsNormOperation):
-                lowered = DeviceRmsNormOperation(
-                    name=operation.name,
-                    kind=kind,
-                    inputs=operation.inputs,
-                    output=operation.output,
-                    dependencies=dependencies,
-                    block=operation.block,
-                    epsilon=operation.epsilon,
-                )
-            if isinstance(operation, ActivationOperation):
-                lowered = DeviceActivationOperation(
-                    name=operation.name,
-                    kind=kind,
-                    inputs=operation.inputs,
-                    output=operation.output,
-                    dependencies=dependencies,
-                    block=operation.block,
-                    function=operation.function,
-                )
-            if isinstance(operation, AttentionOperation):
-                lowered = DeviceAttentionOperation(
-                    name=operation.name,
-                    kind=kind,
-                    inputs=operation.inputs,
-                    output=operation.output,
-                    dependencies=dependencies,
-                    block=operation.block,
-                    causal=operation.causal,
-                    query_position_offset=operation.query_position_offset,
-                    scale=operation.scale,
-                )
-            operations.append(lowered)
-            producers[operation.output.name] = operation.name
-        ranks.append(
-            DeviceRankGraph(
-                rank.rank,
-                rank.device_id,
-                rank.graph.inputs,
-                tuple(operations),
-                rank.graph.outputs,
-            )
+
+    producers: dict[str, str] = {}
+    operations: list[DeviceOperation] = []
+    for op, kind in zip(function.operations, kinds, strict=True):
+        # Every supported operation produces exactly one result, so the
+        # result's name also names the device operation.
+        name = names[op.results[0]]
+        if kind not in capabilities.supported_operations:
+            raise NotImplementedError(f"Target capability {kind.name} is unavailable")
+        inputs = tuple(names[operand] for operand in op.operands)
+        # Graph inputs arrive from the caller and have no producer here.
+        # dict.fromkeys removes repeated producers while keeping input order;
+        # z + z needs to wait for z's producer only once.
+        dependencies = tuple(
+            dict.fromkeys(producers[input] for input in inputs if input in producers)
         )
-    return DeviceGraph(graph, capabilities, tuple(ranks))
+        operations.append(_device_operation(op, name, kind, inputs, dependencies))
+        producers[name] = name
+    rank = DeviceRankGraph(
+        0,
+        0,
+        tuple(NameValue(names[value], value.type) for value in function.operands),
+        tuple(operations),
+        tuple(names[value] for value in function.results),
+    )
+    return DeviceGraph(function, capabilities, (rank,))
+
+
+def _check_backend_types(function: Function, names: dict[Value, str]) -> None:
+    """Reject tensors the reference backend cannot store or compute with.
+
+    Args:
+        function: Function whose arguments and results are checked.
+        names: Printed name of every value, for the error message.
+
+    Raises:
+        NotImplementedError: If a tensor is not fp32, other than RoPE's
+            integer positions. The functional simulator computes with Python
+            floats; other formats have no lowering yet.
+        ValueError: If a tensor has a zero-length dimension and so no element
+            to store.
+    """
+    values = (
+        *function.operands,
+        *(result for op in function.operations for result in op.results),
+    )
+    # A RoPE position only selects a table row. It is stored as a scalar value,
+    # which holds every integer below 2**24 exactly, so integer dtypes are safe.
+    positions = {op.positions for op in function.operations if isinstance(op, RopeOp)}
+    for value in values:
+        # RopeOp itself requires the positions to be int32 or int64.
+        if value not in positions and value.type.dtype is not DType.FP32:
+            raise NotImplementedError(
+                f"The CENT pipeline supports fp32 tensors only; "
+                f"{names[value]} is {value.type.dtype}"
+            )
+        if any(dim == 0 for dim in value.type.shape):
+            raise ValueError(f"Tensor dimensions must be positive: {names[value]}")
+
+
+def _device_kind(op: Operation, name: str) -> DeviceOperationKind:
+    """Select the device operation kind that implements an IR operation.
+
+    Args:
+        op: The IR operation.
+        name: Its result name, for the error message.
+
+    Returns:
+        The kind whose target lowering computes the same result.
+
+    Raises:
+        NotImplementedError: If no device operation implements ``op``.
+    """
+    if isinstance(op, AddOp):
+        return DeviceOperationKind.PNM_ADD
+    if isinstance(op, MulOp):
+        return DeviceOperationKind.PIM_MULTIPLY
+    if isinstance(op, CopyOp):
+        return DeviceOperationKind.COPY
+    # split_heads and merge_heads only regroup the last dimensions, so they
+    # keep the flattened element order, like any reshape.
+    if isinstance(op, (ReshapeOp, SplitHeadsOp, MergeHeadsOp)):
+        return DeviceOperationKind.RESHAPE
+    if isinstance(op, LinearOp):
+        return DeviceOperationKind.LINEAR
+    if isinstance(op, AttentionOp):
+        return DeviceOperationKind.ATTENTION
+    if isinstance(op, ActivationOp):
+        return DeviceOperationKind.ACTIVATION
+    if isinstance(op, SoftmaxOp):
+        return DeviceOperationKind.SOFTMAX
+    if isinstance(op, RMSNormOp):
+        return DeviceOperationKind.RMS_NORM
+    if isinstance(op, RopeOp):
+        return DeviceOperationKind.ROPE
+    raise NotImplementedError(f"No device legalization for {op.NAME} ({name})")
+
+
+def _device_operation(
+    op: Operation,
+    name: str,
+    kind: DeviceOperationKind,
+    inputs: tuple[str, ...],
+    dependencies: tuple[str, ...],
+) -> DeviceOperation:
+    """Build the device operation for ``op``, with the parameters its kind needs.
+
+    Args:
+        op: The IR operation being legalized.
+        name: Name of its result; it names the device operation too.
+        kind: Device operation kind selected for ``op``.
+        inputs: Names of its operands, in operand order.
+        dependencies: Earlier device operations producing those operands.
+
+    Returns:
+        A plain ``DeviceOperation``, or a subclass that also keeps the
+        normalization constant, activation formula, or attention options
+        that target lowering needs.
+    """
+    output = NameValue(name, op.results[0].type)
+    # The name hint is the module path, e.g. "mlp.gate_proj"; its parent
+    # path, "mlp", labels the model block in diagnostics.
+    block = (op.name_hint or "").rpartition(".")[0]
+    if isinstance(op, RMSNormOp):
+        return DeviceRmsNormOperation(
+            name=name,
+            kind=kind,
+            inputs=inputs,
+            output=output,
+            dependencies=dependencies,
+            block=block,
+            epsilon=_FP32_EPSILON if op.eps is None else op.eps,
+        )
+    if isinstance(op, ActivationOp):
+        return DeviceActivationOperation(
+            name=name,
+            kind=kind,
+            inputs=inputs,
+            output=output,
+            dependencies=dependencies,
+            block=block,
+            function=op.function,
+        )
+    if isinstance(op, RopeOp):
+        return DeviceRopeOperation(
+            name=name,
+            kind=kind,
+            inputs=inputs,
+            output=output,
+            dependencies=dependencies,
+            block=block,
+            is_neox_style=op.is_neox_style,
+        )
+    if isinstance(op, AttentionOp):
+        return DeviceAttentionOperation(
+            name=name,
+            kind=kind,
+            inputs=inputs,
+            output=output,
+            dependencies=dependencies,
+            block=block,
+            causal=op.causal,
+            query_position_offset=op.query_position_offset,
+            scale=op.scale,
+        )
+    return DeviceOperation(name, kind, inputs, output, dependencies, block=block)
 
 
 def verify_device(graph: DeviceGraph) -> None:

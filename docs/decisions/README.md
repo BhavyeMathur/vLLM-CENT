@@ -90,11 +90,13 @@ with an early prototype.
 
 ## Multi-level compilation and mapping ownership
 
-- Each semantic operation is a concrete immutable type that owns its parameters
-  and shape checks. The shared `Operation` base only contains graph connections
-  and a verification method. `verify_semantic` resolves tensor names and delegates
-  mathematical checks; adding a new operation does not extend a central enum or
-  add optional fields to unrelated operations.
+- One IR (`vllm_cent.ir`) serves every frontend. Each operation is a concrete
+  immutable type that owns its parameters and infers its result type. The
+  shared `Operation` base only holds operands, results, and a name hint.
+  Adding a new operation does not extend a central enum or add optional fields
+  to unrelated operations. Values are compared by identity; `legalize()` gives
+  them the IR printer's names at the device boundary, where schedules and
+  storage plans refer to tensors by name.
 - The compilation scope is a shape-specialized decode-step graph with retained
   model-block provenance. Supported operations are listed in
   [project state](../PROJECT_STATE.md); full decode remains a roadmap gate,

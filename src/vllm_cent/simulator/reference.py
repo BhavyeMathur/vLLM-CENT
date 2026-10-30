@@ -31,6 +31,7 @@ from vllm_cent.cent.reference import (
     ReferenceInstruction,
     ReferenceReduceSum,
     ReferenceRmsScale,
+    ReferenceRotaryEmbedding,
     ReferenceStoreSlice,
 )
 from vllm_cent.runtime import (
@@ -127,6 +128,41 @@ def _softmax_row(values: tuple[float, ...]) -> tuple[float, ...]:
     exponentials = tuple(exp(value - maximum) for value in values)
     total = fsum(exponentials)
     return tuple(value / total for value in exponentials)
+
+
+def _rotate_head(
+    head: tuple[float, ...],
+    cos: tuple[float, ...],
+    sin: tuple[float, ...],
+    is_neox_style: bool,
+) -> tuple[float, ...]:
+    """Rotate the leading pairs of one head vector by the given angles.
+
+    Args:
+        head: One head vector; its first ``2 * len(cos)`` scalars are rotated.
+        cos: Cosine of each pair's angle, in pair order.
+        sin: Sine of each pair's angle, in pair order.
+        is_neox_style: True pairs element ``i`` with ``i + len(cos)``; False
+            pairs ``2i`` with ``2i + 1``.
+
+    Returns:
+        The rotated head vector; elements after the rotated prefix are kept.
+
+    Examples:
+        GPT-J pairing of ``(a0, b0, a1, b1)`` with ``cos=(0, 1)`` and
+        ``sin=(1, 0)`` gives ``(-b0, a0, a1, b1)``.
+    """
+    half = len(cos)
+    rotated = list(head)
+    for pair in range(half):
+        # Index of each pair's first and second element in the head vector.
+        first, second = (
+            (pair, pair + half) if is_neox_style else (2 * pair, 2 * pair + 1)
+        )
+        a, b = head[first], head[second]
+        rotated[first] = a * cos[pair] - b * sin[pair]
+        rotated[second] = b * cos[pair] + a * sin[pair]
+    return tuple(rotated)
 
 
 @dataclass(slots=True)
@@ -383,6 +419,55 @@ def _prepare_nonlinear(
     )
 
 
+def _prepare_rotary_embedding(
+    instruction: ReferenceRotaryEmbedding, context: _ReferenceContext
+) -> _InstructionEffects:
+    """Rotate every head vector by the table angles of its token's position.
+
+    Args:
+        instruction: Head vectors, positions, angle table, and pairing style.
+        context: Input snapshots and conversion policy for final results.
+
+    Returns:
+        One complete output write, created only after every input is read.
+
+    Raises:
+        ValueError: If a position is not an integer row of the table, or
+            result conversion is invalid.
+    """
+    width = instruction.head_dim
+    vectors_per_token = instruction.head_count * width
+    source = context.read(
+        instruction.source, instruction.token_count * vectors_per_token
+    )
+    positions = context.read(instruction.positions, instruction.token_count)
+    table = context.read(
+        instruction.table, instruction.position_count * instruction.rotary_dim
+    )
+    half = instruction.rotary_dim // 2
+    result: list[float] = []
+    for token, position in enumerate(positions):
+        # Positions arrive as stored scalars. Only an exact integer names a row.
+        if not position.is_integer() or not 0 <= position < instruction.position_count:
+            raise ValueError(
+                "rotary position must be an integer row of the angle table"
+            )
+        row = int(position) * instruction.rotary_dim
+        cos, sin = table[row : row + half], table[row + half : row + 2 * half]
+        # Every head of this token rotates by the same angles.
+        for head in range(instruction.head_count):
+            start = token * vectors_per_token + head * width
+            result.extend(
+                _rotate_head(
+                    source[start : start + width], cos, sin, instruction.is_neox_style
+                )
+            )
+    return context.finish(
+        instruction.destination,
+        tuple(context.state.numeric.store(value) for value in result),
+    )
+
+
 def _prepare_reduction(
     instruction: ReferenceReduceSum | ReferenceRmsScale, context: _ReferenceContext
 ) -> _InstructionEffects:
@@ -466,6 +551,9 @@ def _prepare_reference(
         if isinstance(instruction, (ReferenceReduceSum, ReferenceRmsScale)):
             location = instruction.destination
             return _prepare_reduction(instruction, context)
+        if isinstance(instruction, ReferenceRotaryEmbedding):
+            location = instruction.destination
+            return _prepare_rotary_embedding(instruction, context)
         raise TypeError("unsupported reference instruction")
     except ValueError as error:
         raise _KernelArithmeticError(str(error), location=location) from error

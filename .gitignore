@@ -1,4 +1,7 @@
 __pycache__/
+.vscode/
+.ruff_cache/
+.mypy_cache/
 *.py[cod]
 .venv/
 build/
@@ -8,4 +11,5 @@ dist/
 coverage.xml
 htmlcov/
 presentations
+docs/impl_plan
 .venv-mlir/

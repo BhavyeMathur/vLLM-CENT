@@ -12,14 +12,17 @@ from vllm_cent.cent import (
     ReadSingleBank,
     WriteSingleBank,
 )
-from vllm_cent.pipeline import CentTargetProfile, ValuePlacement, compile_graph
-from vllm_cent.pipeline.ir import SemanticGraph, TensorType, Value
-from vllm_cent.pipeline.operations import (
-    AddOperation,
-    CopyOperation,
-    MultiplyOperation,
-    ReshapeOperation,
+from vllm_cent.ir import (
+    AddOp,
+    CopyOp,
+    DType,
+    Function,
+    MulOp,
+    ReshapeOp,
+    TensorType,
+    Value,
 )
+from vllm_cent.pipeline import CentTargetProfile, ValuePlacement, compile_graph
 from vllm_cent.pipeline.target import TargetCommandKind, _emit_multiply_chunk
 from vllm_cent.runtime import CentNamedScalars
 from vllm_cent.simulator import execute_functionally
@@ -50,7 +53,20 @@ def target(*, banks: int = 8) -> CentTargetProfile:
     )
 
 
-def multiply_graph(*, square: bool = False, preserve: bool = False) -> SemanticGraph:
+def _fp32(name: str, *shape: int) -> Value:
+    """Create a named fp32 function argument.
+
+    Args:
+        name: Argument name, which also names the compiled program input.
+        *shape: Tensor dimensions, outermost first; none gives a scalar.
+
+    Returns:
+        New argument value with the requested shape and fp32 elements.
+    """
+    return Value(type=TensorType(shape=shape, dtype=DType.FP32), name=name)
+
+
+def multiply_graph(*, square: bool = False, preserve: bool = False) -> Function:
     """Create a five-value multiply crossing the scratch-row boundary.
 
     Args:
@@ -58,19 +74,17 @@ def multiply_graph(*, square: bool = False, preserve: bool = False) -> SemanticG
         preserve: Return the left input as well, requiring a preservation copy.
 
     Returns:
-        Graph whose padded six lanes occupy three slots and two scratch chunks.
+        Function whose padded six lanes occupy three slots and two scratch
+        chunks. The product is named ``z``.
     """
-    kind = TensorType(shape=(5,))
-    return SemanticGraph(
-        inputs=(Value("x", kind),) if square else (Value("x", kind), Value("y", kind)),
-        operations=(
-            MultiplyOperation(
-                name="multiply",
-                inputs=("x", "x" if square else "y"),
-                output=Value("z", kind),
-            ),
-        ),
-        outputs=("z", "x") if preserve else ("z",),
+    x = _fp32("x", 5)
+    inputs = (x,) if square else (x, _fp32("y", 5))
+    multiply = MulOp(operands=(x, inputs[-1]), name_hint="z")
+    return Function(
+        name="main",
+        operands=inputs,
+        operations=(multiply,),
+        results=(multiply.results[0], x) if preserve else multiply.results,
     )
 
 
@@ -158,22 +172,21 @@ class TensorBackendTests(unittest.TestCase):
 
     def test_unary_chain_can_reuse_storage_without_instructions(self) -> None:
         """Copy and reshape record new tensors without changing flat values."""
-        vector = TensorType(shape=(6,))
-        matrix = TensorType(shape=(2, 3))
-        graph = SemanticGraph(
-            inputs=(Value("x", vector),),
-            operations=(
-                CopyOperation(name="copy", inputs=("x",), output=Value("c", vector)),
-                ReshapeOperation(
-                    name="reshape", inputs=("c",), output=Value("r", matrix)
-                ),
-            ),
-            outputs=("r",),
+        x = _fp32("x", 6)
+        copy = CopyOp(operands=(x,), name_hint="c")
+        reshape = ReshapeOp(operands=copy.results, shape=(2, 3), name_hint="r")
+        graph = Function(
+            name="main",
+            operands=(x,),
+            operations=(copy, reshape),
+            results=reshape.results,
         )
         artifact = compile_graph(graph, target())
         self.assertEqual(artifact.target_ir.commands, ())
         self.assertEqual(artifact.executable.program.instructions, ())
-        self.assertEqual(artifact.outputs[0].type, matrix)
+        self.assertEqual(
+            artifact.outputs[0].type, TensorType(shape=(2, 3), dtype=DType.FP32)
+        )
         self.assertEqual(
             artifact.execute(
                 (CentNamedScalars(name="x", values=(1.0, 2.0, 3.0, 4.0, 5.0, 6.0)),)
@@ -183,16 +196,13 @@ class TensorBackendTests(unittest.TestCase):
 
     def test_reshape_preserves_a_requested_input_with_a_real_copy(self) -> None:
         """Changing shape cannot permit overwriting a still-requested input."""
-        vector = TensorType(shape=(6,))
-        matrix = TensorType(shape=(3, 2))
-        graph = SemanticGraph(
-            inputs=(Value("x", vector),),
-            operations=(
-                ReshapeOperation(
-                    name="reshape", inputs=("x",), output=Value("r", matrix)
-                ),
-            ),
-            outputs=("r", "x"),
+        x = _fp32("x", 6)
+        reshape = ReshapeOp(operands=(x,), shape=(3, 2), name_hint="r")
+        graph = Function(
+            name="main",
+            operands=(x,),
+            operations=(reshape,),
+            results=(reshape.results[0], x),
         )
         artifact = compile_graph(graph, target())
         self.assertEqual(
@@ -212,21 +222,17 @@ class TensorBackendTests(unittest.TestCase):
 
     def test_copy_reshape_multiply_add_chain_preserves_original_output(self) -> None:
         """Preserve an input, reshape its copy, square it, and add a second matrix."""
-        vector = TensorType(shape=(6,))
-        matrix = TensorType(shape=(2, 3))
-        graph = SemanticGraph(
-            inputs=(Value("x", vector), Value("y", matrix)),
-            operations=(
-                CopyOperation(name="copy", inputs=("x",), output=Value("c", vector)),
-                ReshapeOperation(
-                    name="reshape", inputs=("c",), output=Value("r", matrix)
-                ),
-                MultiplyOperation(
-                    name="square", inputs=("r", "r"), output=Value("s", matrix)
-                ),
-                AddOperation(name="add", inputs=("s", "y"), output=Value("z", matrix)),
-            ),
-            outputs=("z", "x"),
+        x = _fp32("x", 6)
+        y = _fp32("y", 2, 3)
+        copy = CopyOp(operands=(x,), name_hint="c")
+        reshape = ReshapeOp(operands=copy.results, shape=(2, 3), name_hint="r")
+        square = MulOp(operands=reshape.results * 2, name_hint="s")
+        add = AddOp(operands=(square.results[0], y), name_hint="z")
+        graph = Function(
+            name="main",
+            operands=(x, y),
+            operations=(copy, reshape, square, add),
+            results=(add.results[0], x),
         )
         artifact = compile_graph(graph, target(banks=4))
         self.assertEqual(

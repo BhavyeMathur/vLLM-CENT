@@ -15,12 +15,11 @@ may inspect data dependencies and storage lifetimes across blocks. Request
 scheduling, sampling, and admission control remain with vLLM.
 
 ```text
-Model frontend                          Native MLIR func/arith frontend
-      |                                          |
-      +------------ SemanticGraph <--------------+
-                           | caller ParallelPlan
-                     ShardedGraph
-                           | CapabilityProfile
+PyTorch model (torch.export importer)   Native MLIR func/arith frontend
+      |              hand-built builders         |
+      +------------- vllm_cent.ir Function <-----+
+                           | optional ApplyTensorParallel (one rank's program)
+                           | legalize + CapabilityProfile (names every value)
                        DeviceGraph
                            | MappingRequest + physical CentTargetProfile
                 manual MappingPlan / MappingProvider
@@ -41,9 +40,8 @@ or native semantic frontend.
 
 | Stage | Allowed information | Verifier obligations |
 | --- | --- | --- |
-| Semantic | SSA names, static shapes, F32 type, mathematical operation, block provenance | Unique definitions, dominance, arity, dtype/shape agreement, unique observable results, explicit RMSNorm epsilon |
-| Sharded semantic | Caller-selected logical rank IDs and partition axis, global/local types, ownership intervals | Exact coverage, equal uniform shards, preserved operation semantics, no physical addresses |
-| Device | PNM_ADD, PIM_MULTIPLY, COPY, RESHAPE, Shared Buffer boundary, dependencies and logical rank | Capability support, preserved lineage, legal component operation and dependency graph |
+| Semantic (`vllm_cent.ir`) | SSA values compared by identity, static shapes, dtype, optional semantic axes and tensor-parallel placements, mathematical operation, name hints (module paths) | Definition before use, arity, and per-operation inference of shape, dtype, axes, and placement; invalid operations cannot be constructed |
+| Device | Names from the IR printer, fp32 types, PNM_ADD, PIM_MULTIPLY, COPY, RESHAPE, LINEAR, RMS_NORM, ACTIVATION, SOFTMAX, ATTENTION, Shared Buffer boundary, dependencies | Capability support, non-empty fp32 tensors, unique results, preserved lineage, legal component operation and dependency graph |
 | Mapping | Physical target, operation schedule, symbolic storage assignments and exact optional constraints | Complete placements, topological order, capacity, equal alias sizes, last-use safety, no input-entry aliases |
 | Target | Symbolic COPY, ACCUMULATE, and MULTIPLY, storage IDs, slot counts, provenance | Commands must implement the validated mapping; missing preservation transfers are rejected |
 | Allocation/codegen | Concrete Shared Buffer slots, private scratch DRAM location, command tiling | Disjoint object intervals, target bounds, row-limited transfers, existing instruction verification |
@@ -59,17 +57,26 @@ fast-math assumptions, dynamic types, and non-F32 types.
 
 ## Operation types
 
-`Operation` contains only the graph connections shared by calculations: name,
-input names, output, and source-block label. It is abstract; each concrete type
-implements its own shape check. `AddOperation`, `MultiplyOperation`, `CopyOperation`, `ReshapeOperation`, and
-`LinearOperation` live in
-`pipeline/operations/tensor.py`. `RmsNormOperation` lives in
-`pipeline/operations/transformer.py` and alone requires an `epsilon` value.
+`vllm_cent.ir.Operation` holds only what every calculation shares: its operand
+values, its inferred results, and an optional name hint such as the module path
+`mlp.gate_proj`. Each concrete type owns its parameters and infers its result
+type, so an invalid operation cannot be constructed. Operations live in the
+`ir/semantic/` package, grouped by the rule that infers their result type:
+`tensor` (`CopyOp`, `ReshapeOp`), `elementwise` (`ActivationOp`, `AddOp`,
+`MulOp`), `linalg` (`LinearOp`), `normalization` (`RMSNormOp`, `SoftmaxOp`), and
+`collective` (`AllReduceOp`). Transformer operations live in
+`ir/semantic/transformer/`: `heads` (`SplitHeadsOp`, `MergeHeadsOp`), `rope`
+(`RopeOp`), `kv_cache` (`KvUpdateOp`), and `attention` (`GqaQKOp`, `GqaSVOp`, and
+the fused `AttentionOp`). Only `RMSNormOp` has `eps`.
 
-The graph verifier checks names and dependencies, resolves input types, then
-calls the operation's verifier. It has no RMSNorm branch or optional epsilon
-field to police. Target legalization remains a separate decision: a valid new
-semantic operation is rejected until the backend has an implementation for it.
+`Function.verify()` checks that every operand is defined before use. Target
+legalization remains a separate decision: `legalize()` maps each operation to a
+device kind and rejects an operation that has no device lowering yet, such as
+KV-cache update, the decomposed GQA steps, or all-reduce. RoPE lowers to the
+`ReferenceRotaryEmbedding` service. Before legalization, `compile_graph()` runs
+`fuse_attention()`, an adaptor that rewrites `gqa_qk → softmax → gqa_sv` into
+`AttentionOp` when reshapes can convert the layouts and no tensor is split
+across ranks; it is to be replaced by lowering the decomposed steps directly.
 
 ## Capability and physical target separation
 
@@ -91,22 +98,23 @@ with unsupported PIM behavior.
 
 ## Parallel-plan boundary
 
-`ParallelPlan` supports identity or uniform addition/multiplication/copy partitioning along
-one logical tensor axis. Every rank retains full global and local shapes plus
-its exact ownership interval. These pointwise operations need no collective. Scalar identity
-sharding is legal; nontrivial scalar partitioning is not.
+Tensor parallelism is chosen before legalization. `vllm_cent.parallel.ParallelPlan`
+names the semantic axes to split, and `ApplyTensorParallel` rewrites the function
+into one SPMD program: local shapes, `global_shape`, and Replicate/Shard/Partial
+placements, with an all-reduce after each operation that produces partial sums.
+Reshape requires whole tensors because reshaping can change which flat elements
+belong to a rank.
 
-The API does not pretend that this implements full pipeline/tensor/sequence
-parallelism. Multi-rank reshape is rejected because reshaping can change which
-flat elements belong to a rank; no ownership transformation is implemented. CENT artifact
-emission currently requires one rank on logical device zero. Full PP/TP/SP
-needs logical collective/transfer operations and topology-aware execution;
-CXL routing and runtime receive matching are unresolved.
+`legalize()` lowers one rank's local program; placements do not change device
+operations. CENT artifact emission currently requires one rank on logical device
+zero, and all-reduce has no device lowering. Full PP/TP/SP needs logical
+collective/transfer operations and topology-aware execution; CXL routing and
+runtime receive matching are unresolved.
 
 ## Shared manual and provider mapping boundary
 
 `MappingRequest(graph, target, constraints)` contains Device IR (which retains
-the caller's parallel plan), physical target, and optional exact value-to-object
+its source IR function), physical target, and optional exact value-to-object
 constraints. A `MappingProvider` returns a `MappingPlan`. A complete manual plan
 bypasses the provider but passes through exactly the same verifier.
 
@@ -217,7 +225,7 @@ reference_target = replace(target, execution_contract=ExecutionContract.REFERENC
 artifact = compile_graph(graph, reference_target)
 ```
 
-Here `graph` is the SemanticGraph described above and `target` supplies the
+Here `graph` is an IR function as described above and `target` supplies the
 hardware geometry. Linear keeps the meaning `x @ weight.T`;
 leading dimensions become independent GEMVs, not an optimized GEMM kernel.
 RMSNorm normalizes each last-dimension row and uses its own positive epsilon.
@@ -289,8 +297,9 @@ vector. The normalized input must survive both branches, and `x` must survive
 until the residual addition. This composition exercises those lifetimes and
 supports both generated and caller-written mappings. Supplied-tensor attention
 is available separately, as described below. Combining both into a complete
-transformer block still requires model-specific projections, RoPE, head
-reordering, output projection, and persistent KV updates.
+transformer block still requires model-specific projections, head
+reordering, output projection, and persistent KV updates; RoPE is available as
+a reference service.
 
 ## Attention over supplied query, key, and value tensors
 
@@ -369,7 +378,7 @@ contract, separate from recompiling the graph per request.
 | Interface/verifier design | Executable arithmetic, shape operations, and reference nonlinear operations implemented | Stateful effects, general PP/TP/SP, transfer/topology/fusion contracts |
 | MLIR proof | Native semantic bridge through typed Python stages to numerical CENT execution | Registered out-of-tree CENT dialects and native conversion passes |
 | Numerical growth | Feed-forward and supplied-tensor attention validated numerically | Projected/rotated attention, complete block, full decode; physical ABI export |
-| Frontends/targets | Native MLIR and direct SemanticGraph; two physical profiles tested | Remaining Llama semantic migration; maintained torch.export-to-MLIR subgraph path; second target backend |
+| Frontends/targets | PyTorch `torch.export` importer, native MLIR, and hand-built IR functions share one IR; two physical profiles tested | Device lowering for KV update and the decomposed attention steps; physical RoPE; multi-device execution; second target backend |
 | Serving/performance | Interfaces leave scheduler ownership with vLLM | GPU-prefill/CENT-decode worker, KV lifecycle, logits parity, external mapper integration |
 
 Do not remove the direct Llama compiler until the replacement has equivalent

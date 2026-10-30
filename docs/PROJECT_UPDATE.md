@@ -24,34 +24,34 @@ also pass.
 
 ## 1. Input: a graph of tensor calculations
 
-The main input is a `SemanticGraph`: named tensors with static shapes, an ordered
-list of operations, and requested outputs. Actual tensor values arrive later.
-For example, this computes `z = x + y`, then `out = z + y`:
+The main input is a `vllm_cent.ir` function: arguments with static shapes, an
+ordered list of operations, and the results to return. Actual tensor values
+arrive later. The PyTorch importer, the MLIR bridge, and hand-written builders
+all produce this form. For example, this computes `z = x + y`, then
+`out = z + y`:
 
 ```python
-from vllm_cent.pipeline.ir import SemanticGraph, TensorType, Value
-from vllm_cent.pipeline.operations import AddOperation
+from vllm_cent.ir import AddOp, DType, Function, TensorType, Value
 
-vector = TensorType((3,))  # Three elements; the current semantic dtype is F32.
-graph = SemanticGraph(
-    inputs=(Value("x", vector), Value("y", vector)),
-    operations=(
-        AddOperation(name="add0", inputs=("x", "y"), output=Value("z", vector)),
-        AddOperation(name="add1", inputs=("z", "y"), output=Value("out", vector)),
-    ),
-    outputs=("out",),
+vector = TensorType(shape=(3,), dtype=DType.FP32)  # The CENT pipeline runs fp32.
+x, y = Value(type=vector, name="x"), Value(type=vector, name="y")
+z = AddOp(operands=(x, y), name_hint="z")
+out = AddOp(operands=(z.results[0], y), name_hint="out")
+graph = Function(
+    name="main", operands=(x, y), operations=(z, out), results=out.results
 )
 ```
 
-Each operation has a name, input names, one output, and an optional model-block
-label. Specialized parameters belong to their operation: RMSNorm owns `epsilon`,
-while attention owns its scale and masking choices. The graph contains no
+Each operation reads value objects and infers its result type; an optional name
+hint names the result (the PyTorch importer uses module paths such as
+`mlp.gate_proj`). Specialized parameters belong to their operation: RMSNorm owns
+`eps`, while attention owns its scale and masking choices. The graph contains no
 hardware addresses.
 
 The compilation entry point is:
 
 ```text
-compile_graph(graph, target, *, parallel=None, capabilities=None,
+compile_graph(graph, target, *, capabilities=None,
               mapping=None, mapper=baseline_mapping, constraints=())
     -> CompiledArtifact
 ```
@@ -71,7 +71,7 @@ An intermediate representation (IR) records the calculation at one level of
 detail. Each pass introduces the information needed by the next stage:
 
 ```text
-SemanticGraph → ShardedGraph → DeviceGraph
+IR Function → DeviceGraph
     → MappingPlan → TargetProgram → allocated CENT instructions
 ```
 
@@ -82,10 +82,9 @@ they are not a separate IR syntax.
 
 | Stage | What it records | Example |
 | --- | --- | --- |
-| **Semantic** | Tensor shapes and mathematical operations | `add0: (x, y) → z`; `add1: (z, y) → out`; all shapes `(3,)` |
-| **Sharded** | A local graph per logical device, plus global/local shapes and owned intervals | Device 0 owns all three elements of each tensor: `axis=-1, start=0, stop=3` |
-| **Device** | Supported operation kinds, storage space, and dependencies | Both operations become `PNM_ADD` in `SHARED_BUFFER`; `add1.dependencies=("add0",)` |
-| **Mapping** | Operation schedule, named storage objects, and required accumulator registers | Schedule `("add0", "add1")`; `x`, `z`, and `out` share storage `"x"`; `y` uses `"y"` |
+| **Semantic** | Tensor shapes and mathematical operations | `z = aloi.add(x, y)`; `out = aloi.add(z, y)`; all shapes `(3,)` |
+| **Device** | Value names, supported operation kinds, storage space, and dependencies; an operation is named after its result | Both operations become `PNM_ADD` in `SHARED_BUFFER`; `out.dependencies=("z",)` |
+| **Mapping** | Operation schedule, named storage objects, and required accumulator registers | Schedule `("z", "out")`; `x`, `z`, and `out` share storage `"x"`; `y` uses `"y"` |
 | **Target** | Implementation commands, transfer sizes, and temporary-space requirements | Two `ACCUMULATE` commands: source `"y"`, destination `"x"`, `slot_count=2` |
 | **Allocation** | Concrete addresses for named storage | `"x"` occupies slots 0–1; `"y"` occupies slots 2–3 |
 
@@ -99,7 +98,7 @@ The actual Target IR record for the first addition is:
 ```text
 TargetCommand(
     kind=TargetCommandKind.ACCUMULATE,
-    source="y", destination="x", slot_count=2, operation="add0",
+    source="y", destination="x", slot_count=2, operation="z",
 )
 ```
 
@@ -111,9 +110,9 @@ with scaling, masking, and softmax between them.
 
 The compiler checks shapes, dependencies, target support, memory capacity, and
 safe reuse at the relevant boundaries. The default mapper reuses available
-storage deterministically; it is not an optimizing search algorithm. Multi-device
-partitioning can be verified for addition, multiplication, and copy, but execution
-currently supports only logical device zero.
+storage deterministically; it is not an optimizing search algorithm. Tensor
+parallelism is applied to the IR before legalization; execution currently
+supports only logical device zero and has no all-reduce lowering.
 
 ## 3. Final output: a reusable program and its input/output locations
 

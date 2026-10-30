@@ -14,7 +14,13 @@ from enum import Enum
 from typing import Protocol
 
 from ..cent import CentHardwareSpec
-from .ir import DeviceGraph, DeviceOperationKind, DeviceRankGraph, Value, verify_device
+from .ir import (
+    DeviceGraph,
+    DeviceOperationKind,
+    DeviceRankGraph,
+    NameValue,
+    verify_device,
+)
 
 __all__ = [
     "AccumulatorPlacement",
@@ -202,7 +208,7 @@ def _rank(request: MappingRequest) -> DeviceRankGraph:
     return rank
 
 
-def _values(rank: DeviceRankGraph) -> tuple[Value, ...]:
+def _values(rank: DeviceRankGraph) -> tuple[NameValue, ...]:
     """List every tensor that needs a storage assignment.
 
     Args:
@@ -214,7 +220,7 @@ def _values(rank: DeviceRankGraph) -> tuple[Value, ...]:
     return rank.inputs + tuple(op.output for op in rank.operations)
 
 
-def _slots(value: Value, target: CentTargetProfile) -> int:
+def _slots(value: NameValue, target: CentTargetProfile) -> int:
     """Round a tensor's element count up to complete Shared Buffer slots.
 
     The runtime must fill unused lanes with zeros before an instruction reads them.
@@ -297,6 +303,7 @@ def verify_mapping(request: MappingRequest, plan: MappingPlan) -> None:
         DeviceOperationKind.ACTIVATION,
         DeviceOperationKind.SOFTMAX,
         DeviceOperationKind.ATTENTION,
+        DeviceOperationKind.ROPE,
     )
     if (
         any(op.kind in reference_kinds for op in rank.operations)

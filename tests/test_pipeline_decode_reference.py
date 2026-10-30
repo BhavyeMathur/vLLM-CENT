@@ -5,6 +5,17 @@ import unittest
 from random import Random
 
 from vllm_cent.cent import CentHardwareSpec
+from vllm_cent.ir import (
+    AddOp,
+    DType,
+    Function,
+    LinearOp,
+    MulOp,
+    RMSNormOp,
+    TensorType,
+    Value,
+    value_names,
+)
 from vllm_cent.pipeline import (
     AccumulatorPlacement,
     CentTargetProfile,
@@ -12,13 +23,6 @@ from vllm_cent.pipeline import (
     MappingPlan,
     ValuePlacement,
     compile_graph,
-)
-from vllm_cent.pipeline.ir import SemanticGraph, TensorType, Value
-from vllm_cent.pipeline.operations import (
-    AddOperation,
-    LinearOperation,
-    MultiplyOperation,
-    RmsNormOperation,
 )
 from vllm_cent.runtime import CentNamedScalars
 from vllm_cent.simulator import execute_functionally
@@ -52,7 +56,20 @@ def _target(burst: int, banks: int) -> CentTargetProfile:
     )
 
 
-def _graph(rows: int, width: int, outputs: int) -> SemanticGraph:
+def _fp32(name: str, *shape: int) -> Value:
+    """Create a named fp32 function argument, the only format the pipeline runs.
+
+    Args:
+        name: Argument name; the compiled program's input of the same name.
+        shape: Tensor dimensions, outermost first.
+
+    Returns:
+        A new graph input value with the requested shape.
+    """
+    return Value(type=TensorType(shape=shape, dtype=DType.FP32), name=name)
+
+
+def _graph(rows: int, width: int, outputs: int) -> Function:
     """Describe normalization, projection, a residual addition, and squaring.
 
     Args:
@@ -62,61 +79,49 @@ def _graph(rows: int, width: int, outputs: int) -> SemanticGraph:
 
     Returns:
         Graph returning its input and normalization intermediate as well as the
-        final result, so later destructive arithmetic must preserve them.
+        final result, so later destructive arithmetic must preserve them. The
+        operation results are named ``normalized``, ``projection``, ``sum``,
+        and ``result``.
     """
-    source = TensorType((rows, width))
-    projected = TensorType((rows, outputs))
-    return SemanticGraph(
-        inputs=(
-            Value("x", source),
-            Value("scale", TensorType((width,))),
-            Value("weights", TensorType((outputs, width))),
-            Value("residual", projected),
-        ),
-        operations=(
-            RmsNormOperation(
-                name="normalize",
-                inputs=("x", "scale"),
-                output=Value("normalized", source),
-                epsilon=0.125,
-            ),
-            LinearOperation(
-                name="project",
-                inputs=("normalized", "weights"),
-                output=Value("projection", projected),
-            ),
-            AddOperation(
-                name="add",
-                inputs=("projection", "residual"),
-                output=Value("sum", projected),
-            ),
-            MultiplyOperation(
-                name="square",
-                inputs=("sum", "sum"),
-                output=Value("result", projected),
-            ),
-        ),
-        outputs=("result", "x", "normalized"),
+    x = _fp32("x", rows, width)
+    scale = _fp32("scale", width)
+    weights = _fp32("weights", outputs, width)
+    residual = _fp32("residual", rows, outputs)
+    normalize = RMSNormOp(operands=(x, scale), eps=0.125, name_hint="normalized")
+    (normalized,) = normalize.results
+    project = LinearOp(operands=(normalized, weights), name_hint="projection")
+    add = AddOp(operands=(*project.results, residual), name_hint="sum")
+    (total,) = add.results
+    square = MulOp(operands=(total, total), name_hint="result")
+    return Function(
+        name="main",
+        operands=(x, scale, weights, residual),
+        operations=(normalize, project, add, square),
+        results=(*square.results, x, normalized),
     )
 
 
-def _manual(graph: SemanticGraph) -> MappingPlan:
+def _manual(graph: Function) -> MappingPlan:
     """Place each tensor separately and explicitly use the second accumulator.
 
+    Device operations are named after their results, so the schedule lists
+    result names and the projection's accumulator is chosen as ``projection``.
+
     Args:
-        graph: Graph with a projection named ``project``.
+        graph: Graph whose projection result is named ``projection``.
 
     Returns:
         Caller-written plan using register one, independent of baseline choices.
     """
-    values = (*graph.inputs, *(op.output for op in graph.operations))
+    names = value_names(graph)
+    results = tuple(names[op.results[0]] for op in graph.operations)
     return MappingPlan(
         placements=tuple(
-            ValuePlacement(value=value.name, storage=f"buffer_{value.name}")
-            for value in values
+            ValuePlacement(value=name, storage=f"buffer_{name}")
+            for name in names.values()
         ),
-        schedule=tuple(op.name for op in graph.operations),
-        accumulators=(AccumulatorPlacement(operation="project", register=1),),
+        schedule=results,
+        accumulators=(AccumulatorPlacement(operation="projection", register=1),),
     )
 
 
@@ -150,7 +155,7 @@ class DecodeReferenceTests(unittest.TestCase):
                                     random.randrange(-8, 9) / 4
                                     for _ in range(value.type.numel)
                                 )
-                                for value in graph.inputs
+                                for value in graph.operands
                             }
                             if run:
                                 host["x"] = (0.0,) * width + host["x"][width:]
