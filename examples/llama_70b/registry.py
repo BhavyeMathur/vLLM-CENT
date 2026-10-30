@@ -17,10 +17,12 @@ __all__: list[str] = []
 register_model(
     "llama",
     parse_config=LlamaConfig.from_hf,
-    build_model=build_meta_decoder_layer,
+    # Every Llama 2/3 decoder layer has the same structure, so the layer
+    # index does not change the model or its annotations.
+    build_model=lambda config, layer: build_meta_decoder_layer(config),
     example_inputs=lambda config, batch, context_len: example_inputs(
         config, context_len=context_len, batch=batch
     ),
-    annotations=lambda config: semantic_annotations(),
+    annotations=lambda config, layer: semantic_annotations(),
     axis_sizes=axis_sizes,
 )

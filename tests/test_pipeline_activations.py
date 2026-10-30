@@ -4,11 +4,11 @@ import math
 import unittest
 from dataclasses import replace
 
+from tests.test_pipeline_gemv_norm import target
 from vllm_cent.activations import ActivationKind
 from vllm_cent.ir import ActivationOp, DType, Function, SoftmaxOp, TensorType, Value
 from vllm_cent.pipeline import ExecutionContract, compile_graph
 from vllm_cent.runtime import CentNamedScalars
-from tests.test_pipeline_gemv_norm import target
 
 
 def _fp32(name: str, *shape: int) -> Value:

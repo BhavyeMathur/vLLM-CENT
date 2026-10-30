@@ -11,7 +11,9 @@ from vllm_cent.ir.base import (
     Operation,
     Value,
     clone_function,
+    operation_class,
     rebuild_function,
+    registered_operations,
 )
 from vllm_cent.ir.types import (
     DType,
@@ -298,9 +300,7 @@ class PlacementTest(unittest.TestCase):
         self.assertEqual(Shard("q_head"), Shard("q_head"))
         self.assertNotEqual(Shard("q_head"), Shard("kv_head"))
         self.assertNotEqual(Partial(), Replicate())
-        self.assertEqual(
-            len({Replicate(), Replicate(), Partial(), Shard("q_head")}), 3
-        )
+        self.assertEqual(len({Replicate(), Replicate(), Partial(), Shard("q_head")}), 3)
 
     def test_unannotated_type_is_replicated(self) -> None:
         """Before tensor parallelism every tensor is whole on every rank."""
@@ -553,7 +553,9 @@ class OperationTest(unittest.TestCase):
         """Operands and results are structure, not printable attributes."""
 
         x = Value(type=VECTOR)
-        self.assertEqual(_Scale(operands=(x,), factor=3.0).attributes(), {"factor": 3.0})
+        self.assertEqual(
+            _Scale(operands=(x,), factor=3.0).attributes(), {"factor": 3.0}
+        )
         self.assertEqual(_Identity(operands=(x,)).attributes(), {})
 
     def test_subclass_may_declare_required_attribute(self) -> None:
@@ -929,7 +931,7 @@ class RebuildFunctionTest(unittest.TestCase):
 class _Sink(Operation):
     """One operand and no result."""
 
-    NAME = "test.sink"
+    NAME = "test.no_result"
     NUM_OPERANDS = 1
 
     def infer_result_types(self) -> tuple[TensorType, ...]:
@@ -1017,7 +1019,9 @@ class RebuildFunctionRewriteTest(unittest.TestCase):
 
         original = _scale_then_identity()
         with self.assertRaises(ValueError):
-            rebuild_function(original, _fresh_arguments(original), rewrite=lambda op: ())
+            rebuild_function(
+                original, _fresh_arguments(original), rewrite=lambda op: ()
+            )
 
     def test_rejects_result_count_mismatch(self) -> None:
         """The last op must have as many results as the op it replaces."""
@@ -1029,7 +1033,91 @@ class RebuildFunctionRewriteTest(unittest.TestCase):
 
         original = _scale_then_identity()
         with self.assertRaises(ValueError):
-            rebuild_function(original, _fresh_arguments(original), rewrite=end_with_sink)
+            rebuild_function(
+                original, _fresh_arguments(original), rewrite=end_with_sink
+            )
+
+
+def _define_probe() -> type[Operation]:
+    """Define the op "test.registry_probe"; each call defines a new class.
+
+    Returns:
+        The class just defined.
+    """
+
+    @dataclass(frozen=True, eq=False, slots=True)
+    class _Probe(Operation):
+        """A one-operand op used only to test registration."""
+
+        NAME = "test.registry_probe"
+        NUM_OPERANDS = 1
+
+        def infer_result_types(self) -> tuple[TensorType, ...]:
+            """Pass the operand type through unchanged."""
+
+            return (self.operands[0].type,)
+
+    return _Probe
+
+
+class OperationRegistryTest(unittest.TestCase):
+    """Every op class that defines a NAME is registered under it."""
+
+    def test_semantic_and_device_ops_are_registered(self) -> None:
+        """aloi.* ops, and pim.* ops once their module is imported."""
+
+        from vllm_cent.ir import LinearOp
+        from vllm_cent.ir.device import PIMGemvOp
+
+        self.assertIs(operation_class("aloi.linear"), LinearOp)
+        self.assertIs(operation_class("pim.gemv"), PIMGemvOp)
+        self.assertIs(registered_operations()["test.identity"], _Identity)
+
+    def test_classes_without_their_own_name_are_not_ops(self) -> None:
+        """Shared rules, mixins and the base class define no NAME of their own."""
+
+        from vllm_cent.ir.device.domain import _PIMOp
+        from vllm_cent.ir.semantic import SoftmaxRules
+
+        registered = set(registered_operations().values())
+        for cls in (Operation, SoftmaxRules, _PIMOp):
+            with self.subTest(cls=cls.__name__):
+                self.assertNotIn(cls, registered)
+
+    def test_slotted_dataclass_registers_its_final_class(self) -> None:
+        """@dataclass(slots=True) builds a second class; that one is registered.
+
+        Defining the same function-local class again replaces the entry
+        rather than counting as a different op with the same name.
+        """
+
+        first = _define_probe()
+        self.assertIs(operation_class("test.registry_probe"), first)
+        second = _define_probe()
+        self.assertIsNot(second, first)
+        self.assertIs(operation_class("test.registry_probe"), second)
+
+    def test_a_different_class_cannot_reuse_a_name(self) -> None:
+        """A second op named "test.identity" is an error at class definition."""
+
+        with self.assertRaisesRegex(ValueError, "'test.identity' is used by both"):
+
+            class _Impostor(Operation):
+                """Claims the name of _Identity."""
+
+                NAME = "test.identity"
+                NUM_OPERANDS = 1
+
+                def infer_result_types(self) -> tuple[TensorType, ...]:
+                    """Unused."""
+
+                    return ()
+
+    def test_unknown_name_lists_the_registered_ones(self) -> None:
+        """A typo is reported with the names that do exist."""
+
+        with self.assertRaisesRegex(KeyError, "no op named 'aloi.linaer'.*aloi.linear"):
+            operation_class("aloi.linaer")
 
 
 if __name__ == "__main__":

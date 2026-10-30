@@ -12,10 +12,10 @@ import unittest
 from dataclasses import asdict, dataclass
 from random import Random
 
+from tests.test_attention_layer import _target
 from vllm_cent.graphs import build_attention_graph
 from vllm_cent.pipeline import compile_graph
 from vllm_cent.runtime import CentNamedScalars
-from tests.test_attention_layer import _target
 
 
 @dataclass(frozen=True)

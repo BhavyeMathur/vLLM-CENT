@@ -1,11 +1,14 @@
-"""Command line: compile a model as a run spec describes.
+r"""Command line: compile a model as a run spec describes.
 
     aloi-compile --model examples/llama_70b/llama3_1_70b.json \\
-                 --run examples/llama_70b/runs/llama3_1_70b_tp8_decode.yaml
+                 --run examples/llama_70b/runs/llama3_1_70b_tp8_decode.yaml \\
+                 --device examples/cent/cent.yaml
     python -m vllm_cent.driver --model ... --run ...   # same, no script
 
 ``--model`` is an HF config.json; the registry.py next to it provides the
 code. ``--run`` is the YAML run spec (parallelism, workload, scope).
+``--device`` is an optional device spec YAML; with it, the IR is also
+lowered to that device's ops (stage ``03_device``).
 """
 
 from __future__ import annotations
@@ -14,6 +17,7 @@ import argparse
 from collections.abc import Sequence
 from pathlib import Path
 
+from ..device import load_device_spec
 from .loader import load_model
 from .run_spec import load_run_spec
 from .stages import compile_stages
@@ -42,6 +46,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--run", required=True, type=Path, help="run spec YAML (parallel, workload)"
     )
     parser.add_argument(
+        "--device",
+        type=Path,
+        help="device spec YAML; also lower to that device (stage 03_device)",
+    )
+    parser.add_argument(
         "--out-dir",
         type=Path,
         help="write <stage>.aloi files here instead of printing them",
@@ -52,10 +61,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         model = load_model(args.model)
         run = load_run_spec(args.run)
+        device = None if args.device is None else load_device_spec(args.device)
     except (FileNotFoundError, KeyError, ValueError, ImportError) as error:
         parser.error(str(error))
 
-    texts = compile_stages(model, run)
+    texts = compile_stages(model, run, device)
     if args.out_dir is None:
         for stage, text in texts.items():
             print(f"// ===== {stage} =====\n{text}")

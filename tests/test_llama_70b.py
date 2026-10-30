@@ -24,6 +24,14 @@ from examples.llama_70b import (
     example_inputs,
     semantic_annotations,
 )
+from vllm_cent.device import load_device_spec
+from vllm_cent.driver import (
+    DEVICE_STAGE,
+    STAGES,
+    compile_stages,
+    load_model,
+    load_run_spec,
+)
 from vllm_cent.frontend import export_model, import_exported_program
 from vllm_cent.ir import (
     AllReduceOp,
@@ -34,8 +42,7 @@ from vllm_cent.ir import (
     Replicate,
     Shard,
 )
-from vllm_cent.parallel import ApplyTensorParallel
-from vllm_cent.driver import STAGES, compile_stages, load_model, load_run_spec
+from vllm_cent.ir.passes import ApplyTensorParallel
 
 # The example's model files (HF config.json) and run specs.
 EXAMPLE_DIR = Path(__file__).resolve().parents[1] / "examples" / "llama_70b"
@@ -49,9 +56,13 @@ LLAMA2_70B_RUN = load_run_spec(EXAMPLE_DIR / "runs" / "llama2_70b_tp8_decode.yam
 # Golden IR of Llama 3.1 70B, tp=8, context 2048, written by
 # ``aloi-compile --model examples/llama_70b/llama3_1_70b.json
 # --run examples/llama_70b/runs/llama3_1_70b_tp8_decode.yaml
+# --device examples/cent/cent.yaml
 # --out-dir tests/golden/llama3_1_70b_tp8`` and reviewed by hand. Regenerate
 # with the same command after an intended IR change.
 GOLDEN_DIR = Path(__file__).parent / "golden" / "llama3_1_70b_tp8"
+
+# The paper-scale CENT device that the golden 03_device stage targets.
+CENT_DEVICE = Path(__file__).resolve().parents[1] / "examples" / "cent" / "cent.yaml"
 
 # A layer small enough to run on CPU in fp32, with the same structure as the
 # 70B models: GQA with 2 query heads per KV head, head_dim 8.
@@ -339,6 +350,23 @@ class GoldenIrTest(unittest.TestCase):
             with self.subTest(stage=stage):
                 golden = (GOLDEN_DIR / f"{stage}.aloi").read_text()
                 self.assertEqual(texts[stage], golden)
+
+    def test_llama3_1_device_stage(self) -> None:
+        """Lowered to the example CENT device, the layer matches its golden file.
+
+        GEMVs, QK, SV, the SiLU's sigmoid and both products run in the banks
+        (PIM); norms, RoPE, softmax parts, residual adds and all_reduces run
+        near memory (PNM), with transfers wherever a value changes domain.
+        """
+
+        texts = compile_stages(
+            load_model(LLAMA3_1_70B_JSON),
+            LLAMA3_1_70B_RUN,
+            load_device_spec(CENT_DEVICE),
+        )
+        self.assertEqual(tuple(texts), (*STAGES, DEVICE_STAGE))
+        golden = (GOLDEN_DIR / f"{DEVICE_STAGE}.aloi").read_text()
+        self.assertEqual(texts[DEVICE_STAGE], golden)
 
     def test_llama2_differs_only_in_rope_table_and_dtype(self) -> None:
         """Llama 2 70B is the same layer with fp16 and a 4096-row RoPE table.

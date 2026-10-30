@@ -16,9 +16,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 
-from .base import Function, Module, Value, rebuild_function
-from .passes import FunctionPass
-from .types import TensorRole
+from ..base import Function, Module, Value, rebuild_function
+from ..pass_manager import FunctionPass
+from ..types import TensorRole
 
 __all__ = ["AnnotateRolesAndAxes", "TensorAnnotation"]
 
@@ -147,7 +147,11 @@ class AnnotateRolesAndAxes(FunctionPass):
         for op in annotated.operations:
             for result in op.results:
                 if len(result.type.axes) != result.type.rank:
-                    label = op.NAME if op.name_hint is None else f"{op.NAME} ({op.name_hint})"
+                    label = (
+                        op.NAME
+                        if op.name_hint is None
+                        else f"{op.NAME} ({op.name_hint})"
+                    )
                     raise ValueError(f"{label} does not propagate axes to its result")
 
         return annotated

@@ -1,0 +1,19 @@
+# Llama 4 Scout, one decode step of layer 0 (a RoPE layer) on 8
+# tensor-parallel ranks.
+#
+#   aloi-compile --model examples/llama4_scout/llama4_scout.json \
+#                --run examples/llama4_scout/runs/llama4_scout_rope_tp8_decode.yaml
+parallel:
+  tp: 8                  # must divide the 40 query heads and 8 KV heads
+  split:
+    - q_head             # q_proj rows, o_proj columns, per-head attention
+    - kv_head            # k_proj/v_proj rows, both KV caches
+    - intermediate       # every expert's and the shared expert's hidden layer
+  replicate: []          # the router stays whole: it has no split axis
+workload:
+  phase: decode
+  batch: 1
+  context_len: 2048      # KV cache positions, including the new token
+scope:
+  layers: 1
+  layer: 0               # RoPE + QK-norm (no_rope_layers[0] == 1)

@@ -2,25 +2,33 @@
 
 from __future__ import annotations
 
+from ..device import DeviceSpec
 from ..frontend import export_model, import_exported_program
-from ..ir import AnnotateRolesAndAxes, Module, PassManager, print_module
-from ..parallel import ApplyTensorParallel
+from ..ir import AnnotateRolesAndAxes, Module, Pass, PassManager, print_module
+from ..ir.passes import ApplyTensorParallel
+from ..legalize import LowerToDevice
 from .loader import LoadedModel
 from .run_spec import Phase, RunSpec
 
-__all__ = ["STAGES", "compile_stages"]
+__all__ = ["DEVICE_STAGE", "STAGES", "compile_stages"]
 
 # Stage names, in pipeline order. They name the dump files: 00_imported.aloi.
 STAGES = ("00_imported", "01_semantic", "02_sharded")
+
+# The stage after STAGES, produced only when a device spec is given.
+DEVICE_STAGE = "03_device"
 
 # Stage produced by each pass, keyed by pass name.
 _PASS_STAGES = {
     AnnotateRolesAndAxes.NAME: "01_semantic",
     ApplyTensorParallel.NAME: "02_sharded",
+    LowerToDevice.NAME: DEVICE_STAGE,
 }
 
 
-def compile_stages(model: LoadedModel, run: RunSpec) -> dict[str, str]:
+def compile_stages(
+    model: LoadedModel, run: RunSpec, device: DeviceSpec | None = None
+) -> dict[str, str]:
     """Compile one step of ``model`` as ``run`` describes; print every stage.
 
     Stages:
@@ -29,13 +37,17 @@ def compile_stages(model: LoadedModel, run: RunSpec) -> dict[str, str]:
     - ``01_semantic``: after AnnotateRolesAndAxes (roles and axes).
     - ``02_sharded``: after ApplyTensorParallel (local shapes, placements,
       all_reduces); the SPMD IR every tensor-parallel rank runs.
+    - ``03_device``: after LowerToDevice, only when ``device`` is given; the
+      device ops of that target, with the transfers between domains.
 
     Args:
         model: Model family and config.
         run: How the model runs.
+        device: Target to lower to; None stops at ``02_sharded``.
 
     Returns:
-        Stage name to IR text, in STAGES order.
+        Stage name to IR text, in STAGES order, then DEVICE_STAGE if
+        ``device`` is given.
 
     Raises:
         NotImplementedError: For prefill, or more than one layer.
@@ -50,7 +62,7 @@ def compile_stages(model: LoadedModel, run: RunSpec) -> dict[str, str]:
 
     registration, config = model.registration, model.config
     program = export_model(
-        registration.build_model(config),
+        registration.build_model(config, run.scope.layer),
         registration.example_inputs(
             config, run.workload.batch, run.workload.context_len
         ),
@@ -63,13 +75,11 @@ def compile_stages(model: LoadedModel, run: RunSpec) -> dict[str, str]:
 
         texts[_PASS_STAGES[pass_name]] = print_module(stage)
 
-    PassManager(
-        (
-            AnnotateRolesAndAxes(registration.annotations(config)),
-            ApplyTensorParallel(
-                run.parallel.build_plan(), registration.axis_sizes(config)
-            ),
-        ),
-        dump=record,
-    ).run(module)
+    passes: list[Pass] = [
+        AnnotateRolesAndAxes(registration.annotations(config, run.scope.layer)),
+        ApplyTensorParallel(run.parallel.build_plan(), registration.axis_sizes(config)),
+    ]
+    if device is not None:
+        passes.append(LowerToDevice(device))
+    PassManager(tuple(passes), dump=record).run(module)
     return texts

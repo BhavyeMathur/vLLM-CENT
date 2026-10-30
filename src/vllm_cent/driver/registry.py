@@ -13,7 +13,7 @@ from typing import Any
 
 from torch import Tensor, nn
 
-from ..ir.annotate import TensorAnnotation
+from ..ir import TensorAnnotation
 
 __all__ = ["ModelRegistration", "get_registration", "register_model"]
 
@@ -28,12 +28,14 @@ class ModelRegistration:
     Attributes:
         model_type: HF ``model_type`` this family handles, e.g. ``"llama"``.
         parse_config: Turns a parsed HF config.json into the typed config.
-        build_model: Creates the model, normally with parameters on the meta
-            device so that full-size models export without memory.
+        build_model: Creates the model for ``(config, layer)``, normally with
+            parameters on the meta device so that full-size models export
+            without memory. ``layer`` is the decoder layer index, for models
+            whose layers differ.
         example_inputs: Sample ``forward`` arguments for
             ``(config, batch, context_len)`` of one decode step.
         annotations: Role and axes of every ``forward`` argument, parameter
-            and buffer, keyed by name.
+            and buffer of the model for ``(config, layer)``, keyed by name.
         axis_sizes: Size of each axis that is the outer factor of a packed
             dimension, e.g. ``{"q_head": 64}``; TP needs it to split whole
             heads.
@@ -41,9 +43,9 @@ class ModelRegistration:
 
     model_type: str
     parse_config: Callable[[Mapping[str, Any]], Any]
-    build_model: Callable[[Any], nn.Module]
+    build_model: Callable[[Any, int], nn.Module]
     example_inputs: Callable[[Any, int, int], tuple[Tensor, ...]]
-    annotations: Callable[[Any], Mapping[str, TensorAnnotation]]
+    annotations: Callable[[Any, int], Mapping[str, TensorAnnotation]]
     axis_sizes: Callable[[Any], Mapping[str, int]]
 
 
@@ -55,9 +57,9 @@ def register_model(
     model_type: str,
     *,
     parse_config: Callable[[Mapping[str, Any]], Any],
-    build_model: Callable[[Any], nn.Module],
+    build_model: Callable[[Any, int], nn.Module],
     example_inputs: Callable[[Any, int, int], tuple[Tensor, ...]],
-    annotations: Callable[[Any], Mapping[str, TensorAnnotation]],
+    annotations: Callable[[Any, int], Mapping[str, TensorAnnotation]],
     axis_sizes: Callable[[Any], Mapping[str, int]],
 ) -> ModelRegistration:
     """Register a model family; called from a model directory's registry.py.

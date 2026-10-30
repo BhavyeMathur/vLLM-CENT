@@ -1,5 +1,6 @@
-"""Compiler driver: a model (HF config + registered code) and a run spec in,
-the IR of every stage out.
+"""Compiler driver: from a model and a run spec to the IR of every stage.
+
+The model is an HF config.json plus the code registered next to it.
 
     aloi-compile --model path/to/config.json --run path/to/run.yaml
 """
@@ -15,9 +16,10 @@ from .run_spec import (
     load_run_spec,
     parse_run_spec,
 )
-from .stages import STAGES, compile_stages
+from .stages import DEVICE_STAGE, STAGES, compile_stages
 
 __all__ = [
+    "DEVICE_STAGE",
     "STAGES",
     "LoadedModel",
     "ModelRegistration",

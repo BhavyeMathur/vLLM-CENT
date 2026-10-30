@@ -4,10 +4,10 @@ import math
 import unittest
 from dataclasses import replace
 
+from tests.test_pipeline_gemv_norm import target
 from vllm_cent.ir import AttentionOp, DType, Function, TensorType, Value
 from vllm_cent.pipeline import AccumulatorPlacement, ExecutionContract, compile_graph
 from vllm_cent.runtime import CentNamedScalars
-from tests.test_pipeline_gemv_norm import target
 
 
 def _fp32(name: str, *shape: int) -> Value:

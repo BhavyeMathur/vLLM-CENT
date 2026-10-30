@@ -17,20 +17,20 @@ import math
 from collections.abc import Callable, Mapping
 
 import torch
+import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
-import torch.nn.functional as F
 
 
 @torch.library.custom_op(
     "aloi::rms_norm",
     mutates_args=(),
 )
-def rms_norm(x: Tensor, weight: Tensor, eps: float | None = None) -> Tensor:
+def rms_norm(x: Tensor, weight: Tensor | None, eps: float | None = None) -> Tensor:
     return F.rms_norm(input=x, normalized_shape=(x.shape[-1],), weight=weight, eps=eps)
 
 
 @rms_norm.register_fake
-def _(x: Tensor, weight: Tensor, eps: float | None = None) -> Tensor:
+def _(x: Tensor, weight: Tensor | None, eps: float | None = None) -> Tensor:
     result = torch.empty_like(x)
     return result
 
@@ -39,14 +39,16 @@ def _(x: Tensor, weight: Tensor, eps: float | None = None) -> Tensor:
     "aloi::linear",
     mutates_args=(),
 )
-def linear(x: Tensor, weight: Tensor) -> Tensor:
-    return F.linear(x, weight)
+def linear(x: Tensor, weight: Tensor, bias: Tensor | None = None) -> Tensor:
+    return F.linear(x, weight, bias)
 
 
 @linear.register_fake
-def _(x: Tensor, weight: Tensor) -> Tensor:
+def _(x: Tensor, weight: Tensor, bias: Tensor | None = None) -> Tensor:
     if x.shape[-1] != weight.shape[-1]:
         raise ValueError("Weight should have shape [out_features, in_features]")
+    if bias is not None and tuple(bias.shape) != (weight.shape[0],):
+        raise ValueError("Bias should have shape [out_features]")
     return x.new_empty((*x.shape[:-1], weight.shape[0]))
 
 
@@ -342,6 +344,107 @@ def _(probs: Tensor, v_cache: Tensor) -> Tensor:
     return probs.new_empty((*probs.shape[:3], v_cache.shape[3]))
 
 
+@torch.library.custom_op("aloi::attn_temperature", mutates_args=())
+def attn_temperature(
+    x: Tensor, positions: Tensor, floor_scale: float, attn_scale: float
+) -> Tensor:
+    """Scale ``x [*tokens, heads, head_dim]`` by a function of each position.
+
+    The scale is ``log(floor((p + 1) / floor_scale) + 1) * attn_scale + 1``,
+    Llama 4's attention temperature tuning for layers without RoPE.
+    """
+
+    scale = (
+        torch.log(torch.floor((positions.to(torch.float32) + 1.0) / floor_scale) + 1.0)
+        * attn_scale
+        + 1.0
+    )
+    # [*tokens] -> broadcast over the heads and head_dim dimensions.
+    return (x.to(torch.float32) * scale[..., None, None]).to(x.dtype)
+
+
+@attn_temperature.register_fake
+def _(x: Tensor, positions: Tensor, floor_scale: float, attn_scale: float) -> Tensor:
+    """Return x's shape after checking one position per token."""
+
+    if positions.shape != x.shape[:-2]:
+        raise ValueError(f"positions {positions.shape} do not fit x {x.shape}")
+    return torch.empty_like(x)
+
+
+@torch.library.custom_op("aloi::topk_sigmoid", mutates_args=())
+def topk_sigmoid(logits: Tensor, top_k: int) -> Tensor:
+    """Sigmoid of each token's ``top_k`` largest logits; 0 for other experts."""
+
+    values, indices = torch.topk(logits.to(torch.float32), top_k, dim=-1)
+    # Unchosen experts get -inf, whose sigmoid is exactly 0.
+    masked = torch.full_like(logits, float("-inf"), dtype=torch.float32)
+    return torch.sigmoid(masked.scatter(-1, indices, values)).to(logits.dtype)
+
+
+@topk_sigmoid.register_fake
+def _(logits: Tensor, top_k: int) -> Tensor:
+    """Return the logits' shape after checking top_k."""
+
+    if not 1 <= top_k <= logits.shape[-1]:
+        raise ValueError(f"top_k {top_k} is not between 1 and {logits.shape[-1]}")
+    return torch.empty_like(logits)
+
+
+@torch.library.custom_op("aloi::moe_experts", mutates_args=())
+def moe_experts(
+    x: Tensor,
+    routing_weights: Tensor,
+    gate_proj: Tensor,
+    up_proj: Tensor,
+    down_proj: Tensor,
+    apply_router_weight_on_input: bool,
+) -> Tensor:
+    """Sum the SwiGLU experts of ``x [*tokens, hidden]``, weighted per token.
+
+    Weights are ``[experts, intermediate, hidden]`` (gate, up) and
+    ``[experts, hidden, intermediate]`` (down). Expert ``e`` reads
+    ``routing_weights[..., e] * x`` when ``apply_router_weight_on_input``,
+    otherwise ``x``, and then its output is scaled instead. Every expert runs;
+    a zero routing weight removes its contribution exactly.
+    """
+
+    x32 = x.to(torch.float32)
+    output = torch.zeros_like(x32)
+    for expert in range(gate_proj.shape[0]):
+        weight = routing_weights[..., expert : expert + 1].to(torch.float32)
+        expert_input = x32 * weight if apply_router_weight_on_input else x32
+        gate = expert_input @ gate_proj[expert].to(torch.float32).T
+        up = expert_input @ up_proj[expert].to(torch.float32).T
+        expert_output = (F.silu(gate) * up) @ down_proj[expert].to(torch.float32).T
+        output += (
+            expert_output if apply_router_weight_on_input else expert_output * weight
+        )
+    return output.to(x.dtype)
+
+
+@moe_experts.register_fake
+def _(
+    x: Tensor,
+    routing_weights: Tensor,
+    gate_proj: Tensor,
+    up_proj: Tensor,
+    down_proj: Tensor,
+    apply_router_weight_on_input: bool,
+) -> Tensor:
+    """Return x's shape after checking that the expert weights fit it."""
+
+    experts, intermediate, hidden = gate_proj.shape
+    if (
+        up_proj.shape != gate_proj.shape
+        or down_proj.shape != (experts, hidden, intermediate)
+        or x.shape[-1] != hidden
+        or routing_weights.shape != (*x.shape[:-1], experts)
+    ):
+        raise ValueError("moe_experts operands do not fit")
+    return torch.empty_like(x)
+
+
 # ---------------------------------------------------------------------------
 # Layers: nn.Modules that own weights and call one ALOI op. Calling a custom op
 # is typed as returning Any, so each forward annotates its result as Tensor.
@@ -349,30 +452,43 @@ def _(probs: Tensor, v_cache: Tensor) -> Tensor:
 
 
 class Linear(nn.Module):
-    """Bias-free linear layer computing ``aloi.linear(x, weight)``.
+    """Linear layer computing ``aloi.linear(x, weight, bias)``.
 
-    Llama projections have no bias, so none is modeled.
+    Parameters have ``nn.Linear``'s names and layouts, so checkpoint keys
+    match. Unlike ``nn.Linear``, ``bias`` defaults to False: the Llama
+    projections this frontend started with have none, and a model with
+    biases (e.g. Qwen2's q/k/v projections) asks for them explicitly.
 
     Attributes:
         weight: ``[out_features, in_features]``, the ``nn.Linear`` layout; the
             layer computes ``x @ weight.T``.
+        bias: ``[out_features]`` added to every output row, or None.
     """
 
-    def __init__(self, in_features: int, out_features: int) -> None:
-        """Create the weight.
+    bias: nn.Parameter | None
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = False) -> None:
+        """Create the weight, and the bias if requested.
 
         Args:
             in_features: Length of each input vector.
             out_features: Length of each output vector.
+            bias: Whether to add a learned bias to each output.
         """
 
         super().__init__()
         # Uninitialized, like nn.Linear before reset_parameters. On the meta
         # device there are no values at all; a loader or test fills them.
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features))
+        else:
+            # Registering None keeps the attribute, as nn.Linear does, while
+            # adding no parameter to state_dict or to the exported graph.
+            self.register_parameter("bias", None)
 
     def forward(self, x: Tensor) -> Tensor:
-        """Compute ``x @ weight.T``.
+        """Compute ``x @ weight.T``, plus the bias when there is one.
 
         Args:
             x: ``[*, in_features]``.
@@ -381,29 +497,42 @@ class Linear(nn.Module):
             ``[*, out_features]``.
         """
 
-        projected: Tensor = linear(x, self.weight)
+        projected: Tensor = linear(x, self.weight, self.bias)
         return projected
 
 
 class RMSNorm(nn.Module):
     """RMSNorm over the last dimension, computing ``aloi.rms_norm``.
 
+    Like ``nn.RMSNorm``, ``elementwise_affine=False`` drops the learned scale.
+
     Attributes:
-        weight: Scale for each feature, ``[hidden_size]``.
+        weight: Scale for each feature, ``[hidden_size]``, or None without
+            ``elementwise_affine``.
         eps: Constant added to the mean square before the square root.
     """
 
-    def __init__(self, hidden_size: int, eps: float) -> None:
+    weight: nn.Parameter | None
+
+    def __init__(
+        self, hidden_size: int, eps: float, elementwise_affine: bool = True
+    ) -> None:
         """Create the weight.
 
         Args:
             hidden_size: Length of the normalized last dimension.
             eps: Constant added to the mean square before the square root.
+            elementwise_affine: Whether to learn a per-feature scale.
         """
 
         super().__init__()
-        # Same initial value as nn.RMSNorm: every feature is scaled by 1.
-        self.weight = nn.Parameter(torch.ones(hidden_size))
+        if elementwise_affine:
+            # Same initial value as nn.RMSNorm: every feature is scaled by 1.
+            self.weight = nn.Parameter(torch.ones(hidden_size))
+        else:
+            # Registering None keeps the attribute, as nn.RMSNorm does, while
+            # adding no parameter to state_dict or to the exported graph.
+            self.register_parameter("weight", None)
         self.eps = eps
 
     def forward(self, x: Tensor) -> Tensor:
@@ -492,3 +621,71 @@ class RotaryEmbedding(nn.Module):
         rotated_q: Tensor = rope(q, positions, table, self.is_neox_style)
         rotated_k: Tensor = rope(k, positions, table, self.is_neox_style)
         return rotated_q, rotated_k
+
+
+class MoEExperts(nn.Module):
+    """A bank of SwiGLU experts, computing ``aloi.moe_experts``.
+
+    Each expert is a feed-forward network like a Llama MLP. The weights use
+    the ``nn.Linear`` layout per expert, stacked on a leading expert
+    dimension. (Hugging Face's Llama 4 checkpoint stores one fused
+    ``gate_up_proj [experts, hidden, 2 * intermediate]`` instead; a loader
+    would split and transpose it.)
+
+    Attributes:
+        gate_proj: ``[experts, intermediate, hidden]``; passed through SiLU.
+        up_proj: ``[experts, intermediate, hidden]``; multiplied by the gate.
+        down_proj: ``[experts, hidden, intermediate]``.
+        apply_router_weight_on_input: Scale each expert's input (Llama 4) or
+            its output (Mixtral) by the routing weight.
+    """
+
+    def __init__(
+        self,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        apply_router_weight_on_input: bool,
+    ) -> None:
+        """Create the weights.
+
+        Args:
+            num_experts: Number of experts.
+            hidden_size: Length of each token's input and output vector.
+            intermediate_size: Width of each expert's hidden layer.
+            apply_router_weight_on_input: See the attribute.
+        """
+
+        super().__init__()
+        # Uninitialized, like Linear; a loader or test fills them.
+        self.gate_proj = nn.Parameter(
+            torch.empty(num_experts, intermediate_size, hidden_size)
+        )
+        self.up_proj = nn.Parameter(
+            torch.empty(num_experts, intermediate_size, hidden_size)
+        )
+        self.down_proj = nn.Parameter(
+            torch.empty(num_experts, hidden_size, intermediate_size)
+        )
+        self.apply_router_weight_on_input = apply_router_weight_on_input
+
+    def forward(self, x: Tensor, routing_weights: Tensor) -> Tensor:
+        """Run every expert on ``x`` and sum them by ``routing_weights``.
+
+        Args:
+            x: ``[*tokens, hidden]``.
+            routing_weights: ``[*tokens, experts]``, 0 for unchosen experts.
+
+        Returns:
+            ``[*tokens, hidden]``.
+        """
+
+        output: Tensor = moe_experts(
+            x,
+            routing_weights,
+            self.gate_proj,
+            self.up_proj,
+            self.down_proj,
+            self.apply_router_weight_on_input,
+        )
+        return output

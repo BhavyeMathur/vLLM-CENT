@@ -15,6 +15,7 @@ compile. Together they define the SPMD program the compiler produces::
       context_len: 2048
     scope:
       layers: 1
+      layer: 0          # which decoder layer: layer types may differ
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ from typing import Any
 import yaml  # type: ignore[import-untyped]
 
 from ..parallel.plan import ParallelPlan
+from ..utils import config
 
 __all__ = [
     "ParallelSpec",
@@ -39,6 +41,9 @@ __all__ = [
     "load_run_spec",
     "parse_run_spec",
 ]
+
+# Names this kind of document in configuration error messages.
+_RUN_SPEC = "run spec"
 
 
 class Phase(StrEnum):
@@ -112,9 +117,12 @@ class Scope:
 
     Attributes:
         layers: Number of decoder layers.
+        layer: Index of the first compiled layer. It matters when layers
+            differ, e.g. Llama 4 interleaves layers with and without RoPE.
     """
 
     layers: int = 1
+    layer: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,59 +138,6 @@ class RunSpec:
     parallel: ParallelSpec = ParallelSpec()
     workload: Workload = Workload()
     scope: Scope = Scope()
-
-
-def _section(data: Mapping[str, Any], name: str, keys: set[str]) -> Mapping[str, Any]:
-    """Return one top-level section, rejecting unknown keys.
-
-    Args:
-        data: The whole document.
-        name: Section name.
-        keys: Allowed keys in the section.
-
-    Returns:
-        The section, empty if absent.
-
-    Raises:
-        ValueError: If the section is not a mapping or has unknown keys; a
-            misspelled key would otherwise be silently ignored.
-    """
-
-    section = data.get(name) or {}
-    if not isinstance(section, Mapping):
-        raise ValueError(f"run spec section {name!r} must be a mapping")
-    unknown = sorted(set(section) - keys)
-    if unknown:
-        raise ValueError(f"unknown keys in run spec section {name!r}: {unknown}")
-    return section
-
-
-def _positive_int(section: str, key: str, value: object) -> int:
-    """Return a positive int setting.
-
-    Raises:
-        ValueError: If the value is not a positive int.
-    """
-
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        raise ValueError(
-            f"run spec {section}.{key} must be a positive int, got {value!r}"
-        )
-    return value
-
-
-def _names(section: str, key: str, value: object) -> tuple[str, ...]:
-    """Return a list-of-names setting as a tuple.
-
-    Raises:
-        ValueError: If the value is not a list of strings.
-    """
-
-    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
-        raise ValueError(
-            f"run spec {section}.{key} must be a list of names, got {value!r}"
-        )
-    return tuple(value)
 
 
 def parse_run_spec(data: Mapping[str, Any]) -> RunSpec:
@@ -202,23 +157,29 @@ def parse_run_spec(data: Mapping[str, Any]) -> RunSpec:
     if unknown:
         raise ValueError(f"unknown run spec sections: {unknown}")
 
-    parallel = _section(data, "parallel", {"tp", "split", "replicate", "split_only"})
+    parallel = config.section(
+        _RUN_SPEC, data, "parallel", {"tp", "split", "replicate", "split_only"}
+    )
     split_only = parallel.get("split_only") or {}
     if not isinstance(split_only, Mapping):
         raise ValueError("run spec parallel.split_only must map axes to tensor names")
     parallel_spec = ParallelSpec(
-        tp=_positive_int("parallel", "tp", parallel.get("tp", 1)),
-        split=_names("parallel", "split", parallel.get("split", [])),
-        replicate=_names("parallel", "replicate", parallel.get("replicate", [])),
+        tp=config.positive_int(_RUN_SPEC, "parallel.tp", parallel.get("tp", 1)),
+        split=config.names(_RUN_SPEC, "parallel.split", parallel.get("split", [])),
+        replicate=config.names(
+            _RUN_SPEC, "parallel.replicate", parallel.get("replicate", [])
+        ),
         split_only=MappingProxyType(
             {
-                str(axis): _names("parallel", f"split_only.{axis}", names)
+                str(axis): config.names(_RUN_SPEC, f"parallel.split_only.{axis}", names)
                 for axis, names in split_only.items()
             }
         ),
     )
 
-    workload = _section(data, "workload", {"phase", "batch", "context_len"})
+    workload = config.section(
+        _RUN_SPEC, data, "workload", {"phase", "batch", "context_len"}
+    )
     phase = workload.get("phase", Phase.DECODE.value)
     try:
         phase = Phase(phase)
@@ -229,14 +190,19 @@ def parse_run_spec(data: Mapping[str, Any]) -> RunSpec:
         ) from error
     workload_spec = Workload(
         phase=phase,
-        batch=_positive_int("workload", "batch", workload.get("batch", 1)),
-        context_len=_positive_int(
-            "workload", "context_len", workload.get("context_len", 2048)
+        batch=config.positive_int(
+            _RUN_SPEC, "workload.batch", workload.get("batch", 1)
+        ),
+        context_len=config.positive_int(
+            _RUN_SPEC, "workload.context_len", workload.get("context_len", 2048)
         ),
     )
 
-    scope = _section(data, "scope", {"layers"})
-    scope_spec = Scope(layers=_positive_int("scope", "layers", scope.get("layers", 1)))
+    scope = config.section(_RUN_SPEC, data, "scope", {"layers", "layer"})
+    scope_spec = Scope(
+        layers=config.positive_int(_RUN_SPEC, "scope.layers", scope.get("layers", 1)),
+        layer=config.nonnegative_int(_RUN_SPEC, "scope.layer", scope.get("layer", 0)),
+    )
     return RunSpec(parallel=parallel_spec, workload=workload_spec, scope=scope_spec)
 
 

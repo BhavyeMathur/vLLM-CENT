@@ -11,31 +11,40 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from ...activations import ActivationKind
-from ..base import Operation, Value
-from ..types import Partial, TensorRole, TensorType
+from ..base import Decomposable, Operation, Value
+from ..types import DType, Partial, TensorRole, TensorType
 
 __all__ = [
     "ActivationOp",
+    "ActivationRules",
     "AddOp",
+    "DivOp",
+    "ExpOp",
     "MulOp",
+    "SubOp",
 ]
 
+# Dtypes without a fractional part: exp and true division do not apply.
+_INTEGER_DTYPES = frozenset({DType.INT64, DType.INT32, DType.INT8})
 
-@dataclass(frozen = True, eq = False, slots = True)
-class ActivationOp(Operation):
-    """A parameter-free activation applied to every element.
+
+@dataclass(frozen=True, eq=False, slots=True)
+class ActivationRules(Operation):
+    """Type rules shared by every activation op, at any IR level; not an op itself.
+
+    ``aloi.activation`` and the device activation ops (``pim.activation``,
+    ``pnm.activation``) derive from this class, so they check types
+    identically. Only ``aloi.activation`` is ``Decomposable``: a device op's
+    parts would be semantic ops.
 
     ``function`` picks the formula: SiLU, ReLU, sigmoid, tanh, or one of the
     two GELU formulas. The exact (erf) GELU and its tanh approximation are
     different choices; no pass may exchange them.
 
-    ActivationOp(operands=(x,), function=ActivationKind.SILU)
-
     Attributes:
         function: Which formula to apply.
     """
 
-    NAME = "aloi.activation"
     NUM_OPERANDS = 1
 
     function: ActivationKind
@@ -58,10 +67,91 @@ class ActivationOp(Operation):
 
         if isinstance(self.x.type.placement, Partial):
             raise ValueError(f"{self.NAME}: x is a partial sum; all_reduce it first")
-        return (replace(self.x.type, role = TensorRole.ACTIVATION),)
+        return (replace(self.x.type, role=TensorRole.ACTIVATION),)
 
 
-@dataclass(frozen = True, eq = False, slots=True)
+@dataclass(frozen=True, eq=False, slots=True)
+class ActivationOp(ActivationRules, Decomposable):
+    """A parameter-free activation applied to every element.
+
+    SiLU can be decomposed, as ``x * sigmoid(x)``, for a target that computes
+    sigmoid but not SiLU; the other functions have no decomposition.
+
+    ActivationOp(operands=(x,), function=ActivationKind.SILU)
+    """
+
+    NAME = "aloi.activation"
+
+    def can_decompose(self) -> bool:
+        """Tell whether ``function`` has a decomposition: only SiLU does.
+
+        Returns:
+            True for SiLU.
+        """
+
+        return self.function is ActivationKind.SILU
+
+    def decompose(self) -> tuple[Operation, ...]:
+        """Return SiLU as ``x * sigmoid(x)``: a sigmoid, then a product.
+
+        The product keeps this op's name_hint, so later ops print the same
+        operand names as before; the sigmoid is named ``<hint>.sigmoid``.
+
+        Returns:
+            The sigmoid op and the product op, in order.
+
+        Raises:
+            ValueError: If ``function`` is not SiLU.
+        """
+
+        if not self.can_decompose():
+            raise ValueError(f"{self.NAME}: {self.function.value} has no decomposition")
+        hint = self.name_hint or "silu"
+        sigmoid = ActivationOp(
+            operands=(self.x,),
+            function=ActivationKind.SIGMOID,
+            name_hint=f"{hint}.sigmoid",
+        )
+        product = MulOp(operands=(self.x, *sigmoid.results), name_hint=self.name_hint)
+        return (sigmoid, product)
+
+
+@dataclass(frozen=True, eq=False, slots=True)
+class ExpOp(Operation):
+    """Natural exponential ``e ** x``, element by element.
+
+    ExpOp(operands=(x,))
+    """
+
+    NAME = "aloi.exp"
+    NUM_OPERANDS = 1
+
+    @property
+    def x(self) -> Value:
+        return self.operands[0]
+
+    def infer_result_types(self) -> tuple[TensorType, ...]:
+        """The result has x's shape, dtype, axes and placement.
+
+        A split x stays split the same way: each element's result depends
+        only on that element.
+
+        Raises:
+            ValueError: If x has an integer dtype (e ** x is not an integer),
+                or x is a partial sum: exp(a) + exp(b) != exp(a + b), so the
+                parts must be summed first.
+        """
+
+        if self.x.type.dtype in _INTEGER_DTYPES:
+            raise ValueError(
+                f"{self.NAME}: x must be floating point, got {self.x.type.dtype}"
+            )
+        if isinstance(self.x.type.placement, Partial):
+            raise ValueError(f"{self.NAME}: x is a partial sum; all_reduce it first")
+        return (replace(self.x.type, role=TensorRole.ACTIVATION),)
+
+
+@dataclass(frozen=True, eq=False, slots=True)
 class _ElementwiseBinaryOp(Operation):
     """Shared rules of ops that combine two same-shaped tensors elementwise.
 
@@ -114,16 +204,16 @@ class _ElementwiseBinaryOp(Operation):
         axes = lhs.axes if lhs.axes and rhs.axes else ()
         return (
             TensorType(
-                shape = lhs.shape,
-                dtype = lhs.dtype,
-                axes = axes,
-                global_shape = lhs.global_shape,
-                placement = lhs.placement,
+                shape=lhs.shape,
+                dtype=lhs.dtype,
+                axes=axes,
+                global_shape=lhs.global_shape,
+                placement=lhs.placement,
             ),
         )
 
 
-@dataclass(frozen = True, eq = False, slots=True)
+@dataclass(frozen=True, eq=False, slots=True)
 class AddOp(_ElementwiseBinaryOp):
     """Elementwise sum, e.g. a residual connection.
 
@@ -133,7 +223,17 @@ class AddOp(_ElementwiseBinaryOp):
     NAME = "aloi.add"
 
 
-@dataclass(frozen = True, eq = False, slots=True)
+@dataclass(frozen=True, eq=False, slots=True)
+class SubOp(_ElementwiseBinaryOp):
+    """Elementwise difference ``lhs - rhs``, e.g. subtracting each row's maximum.
+
+    SubOp(operands=(lhs, rhs))
+    """
+
+    NAME = "aloi.sub"
+
+
+@dataclass(frozen=True, eq=False, slots=True)
 class MulOp(_ElementwiseBinaryOp):
     """Elementwise product, e.g. the SwiGLU gate times the up projection.
 
@@ -141,3 +241,31 @@ class MulOp(_ElementwiseBinaryOp):
     """
 
     NAME = "aloi.mul"
+
+
+@dataclass(frozen=True, eq=False, slots=True)
+class DivOp(_ElementwiseBinaryOp):
+    """Elementwise quotient ``lhs / rhs``, e.g. dividing by a softmax row sum.
+
+    This is true division of floating-point values. How a target computes it,
+    e.g. a reciprocal followed by a multiplication, is a lowering choice.
+
+    DivOp(operands=(lhs, rhs))
+    """
+
+    NAME = "aloi.div"
+
+    def infer_result_types(self) -> tuple[TensorType, ...]:
+        """Check the operands like the other binary ops, and reject integers.
+
+        Raises:
+            ValueError: As for the other binary ops, or if the operands are
+                integers (integer division would need a rounding mode).
+        """
+
+        if self.lhs.type.dtype in _INTEGER_DTYPES:
+            raise ValueError(
+                f"{self.NAME}: operands must be floating point, "
+                f"got {self.lhs.type.dtype}"
+            )
+        return super().infer_result_types()

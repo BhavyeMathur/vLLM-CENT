@@ -1,21 +1,27 @@
-"""Infrastructure for implementing IR passes"""
+"""Infrastructure for IR passes: the Pass interface and the PassManager.
+
+Target-independent passes live in ``vllm_cent.ir.passes``; passes that
+need a target description live in their own packages, e.g.
+``vllm_cent.legalize.LowerToDevice``.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import ClassVar, Callable
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from collections.abc import Callable
+from typing import ClassVar
 
-from .base import Function, Module, clone_function
+from .base import Function, Module
+
 
 class Pass(ABC):
-    """Abstract class for IR passes"""
+    """Abstract class for IR passes."""
 
     NAME: ClassVar[str]
 
     @abstractmethod
-    def run(self, module: Module) -> Module:
-        ...
+    def run(self, module: Module) -> Module: ...
 
 
 class FunctionPass(Pass):
@@ -27,27 +33,17 @@ class FunctionPass(Pass):
     """
 
     @abstractmethod
-    def run_on_function(self, function: Function) -> Function:
-        ...
+    def run_on_function(self, function: Function) -> Function: ...
 
     def run(self, module: Module) -> Module:
         return Module(
-            name = module.name,
-            functions = tuple(self.run_on_function(func) for func in module.functions),
+            name=module.name,
+            functions=tuple(self.run_on_function(func) for func in module.functions),
         )
 
 
-class ClonePass(FunctionPass):
-    """Copy every function with fresh values; the IR itself is unchanged."""
-
-    NAME = "clone"
-
-    def run_on_function(self, function: Function) -> Function:
-        return clone_function(function)
-
-
-@dataclass(frozen = True)
-class PassManager():
+@dataclass(frozen=True)
+class PassManager:
     passes: tuple[Pass, ...]
     verify_each: bool = True
     dump: Callable[[str, Module], None] | None = None

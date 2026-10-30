@@ -1,32 +1,74 @@
-"""Small, dependency-free SSA IR"""
+"""Small, dependency-free SSA IR."""
 
 from __future__ import annotations
 
-from dataclasses import  dataclass, field, fields, replace
-from typing import ClassVar, Self
-from collections.abc import Callable, Iterable, Sequence
 from abc import ABC, abstractmethod
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field, fields, replace
+from types import MappingProxyType
+from typing import ClassVar, Self
 
 from .types import TensorType
 
-@dataclass(frozen = True, eq = False, )
-class Value:
+# Every op class that defines a NAME, keyed by that name, at every IR level
+# ("aloi.linear", "pim.gemv"). Operation.__init_subclass__ fills it as op
+# classes are defined, so it holds the ops of every module imported so far.
+_OPERATIONS: dict[str, type[Operation]] = {}
 
+
+@dataclass(
+    frozen=True,
+    eq=False,
+)
+class Value:
     type: TensorType
     name: str | None = None
 
 
-@dataclass(frozen = True, eq = False, slots = True)
+@dataclass(frozen=True, eq=False, slots=True)
 class Operation(ABC):
-
     NAME: ClassVar[str]
     # Exact operand count, or the allowed counts when trailing operands
     # are optional (e.g. attention's mask).
     NUM_OPERANDS: ClassVar[int | tuple[int, ...]]
 
-    name_hint: str | None = field(default = None, kw_only = True)
+    name_hint: str | None = field(default=None, kw_only=True)
     operands: tuple[Value, ...]
-    results: tuple[Value, ...] = field(init = False)
+    results: tuple[Value, ...] = field(init=False)
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        """Register each op class that defines its own NAME.
+
+        Classes without a NAME of their own (mixins such as ``_PIMOp``, shared
+        rules such as ``SoftmaxRules``) are not ops and are skipped; a class
+        that only inherits a NAME would otherwise claim its parent's.
+
+        ``@dataclass(slots=True)`` builds a second class to add the slots, so
+        this runs twice for each op; the second, final class must win. A
+        class with the same module and class name therefore replaces the
+        registered one, which also covers a class defined in a function that
+        runs again. (The class name, not ``__qualname__``: while this hook
+        runs for the second class, dataclasses has not yet copied the nested
+        qualified name onto it.)
+
+        Raises:
+            ValueError: If a different class already uses this NAME.
+        """
+
+        super().__init_subclass__(**kwargs)
+        if "NAME" not in cls.__dict__:
+            return
+        registered = _OPERATIONS.get(cls.NAME)
+        if registered is not None and (registered.__module__, registered.__name__) != (
+            cls.__module__,
+            cls.__name__,
+        ):
+            raise ValueError(
+                f"op name {cls.NAME!r} is used by both "
+                f"{registered.__module__}.{registered.__qualname__} and "
+                f"{cls.__module__}.{cls.__qualname__}"
+            )
+        _OPERATIONS[cls.NAME] = cls
 
     def __post_init__(self) -> None:
         # Convert before anything else: a generator has no len(), and a list
@@ -45,13 +87,12 @@ class Operation(ABC):
             )
 
         result_types = self.infer_result_types()
-        results = tuple(Value(type = t) for t in result_types)
+        results = tuple(Value(type=t) for t in result_types)
         object.__setattr__(self, "results", results)
 
     # Infer the output type entirely by the operation
     @abstractmethod
-    def infer_result_types(self) -> tuple[TensorType, ...]: 
-        ...
+    def infer_result_types(self) -> tuple[TensorType, ...]: ...
 
     # Getting attributes for printing
     def attributes(self) -> dict[str, object]:
@@ -61,13 +102,77 @@ class Operation(ABC):
             if f.name not in {"name_hint", "operands", "results"}
         }
 
-
     def with_operands(self, new_operands: Iterable[Value]) -> Self:
-        return replace(self, operands = tuple(new_operands))
+        return replace(self, operands=tuple(new_operands))
 
-@dataclass(frozen = True, eq = False, slots = True)
+
+class Decomposable(ABC):
+    """An IR Operation that can be decomposed into other IR Operations.
+
+    The decomposition uses ops of the same IR level, e.g. a semantic op
+    decomposes into semantic ops only. Some ops can be decomposed only for
+    some attribute values: an activation op decomposes SiLU into a sigmoid
+    and a product, but has no decomposition for ReLU. Such an op overrides
+    ``can_decompose()``.
+    """
+
+    __slots__ = ()
+
+    def can_decompose(self) -> bool:
+        """Tell whether this op instance has a decomposition.
+
+        Returns:
+            True by default; an op whose decomposition depends on its
+            attributes returns False when ``decompose()`` would fail.
+        """
+
+        return True
+
+    @abstractmethod
+    def decompose(self) -> tuple[Operation, ...]:
+        """Return IR Operations computing the same result from self.operands.
+
+        The last Op's result replaces this Op's result. Only called when
+        ``can_decompose()`` is True.
+        """
+
+
+def operation_class(name: str) -> type[Operation]:
+    """Return the op class registered under ``name``, e.g. ``"aloi.linear"``.
+
+    Only ops of imported modules are registered: import ``vllm_cent.ir.device``
+    before looking up a device op such as ``"pim.gemv"``.
+
+    Args:
+        name: An op's ``NAME``.
+
+    Returns:
+        The op class.
+
+    Raises:
+        KeyError: If no imported op class has that name; the message lists
+            the registered names.
+    """
+
+    registered = _OPERATIONS.get(name)
+    if registered is None:
+        raise KeyError(f"no op named {name!r}; registered: {sorted(_OPERATIONS)}")
+    return registered
+
+
+def registered_operations() -> Mapping[str, type[Operation]]:
+    """Return every registered op class by name, as a read-only view.
+
+    Returns:
+        A live view: ops of modules imported later appear in it too.
+    """
+
+    return MappingProxyType(_OPERATIONS)
+
+
+@dataclass(frozen=True, eq=False, slots=True)
 class Function:
-    """One straight-line SSA function"""
+    """One straight-line SSA function."""
 
     name: str
     operands: tuple[Value, ...]
@@ -77,7 +182,7 @@ class Function:
     def __post_init__(self) -> None:
         operands = tuple(self.operands)
         object.__setattr__(self, "operands", operands)
-        
+
         operations = tuple(self.operations)
         object.__setattr__(self, "operations", operations)
 
@@ -92,11 +197,7 @@ class Function:
         return None
 
     def users(self, value: Value) -> tuple[Operation, ...]:
-        return tuple(
-            op
-            for op in self.operations
-            if value in op.operands
-        )
+        return tuple(op for op in self.operations if value in op.operands)
 
     def verify(self) -> None:
         # Add arguments one at a time: set(self.operands) would silently merge
@@ -112,23 +213,30 @@ class Function:
         for op in self.operations:
             # NAME says what kind of op failed; name_hint, when present, says which one.
             label = op.NAME if op.name_hint is None else f"{op.NAME} ({op.name_hint})"
-            missing = [operand.name for operand in op.operands if operand not in available]
+            missing = [
+                operand.name for operand in op.operands if operand not in available
+            ]
             if missing:
                 raise ValueError(f"{label} uses unavailable values: {missing}")
             for result in op.results:
                 if result in available:
-                    raise ValueError(f"{label} defines duplicate SSA value %{result.name}")
+                    raise ValueError(
+                        f"{label} defines duplicate SSA value %{result.name}"
+                    )
                 available.add(result)
-        missing_outputs = [value.name for value in self.results if value not in available]
+        missing_outputs = [
+            value.name for value in self.results if value not in available
+        ]
         if missing_outputs:
             raise ValueError(f"function returns unavailable values: {missing_outputs}")
 
-@dataclass(frozen = True)
+
+@dataclass(frozen=True)
 class Module:
     """A named collection of functions."""
 
     name: str
-    functions: tuple[Function, ... ]
+    functions: tuple[Function, ...]
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "functions", tuple(self.functions))
@@ -145,7 +253,9 @@ class Module:
         names: set[str] = set()
         for func in self.functions:
             if func.name in names:
-                raise ValueError(f"module @{self.name} defines function @{func.name} twice")
+                raise ValueError(
+                    f"module @{self.name} defines function @{func.name} twice"
+                )
             names.add(func.name)
 
         for func in self.functions:
@@ -201,10 +311,7 @@ def rebuild_function(
     new_ops: list[Operation] = []
     for op in func.operations:
         new_op = op.with_operands(
-            new_operands = tuple(
-                new_map[operand] 
-                for operand 
-                in op.operands),
+            new_operands=tuple(new_map[operand] for operand in op.operands),
         )
 
         emitted = (new_op,) if rewrite is None else tuple(rewrite(new_op))
@@ -223,13 +330,13 @@ def rebuild_function(
             new_map[old_result] = new_result
 
     return Function(
-        name = func.name,
-        operands = new_operands,
-        operations = tuple(new_ops),
+        name=func.name,
+        operands=new_operands,
+        operations=tuple(new_ops),
         # The returns are chosen by the original function, not by the ops:
         # look up the copy of each returned value instead of returning every
         # op result.
-        results = tuple(new_map[value] for value in func.results),
+        results=tuple(new_map[value] for value in func.results),
     )
 
 
@@ -245,5 +352,5 @@ def clone_function(func: Function) -> Function:
 
     return rebuild_function(
         func,
-        (Value(type = operand.type, name = operand.name) for operand in func.operands),
+        (Value(type=operand.type, name=operand.name) for operand in func.operands),
     )

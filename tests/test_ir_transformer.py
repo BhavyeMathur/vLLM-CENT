@@ -1,4 +1,4 @@
-"""Tests for the transformer semantic ops: heads, RoPE, KV cache, GQA."""
+"""Tests for the transformer semantic ops: heads, RoPE, KV cache, GQA, MoE."""
 
 from __future__ import annotations
 
@@ -7,12 +7,15 @@ import unittest
 from vllm_cent.ir.base import Value
 from vllm_cent.ir.semantic.transformer import (
     AttentionOp,
+    AttnTemperatureOp,
     GqaQKOp,
     GqaSVOp,
     KvUpdateOp,
     MergeHeadsOp,
+    MoeExpertsOp,
     RopeOp,
     SplitHeadsOp,
+    TopKSigmoidOp,
 )
 from vllm_cent.ir.types import (
     DType,
@@ -408,7 +411,7 @@ class GqaOpsTest(unittest.TestCase):
             GqaQKOp(operands=(q_by_batch, cache_by_batch), scale=1.0)
 
     def test_sv_rejects_wrong_contraction(self) -> None:
-        """probs must sum over the cache's context axis."""
+        """The probabilities must sum over the cache's context axis."""
 
         probs = _value(
             (1, 1, Q_HEADS, CONTEXT), (*TOKEN_AXES, "q_head", "seq_len_again")
@@ -461,6 +464,172 @@ class AttentionOpTest(unittest.TestCase):
         for name, (operands, attributes, message) in cases.items():
             with self.subTest(case=name), self.assertRaisesRegex(ValueError, message):
                 AttentionOp(operands=operands, **attributes)  # type: ignore[arg-type]
+
+
+class AttnTemperatureOpTest(unittest.TestCase):
+    """aloi.attn_temperature: per-token query scale of Llama 4's NoPE layers."""
+
+    def test_type_is_kept_for_split_and_partial_queries(self) -> None:
+        """Scaling whole tokens is local, so heads and partial sums stay as they are.
+
+        q is one rank's 5 of 40 query heads of Llama 4 Scout under tp=8.
+        """
+        positions = _value((1, 1), TOKEN_AXES, dtype=DType.INT64)
+        split_q = _value(
+            (1, 1, 5, HEAD_DIM),
+            (*TOKEN_AXES, "q_head", "head_dim"),
+            Shard("q_head"),
+            (1, 1, 40, HEAD_DIM),
+        )
+        partial_q = _value(
+            (1, 1, 5, HEAD_DIM), (*TOKEN_AXES, "q_head", "head_dim"), Partial()
+        )
+        for q in (split_q, partial_q):
+            with self.subTest(placement=q.type.placement):
+                op = AttnTemperatureOp(
+                    operands=(q, positions), floor_scale=8192.0, attn_scale=0.1
+                )
+                self.assertEqual(op.results[0].type, q.type)
+        self.assertEqual(op.attributes(), {"floor_scale": 8192.0, "attn_scale": 0.1})
+
+    def test_rejections(self) -> None:
+        """Bad constants, float or misshaped positions, or split positions."""
+        q = _value((1, 1, 4, HEAD_DIM))
+        positions = _value((1, 1), dtype=DType.INT64)
+        split_positions = _value(
+            (1, 1), ("batch", "seq_len"), Shard("batch"), (2, 1), dtype=DType.INT64
+        )
+        cases = {
+            "zero floor_scale": ((q, positions), 0.0, 0.1, "floor_scale"),
+            "infinite attn_scale": ((q, positions), 2.0, float("inf"), "attn_scale"),
+            "float positions": ((q, _value((1, 1))), 2.0, 0.1, "integers"),
+            "one position for two tokens": (
+                (_value((1, 2, 4, HEAD_DIM)), positions),
+                2.0,
+                0.1,
+                "token",
+            ),
+            "split positions": ((q, split_positions), 2.0, 0.1, "replicated"),
+        }
+        for name, (operands, floor_scale, attn_scale, message) in cases.items():
+            with self.subTest(case=name), self.assertRaisesRegex(ValueError, message):
+                AttnTemperatureOp(
+                    operands=operands, floor_scale=floor_scale, attn_scale=attn_scale
+                )
+
+
+class TopKSigmoidOpTest(unittest.TestCase):
+    """aloi.topk_sigmoid: dense routing weights over all experts."""
+
+    def test_type_is_kept(self) -> None:
+        """Scout's router logits [1, 1, 16] give routing weights [1, 1, 16]."""
+        logits = _value((1, 1, 16), (*TOKEN_AXES, "expert"))
+        op = TopKSigmoidOp(operands=(logits,), top_k=1)
+        self.assertEqual(op.results[0].type, logits.type)
+
+    def test_rejections(self) -> None:
+        """top_k outside 1..experts, a partial sum, or split experts."""
+        logits = _value((1, 16))
+        split = _value((1, 2), ("seq_len", "expert"), Shard("expert"), (1, 16))
+        partial = _value((1, 16), placement=Partial())
+        cases = {
+            "top_k 0": (logits, 0, "between 1 and 16"),
+            "top_k above experts": (logits, 17, "between 1 and 16"),
+            "partial logits": (partial, 1, "partial sum"),
+            "split experts": (split, 1, "every expert"),
+        }
+        for name, (operand, top_k, message) in cases.items():
+            with self.subTest(case=name), self.assertRaisesRegex(ValueError, message):
+                TopKSigmoidOp(operands=(operand,), top_k=top_k)
+
+
+class MoeExpertsOpTest(unittest.TestCase):
+    """aloi.moe_experts: the weighted sum of SwiGLU experts and its TP rule."""
+
+    # Scout's expert weights under tp=8: 16 experts, hidden 5120, and each
+    # rank holding 8192 / 8 = 1024 of every expert's intermediate width.
+    EXPERT_AXES = ("expert", "intermediate", "hidden")
+    DOWN_AXES = ("expert", "hidden", "intermediate")
+
+    def _operands(self, placement: Placement = REPLICATED) -> tuple[Value, ...]:
+        """Return x, routing weights, and gate/up/down weights of Scout.
+
+        Args:
+            placement: Placement of the three expert weights; a shard splits
+                the intermediate axis, so local widths are 1024 of 8192.
+
+        Returns:
+            The five operands.
+        """
+        width = 1024 if isinstance(placement, Shard) else 8192
+        whole = {"gate": (16, 8192, 5120), "down": (16, 5120, 8192)}
+
+        def weight(shape: tuple[int, ...], axes: tuple[str, ...], key: str) -> Value:
+            """Return one expert weight with the requested placement."""
+            sharded = isinstance(placement, Shard)
+            return _value(
+                shape,
+                axes,
+                placement,
+                whole[key] if sharded else None,
+                role=TensorRole.WEIGHT,
+            )
+
+        return (
+            _value((1, 1, 5120), (*TOKEN_AXES, "hidden")),
+            _value((1, 1, 16), (*TOKEN_AXES, "expert")),
+            weight((16, width, 5120), self.EXPERT_AXES, "gate"),
+            weight((16, width, 5120), self.EXPERT_AXES, "gate"),
+            weight((16, 5120, width), self.DOWN_AXES, "down"),
+        )
+
+    def test_replicated_and_intermediate_split(self) -> None:
+        """Whole experts give a whole result; a split intermediate a partial sum."""
+        for placement, expected in (
+            (REPLICATED, REPLICATED),
+            (Shard("intermediate"), Partial()),
+        ):
+            with self.subTest(placement=placement):
+                op = MoeExpertsOp(
+                    operands=self._operands(placement),
+                    apply_router_weight_on_input=True,
+                )
+                self.assertEqual(
+                    op.results[0].type,
+                    TensorType(
+                        shape=(1, 1, 5120),
+                        dtype=DType.BF16,
+                        axes=(*TOKEN_AXES, "hidden"),
+                        placement=expected,
+                    ),
+                )
+
+    def test_rejections(self) -> None:
+        """Mismatched shapes or axes, and an expert-axis split, are rejected."""
+        x, weights, gate, up, down = self._operands()
+        wrong_down = _value((16, 8192, 5120), self.EXPERT_AXES, role=TensorRole.WEIGHT)
+        wrong_axes = _value((1, 1, 16), (*TOKEN_AXES, "router"))
+        split_experts = tuple(
+            _value(
+                (2, *t.type.shape[1:]),
+                t.type.axes,
+                Shard("expert"),
+                t.type.shape,
+                role=TensorRole.WEIGHT,
+            )
+            for t in (gate, up, down)
+        )
+        cases = {
+            "down not transposed": ((x, weights, gate, up, wrong_down), "do not fit"),
+            "routing axis is not the expert axis": (
+                (x, wrong_axes, gate, up, down),
+                "axes",
+            ),
+            "split experts": ((x, weights, *split_experts), "intermediate axis"),
+        }
+        for name, (operands, message) in cases.items():
+            with self.subTest(case=name), self.assertRaisesRegex(ValueError, message):
+                MoeExpertsOp(operands=operands, apply_router_weight_on_input=True)
 
 
 if __name__ == "__main__":

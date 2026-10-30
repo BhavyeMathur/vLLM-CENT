@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import unittest
 
-from vllm_cent.ir.annotate import AnnotateRolesAndAxes, TensorAnnotation
 from vllm_cent.ir.base import Function, Module, Value
-from vllm_cent.ir.passes import PassManager
+from vllm_cent.ir.pass_manager import PassManager
+from vllm_cent.ir.passes import (
+    AnnotateRolesAndAxes,
+    ApplyTensorParallel,
+    TensorAnnotation,
+)
 from vllm_cent.ir.printer import print_module
 from vllm_cent.ir.semantic import LinearOp
 from vllm_cent.ir.types import (
@@ -17,7 +21,7 @@ from vllm_cent.ir.types import (
     TensorType,
     packed_axis,
 )
-from vllm_cent.parallel import ApplyTensorParallel, ParallelPlan
+from vllm_cent.parallel import ParallelPlan
 
 # A tiny attention projection pair: hidden 16 = 4 query heads x head_dim 4.
 # The attention between q_proj and o_proj is left out; it works per head, so

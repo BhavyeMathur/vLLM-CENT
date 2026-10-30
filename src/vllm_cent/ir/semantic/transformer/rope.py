@@ -1,5 +1,4 @@
-"""Rotary position embedding (RoPE) from a precomputed cos/sin table.
-"""
+"""Rotary position embedding (RoPE) from a precomputed cos/sin table."""
 
 from __future__ import annotations
 

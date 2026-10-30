@@ -16,7 +16,7 @@ __all__ = [
 ]
 
 
-@dataclass(frozen = True, eq = False, slots=True)
+@dataclass(frozen=True, eq=False, slots=True)
 class AllReduceOp(Operation):
     """Sum a partial tensor over all tensor-parallel ranks.
 
@@ -47,4 +47,4 @@ class AllReduceOp(Operation):
                 f"{self.NAME}: operand must be a partial sum, "
                 f"got {self.x.type.placement}"
             )
-        return (replace(self.x.type, placement = Replicate()),)
+        return (replace(self.x.type, placement=Replicate()),)

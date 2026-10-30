@@ -1,5 +1,4 @@
-"""Writing new keys or values into a KV cache.
-"""
+"""Writing new keys or values into a KV cache."""
 
 from __future__ import annotations
 

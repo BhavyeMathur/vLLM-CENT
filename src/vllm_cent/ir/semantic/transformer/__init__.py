@@ -18,14 +18,19 @@ tensor parallelism is applied), like the generic semantic ops.
 from .attention import AttentionOp, GqaQKOp, GqaSVOp
 from .heads import MergeHeadsOp, SplitHeadsOp
 from .kv_cache import KvUpdateOp
+from .moe import MoeExpertsOp, TopKSigmoidOp
 from .rope import RopeOp
+from .temperature import AttnTemperatureOp
 
 __all__ = [
     "AttentionOp",
+    "AttnTemperatureOp",
     "GqaQKOp",
     "GqaSVOp",
     "KvUpdateOp",
     "MergeHeadsOp",
+    "MoeExpertsOp",
     "RopeOp",
     "SplitHeadsOp",
+    "TopKSigmoidOp",
 ]
