@@ -29,8 +29,9 @@ class Value:
 class Operation(ABC):
     NAME: ClassVar[str]
     # Exact operand count, or the allowed counts when trailing operands
-    # are optional (e.g. attention's mask).
-    NUM_OPERANDS: ClassVar[int | tuple[int, ...]]
+    # are optional (e.g. attention's mask), or None for any count (e.g. a
+    # loop's carried values).
+    NUM_OPERANDS: ClassVar[int | tuple[int, ...] | None]
 
     name_hint: str | None = field(default=None, kw_only=True)
     operands: tuple[Value, ...]
@@ -75,16 +76,17 @@ class Operation(ABC):
         # could still be changed by the caller after construction.
         object.__setattr__(self, "operands", tuple(self.operands))
 
-        allowed = (
-            self.NUM_OPERANDS
-            if isinstance(self.NUM_OPERANDS, tuple)
-            else (self.NUM_OPERANDS,)
-        )
-        if len(self.operands) not in allowed:
-            raise ValueError(
-                f"{self.NAME} expects {self.NUM_OPERANDS} operands, "
-                f"got {len(self.operands)}"
+        if self.NUM_OPERANDS is not None:
+            allowed = (
+                self.NUM_OPERANDS
+                if isinstance(self.NUM_OPERANDS, tuple)
+                else (self.NUM_OPERANDS,)
             )
+            if len(self.operands) not in allowed:
+                raise ValueError(
+                    f"{self.NAME} expects {self.NUM_OPERANDS} operands, "
+                    f"got {len(self.operands)}"
+                )
 
         result_types = self.infer_result_types()
         results = tuple(Value(type=t) for t in result_types)
@@ -101,6 +103,10 @@ class Operation(ABC):
             for f in fields(self)
             if f.name not in {"name_hint", "operands", "results"}
         }
+
+    def blocks(self) -> tuple[Block, ...]:
+        """Nested blocks of this op, e.g. a loop body; most ops have none."""
+        return ()
 
     def with_operands(self, new_operands: Iterable[Value]) -> Self:
         return replace(self, operands=tuple(new_operands))
@@ -170,6 +176,73 @@ def registered_operations() -> Mapping[str, type[Operation]]:
     return MappingProxyType(_OPERATIONS)
 
 
+def _verify_body(
+    where: str,
+    arguments: tuple[Value, ...],
+    operations: tuple[Operation, ...],
+    results: tuple[Value, ...],
+    visible: frozenset[Value],
+    defined: set[Value],
+) -> None:
+    """Check that a function or block body only uses values it can see.
+
+    A body sees its own arguments, the results of its earlier ops, and the
+    ``visible`` values of the code around it. Values defined inside a nested
+    block stay inside it: the code around the block only sees the results of
+    the op that owns the block.
+
+    Args:
+        where: Names the body in messages, e.g. ``function main``.
+        arguments: Values the body defines on entry.
+        operations: The body's ops, in order.
+        results: Values the body returns or yields.
+        visible: Values of the code around the body at the op that owns it;
+            empty for a function.
+        defined: Every value defined so far anywhere in the function, shared
+            by all bodies, so that no value is defined twice, not even in two
+            different blocks. Updated in place.
+
+    Raises:
+        ValueError: If a value is defined twice, or an op or the body's
+            results use a value the body cannot see.
+    """
+
+    available = set(visible)
+    # Add arguments one at a time: set(arguments) would silently merge an
+    # argument that is listed twice.
+    for argument in arguments:
+        if argument in defined:
+            raise ValueError(f"{where} lists argument %{argument.name} twice")
+        defined.add(argument)
+        available.add(argument)
+
+    for op in operations:
+        # NAME says what kind of op failed; name_hint, when present, says which one.
+        label = op.NAME if op.name_hint is None else f"{op.NAME} ({op.name_hint})"
+        missing = [operand.name for operand in op.operands if operand not in available]
+        if missing:
+            raise ValueError(f"{label} uses unavailable values: {missing}")
+        # A block sees what is defined before its op, not the op's results.
+        for block in op.blocks():
+            _verify_body(
+                f"body of {label}",
+                block.arguments,
+                block.operations,
+                block.results,
+                frozenset(available),
+                defined,
+            )
+        for result in op.results:
+            if result in defined:
+                raise ValueError(f"{label} defines duplicate SSA value %{result.name}")
+            defined.add(result)
+            available.add(result)
+
+    missing_outputs = [value.name for value in results if value not in available]
+    if missing_outputs:
+        raise ValueError(f"{where} returns unavailable values: {missing_outputs}")
+
+
 @dataclass(frozen=True, eq=False, slots=True)
 class Function:
     """One straight-line SSA function."""
@@ -190,6 +263,7 @@ class Function:
         object.__setattr__(self, "results", results)
 
     def defining_op(self, value: Value) -> Operation | None:
+        """Return the top-level op defining ``value``; ops in blocks are not searched."""
         for op in self.operations:
             if value in op.results:
                 return op
@@ -197,38 +271,50 @@ class Function:
         return None
 
     def users(self, value: Value) -> tuple[Operation, ...]:
+        """Return the top-level ops using ``value``; ops in blocks are not searched."""
         return tuple(op for op in self.operations if value in op.operands)
 
     def verify(self) -> None:
-        # Add arguments one at a time: set(self.arguments) would silently merge
-        # an argument that is listed twice.
-        available: set[Value] = set()
-        for argument in self.arguments:
-            if argument in available:
-                raise ValueError(
-                    f"function {self.name} lists argument %{argument.name} twice"
-                )
-            available.add(argument)
+        """Check SSA scoping, including the bodies of nested blocks.
 
-        for op in self.operations:
-            # NAME says what kind of op failed; name_hint, when present, says which one.
-            label = op.NAME if op.name_hint is None else f"{op.NAME} ({op.name_hint})"
-            missing = [
-                operand.name for operand in op.operands if operand not in available
-            ]
-            if missing:
-                raise ValueError(f"{label} uses unavailable values: {missing}")
-            for result in op.results:
-                if result in available:
-                    raise ValueError(
-                        f"{label} defines duplicate SSA value %{result.name}"
-                    )
-                available.add(result)
-        missing_outputs = [
-            value.name for value in self.results if value not in available
-        ]
-        if missing_outputs:
-            raise ValueError(f"function returns unavailable values: {missing_outputs}")
+        Raises:
+            ValueError: If a value is defined twice or used where it is not
+                visible.
+        """
+
+        _verify_body(
+            f"function {self.name}",
+            self.arguments,
+            self.operations,
+            self.results,
+            visible=frozenset(),
+            defined=set(),
+        )
+
+
+@dataclass(frozen=True, eq=False, slots=True)
+class Block:
+    """A sequence of ops with its own arguments and results: a loop body.
+
+    Unlike a Function, a block sees the values of the code around it, so it
+    has no ``verify()`` of its own: ``Function.verify`` checks it together
+    with the enclosing code. The op that owns the block says what the
+    arguments and results mean (see ``Operation.blocks``).
+    """
+
+    arguments: tuple[Value, ...]
+    operations: tuple[Operation, ...]
+    results: tuple[Value, ...]
+
+    def __post_init__(self) -> None:
+        arguments = tuple(self.arguments)
+        object.__setattr__(self, "arguments", arguments)
+
+        operations = tuple(self.operations)
+        object.__setattr__(self, "operations", operations)
+
+        results = tuple(self.results)
+        object.__setattr__(self, "results", results)
 
 
 @dataclass(frozen=True)
@@ -296,7 +382,17 @@ def rebuild_function(
             an op rejects the new operand types, ``rewrite`` emits no op, or
             the last emitted op has a different number of results than the
             original op.
+        NotImplementedError: If an op has nested blocks (e.g. a loop body);
+            no pass rewrites Tile IR yet, and rebuilding only the top-level
+            ops would leave the blocks reading the old values.
     """
+
+    for op in func.operations:
+        if op.blocks():
+            raise NotImplementedError(
+                f"function {func.name}: {op.NAME} has nested blocks, "
+                "which are not rebuilt yet"
+            )
 
     arguments = tuple(new_arguments)
     if len(arguments) != len(func.arguments):

@@ -14,6 +14,17 @@ Example::
       %k = aloi.linear(%x, %w) : tensor<1x1x1024xfp16>
       return %k
     }
+
+An op with nested blocks (``Operation.blocks()``, e.g. a loop body) prints
+each block after its own line, one level deeper: the block's arguments, its
+ops, and the values it yields. Names are unique in the whole function, so a
+name inside a block never hides one outside::
+
+    %acc = tile.for(%acc0) {extent = 4} : tensor<4xbf16> {
+    ^(%k: tensor<int32>, %a: tensor<4xbf16>):
+      %a_1 = test.step(%a, %k) : tensor<4xbf16>
+      yield %a_1
+    }
 """
 
 from __future__ import annotations
@@ -90,7 +101,9 @@ def print_function(function: Function) -> str:
         f"{namer.define(argument, argument.name)}: {format_type(argument.type)}"
         for argument in function.arguments
     )
-    body = [_INDENT + _format_operation(op, namer) for op in function.operations]
+    body = [
+        line for op in function.operations for line in _format_operation(op, namer, 1)
+    ]
     returns = ", ".join(namer.reference(value) for value in function.results)
     return_types = ", ".join(format_type(value.type) for value in function.results)
 
@@ -124,11 +137,35 @@ def value_names(function: Function) -> dict[Value, str]:
         argument: namer.define(argument, argument.name).removeprefix("%")
         for argument in function.arguments
     }
-    for op in function.operations:
+    _name_operations(function.operations, namer, names)
+    return names
+
+
+def _name_operations(
+    operations: tuple[Operation, ...], namer: _Namer, names: dict[Value, str]
+) -> None:
+    """Name the values defined by ``operations`` in the order they print.
+
+    That order is: an op's results, then each of its blocks' arguments and
+    ops. It must stay the same as in ``_format_operation``, or the numbers
+    given to unnamed values would differ from the dump.
+
+    Args:
+        operations: Ops of a function or block, in order.
+        namer: Names of the values defined so far in this function.
+        names: Filled in with each defined value's name (without %).
+    """
+
+    for op in operations:
         for result in op.results:
             hint = result.name if result.name is not None else op.name_hint
             names[result] = namer.define(result, hint).removeprefix("%")
-    return names
+        for block in op.blocks():
+            for argument in block.arguments:
+                names[argument] = namer.define(argument, argument.name).removeprefix(
+                    "%"
+                )
+            _name_operations(block.operations, namer, names)
 
 
 def print_module(module: Module) -> str:
@@ -148,16 +185,22 @@ def print_module(module: Module) -> str:
     return "\n\n".join(sections) + "\n"
 
 
-def _format_operation(op: Operation, namer: _Namer) -> str:
+def _format_operation(op: Operation, namer: _Namer, depth: int) -> list[str]:
     """Format one op as ``%r = name(%a, %b) {attr = v} : type``.
+
+    An op with blocks ends its line with ``{``, then prints each block one
+    level deeper (``^(arguments):``, its ops, ``yield``) and closes with ``}``.
 
     Args:
         op: Operation to format.
         namer: Names of the values defined so far in this function.
+        depth: Indentation level of the op's line.
 
     Returns:
-        The op's line without indentation.
+        The op's lines, indented.
     """
+
+    indent = _INDENT * depth
 
     # Operands are looked up before results are defined: an op can never use
     # its own result, and numbering then follows reading order.
@@ -172,21 +215,40 @@ def _format_operation(op: Operation, namer: _Namer) -> str:
         )
         text += f" {{{formatted}}}"
 
-    if not op.results:
-        return text
+    if op.results:
+        # A result's own name wins; otherwise the op's name_hint names it, so
+        # LinearOp(..., name_hint="q") prints as %q.
+        results = ", ".join(
+            namer.define(
+                result, result.name if result.name is not None else op.name_hint
+            )
+            for result in op.results
+        )
+        result_types = [format_type(result.type) for result in op.results]
+        if len(result_types) == 1:
+            type_text = result_types[0]
+        else:
+            type_text = f"({', '.join(result_types)})"
+        text = f"{results} = {text} : {type_text}"
 
-    # A result's own name wins; otherwise the op's name_hint names it, so
-    # LinearOp(..., name_hint="q") prints as %q.
-    results = ", ".join(
-        namer.define(result, result.name if result.name is not None else op.name_hint)
-        for result in op.results
-    )
-    result_types = [format_type(result.type) for result in op.results]
-    if len(result_types) == 1:
-        type_text = result_types[0]
-    else:
-        type_text = f"({', '.join(result_types)})"
-    return f"{results} = {text} : {type_text}"
+    blocks = op.blocks()
+    if not blocks:
+        return [indent + text]
+
+    lines = [f"{indent}{text} {{"]
+    for block in blocks:
+        arguments = ", ".join(
+            f"{namer.define(argument, argument.name)}: {format_type(argument.type)}"
+            for argument in block.arguments
+        )
+        lines.append(f"{indent}^({arguments}):")
+        for inner in block.operations:
+            lines.extend(_format_operation(inner, namer, depth + 1))
+        yields = ", ".join(namer.reference(value) for value in block.results)
+        # rstrip() keeps a block without results as "yield", not "yield ".
+        lines.append(f"{indent}{_INDENT}yield {yields}".rstrip())
+    lines.append(f"{indent}}}")
+    return lines
 
 
 def _format_attribute(value: object) -> str:

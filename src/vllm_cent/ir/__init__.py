@@ -1,6 +1,7 @@
 """ALOI IR: generic SSA core, semantic dialect, printer, and pass infrastructure."""
 
 from .base import (
+    Block,
     Function,
     Module,
     Operation,
@@ -63,6 +64,7 @@ __all__ = [
     "AnnotateRolesAndAxes",
     "AttentionOp",
     "AttnTemperatureOp",
+    "Block",
     "BroadcastOp",
     "ClonePass",
     "CopyOp",
