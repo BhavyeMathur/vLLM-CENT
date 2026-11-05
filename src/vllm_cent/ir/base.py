@@ -178,9 +178,7 @@ def registered_operations() -> Mapping[str, type[Operation]]:
 
 def _verify_body(
     where: str,
-    arguments: tuple[Value, ...],
-    operations: tuple[Operation, ...],
-    results: tuple[Value, ...],
+    body: Function | Block,
     visible: frozenset[Value],
     defined: set[Value],
 ) -> None:
@@ -193,9 +191,7 @@ def _verify_body(
 
     Args:
         where: Names the body in messages, e.g. ``function main``.
-        arguments: Values the body defines on entry.
-        operations: The body's ops, in order.
-        results: Values the body returns or yields.
+        body: The function or block to check.
         visible: Values of the code around the body at the op that owns it;
             empty for a function.
         defined: Every value defined so far anywhere in the function, shared
@@ -208,15 +204,15 @@ def _verify_body(
     """
 
     available = set(visible)
-    # Add arguments one at a time: set(arguments) would silently merge an
-    # argument that is listed twice.
-    for argument in arguments:
+    # Add arguments one at a time: set(body.arguments) would silently merge
+    # an argument that is listed twice.
+    for argument in body.arguments:
         if argument in defined:
             raise ValueError(f"{where} lists argument %{argument.name} twice")
         defined.add(argument)
         available.add(argument)
 
-    for op in operations:
+    for op in body.operations:
         # NAME says what kind of op failed; name_hint, when present, says which one.
         label = op.NAME if op.name_hint is None else f"{op.NAME} ({op.name_hint})"
         missing = [operand.name for operand in op.operands if operand not in available]
@@ -224,21 +220,14 @@ def _verify_body(
             raise ValueError(f"{label} uses unavailable values: {missing}")
         # A block sees what is defined before its op, not the op's results.
         for block in op.blocks():
-            _verify_body(
-                f"body of {label}",
-                block.arguments,
-                block.operations,
-                block.results,
-                frozenset(available),
-                defined,
-            )
+            _verify_body(f"body of {label}", block, frozenset(available), defined)
         for result in op.results:
             if result in defined:
                 raise ValueError(f"{label} defines duplicate SSA value %{result.name}")
             defined.add(result)
             available.add(result)
 
-    missing_outputs = [value.name for value in results if value not in available]
+    missing_outputs = [value.name for value in body.results if value not in available]
     if missing_outputs:
         raise ValueError(f"{where} returns unavailable values: {missing_outputs}")
 
@@ -282,14 +271,7 @@ class Function:
                 visible.
         """
 
-        _verify_body(
-            f"function {self.name}",
-            self.arguments,
-            self.operations,
-            self.results,
-            visible=frozenset(),
-            defined=set(),
-        )
+        _verify_body(f"function {self.name}", self, frozenset(), set())
 
 
 @dataclass(frozen=True, eq=False, slots=True)
