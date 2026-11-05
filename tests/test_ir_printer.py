@@ -119,7 +119,7 @@ def _block() -> Function:
     query = LinearOp(operands=(norm.results[0], wq), name_hint="q")
     return Function(
         name="block",
-        operands=(x, gamma, wq),
+        arguments=(x, gamma, wq),
         operations=(norm, query),
         results=(query.results[0],),
     )
@@ -229,7 +229,7 @@ class PrintFunctionTest(unittest.TestCase):
         first = Value(type=VECTOR, name="x")
         second = Value(type=VECTOR, name="x")
         function = Function(
-            name="f", operands=(first, second), operations=(), results=(second,)
+            name="f", arguments=(first, second), operations=(), results=(second,)
         )
         self.assertEqual(
             print_function(function),
@@ -243,7 +243,7 @@ class PrintFunctionTest(unittest.TestCase):
 
         empty = Value(type=VECTOR, name="")
         function = Function(
-            name="f", operands=(empty,), operations=(), results=(empty,)
+            name="f", arguments=(empty,), operations=(), results=(empty,)
         )
         self.assertEqual(
             print_function(function),
@@ -256,7 +256,7 @@ class PrintFunctionTest(unittest.TestCase):
         zero = Value(type=VECTOR, name="0")
         split = _Split(operands=(zero,))
         function = Function(
-            name="f", operands=(zero,), operations=(split,), results=split.results
+            name="f", arguments=(zero,), operations=(split,), results=split.results
         )
         self.assertIn("  %1, %2 = test.split(%0)", print_function(function))
 
@@ -268,7 +268,7 @@ class PrintFunctionTest(unittest.TestCase):
         sink = _Sink(operands=(split.results[0],))
         function = Function(
             name="f",
-            operands=(x,),
+            arguments=(x,),
             operations=(split, sink),
             results=(split.results[1],),
         )
@@ -287,7 +287,7 @@ class PrintFunctionTest(unittest.TestCase):
         x = Value(type=VECTOR, name="x")
         op = _Attributes(operands=(x,))
         function = Function(
-            name="f", operands=(x,), operations=(op,), results=op.results
+            name="f", arguments=(x,), operations=(op,), results=op.results
         )
         expected_attributes = (
             '{flag = true, count = 4, ratio = 0.5, label = "say \\"hi\\"", '
@@ -301,7 +301,7 @@ class PrintFunctionTest(unittest.TestCase):
     def test_empty_function(self) -> None:
         """No arguments, no ops, and a bare return."""
 
-        function = Function(name="empty", operands=(), operations=(), results=())
+        function = Function(name="empty", arguments=(), operations=(), results=())
         self.assertEqual(print_function(function), "func @empty() -> () {\n  return\n}")
 
     def test_rejects_undefined_operand(self) -> None:
@@ -309,7 +309,7 @@ class PrintFunctionTest(unittest.TestCase):
 
         stranger = Value(type=VECTOR, name="stranger")
         op = _Split(operands=(stranger,))
-        function = Function(name="f", operands=(), operations=(op,), results=())
+        function = Function(name="f", arguments=(), operations=(op,), results=())
         with self.assertRaisesRegex(ValueError, "stranger"):
             print_function(function)
 
@@ -317,7 +317,7 @@ class PrintFunctionTest(unittest.TestCase):
         """Returning an undefined value is also rejected."""
 
         function = Function(
-            name="f", operands=(), operations=(), results=(Value(type=VECTOR),)
+            name="f", arguments=(), operations=(), results=(Value(type=VECTOR),)
         )
         with self.assertRaises(ValueError):
             print_function(function)
@@ -327,7 +327,7 @@ class PrintFunctionTest(unittest.TestCase):
 
         x = Value(type=VECTOR, name="x")
         op = _Split(operands=(x,))
-        function = Function(name="f", operands=(x,), operations=(op, op), results=())
+        function = Function(name="f", arguments=(x,), operations=(op, op), results=())
         with self.assertRaisesRegex(ValueError, "defined twice"):
             print_function(function)
 
@@ -336,7 +336,7 @@ class PrintFunctionTest(unittest.TestCase):
 
         x = Value(type=VECTOR, name="x")
         op = _Opaque(operands=(x,), thing=object())
-        function = Function(name="f", operands=(x,), operations=(op,), results=())
+        function = Function(name="f", arguments=(x,), operations=(op,), results=())
         with self.assertRaises(TypeError):
             print_function(function)
 
@@ -354,7 +354,7 @@ class PrintModuleTest(unittest.TestCase):
             """Return ``name(x) -> x``."""
 
             x = Value(type=VECTOR, name="x")
-            return Function(name=name, operands=(x,), operations=(), results=(x,))
+            return Function(name=name, arguments=(x,), operations=(), results=(x,))
 
         module = Module(
             name="toy",

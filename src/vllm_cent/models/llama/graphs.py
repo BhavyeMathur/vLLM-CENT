@@ -113,7 +113,7 @@ def build_feed_forward_graph(
     residual = AddOp(operands=(x, *down_projection.results), name_hint=label("output"))
     function = Function(
         name="feed_forward",
-        operands=(x, norm_weight, gate_weight, up_weight, down_weight),
+        arguments=(x, norm_weight, gate_weight, up_weight, down_weight),
         operations=(
             normalize,
             gate_projection,

@@ -76,7 +76,7 @@ class ApplyTensorParallel(FunctionPass):
         """
 
         arguments = [
-            argument for function in module.functions for argument in function.operands
+            argument for function in module.functions for argument in function.arguments
         ]
 
         # Check annotations first. Without axes, every rule would look unused
@@ -124,7 +124,7 @@ class ApplyTensorParallel(FunctionPass):
         """
 
         new_arguments = [
-            self._shard_argument(argument) for argument in function.operands
+            self._shard_argument(argument) for argument in function.arguments
         ]
         return rebuild_function(function, new_arguments, rewrite=_insert_all_reduce)
 

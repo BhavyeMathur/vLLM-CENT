@@ -219,7 +219,7 @@ class FuseAttentionTests(unittest.TestCase):
         sv = GqaSVOp(operands=(softmax.results[0], v))
         source = Function(
             name="main",
-            operands=(q, k, v),
+            arguments=(q, k, v),
             operations=(qk, softmax, sv),
             results=(sv.results[0], softmax.results[0]),
         )
@@ -273,7 +273,7 @@ class FuseAttentionTests(unittest.TestCase):
         sv = GqaSVOp(operands=(softmax.results[0], v))
         source = Function(
             name="main",
-            operands=(q, k, v),
+            arguments=(q, k, v),
             operations=(qk, softmax, sv),
             results=sv.results,
         )
@@ -284,7 +284,7 @@ class FuseAttentionTests(unittest.TestCase):
     def test_returns_the_same_function_without_chains(self) -> None:
         """Nothing to fuse leaves the input function itself, not a rebuilt copy."""
         x = Value(type=TensorType(shape=(2,), dtype=DType.FP32), name="x")
-        source = Function(name="main", operands=(x,), operations=(), results=(x,))
+        source = Function(name="main", arguments=(x,), operations=(), results=(x,))
         self.assertIs(FuseAttention().run_on_function(source), source)
 
 

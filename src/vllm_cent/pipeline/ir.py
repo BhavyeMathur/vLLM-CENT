@@ -365,7 +365,7 @@ def legalize(function: Function, capabilities: CapabilityProfile) -> DeviceGraph
     # Argument names are the compiled program's input names, which callers
     # bind values to. The printer would quietly rename a repeated name (x,
     # x_1) or number a missing one, so require each name to survive as given.
-    for argument in function.operands:
+    for argument in function.arguments:
         if not argument.name or names[argument] != argument.name:
             raise ValueError(
                 f"Function arguments need unique, non-empty names; "
@@ -392,7 +392,7 @@ def legalize(function: Function, capabilities: CapabilityProfile) -> DeviceGraph
     rank = DeviceRankGraph(
         0,
         0,
-        tuple(NameValue(names[value], value.type) for value in function.operands),
+        tuple(NameValue(names[value], value.type) for value in function.arguments),
         tuple(operations),
         tuple(names[value] for value in function.results),
     )
@@ -414,7 +414,7 @@ def _check_backend_types(function: Function, names: dict[Value, str]) -> None:
             to store.
     """
     values = (
-        *function.operands,
+        *function.arguments,
         *(result for op in function.operations for result in op.results),
     )
     # A RoPE position only selects a table row. It is stored as a scalar value,

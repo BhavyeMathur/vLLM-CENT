@@ -57,7 +57,7 @@ def graph(*, fanout: bool = False, shape: tuple[int, ...] = (3,)) -> Function:
     second = AddOp(operands=(first.results[0], y), name_hint="out")
     return Function(
         name="main",
-        operands=(x, y),
+        arguments=(x, y),
         operations=(first, second),
         results=(second.results[0], x) if fanout else second.results,
     )
@@ -228,7 +228,7 @@ class MappingBoundaryTests(unittest.TestCase):
     def test_dead_storage_and_self_add(self) -> None:
         """Self-add reads initialized lanes; later values may reuse expired space."""
         original = graph()
-        x = original.operands[0]
+        x = original.arguments[0]
         double = AddOp(operands=(x, x), name_hint="z")
         single = replace(original, operations=(double,), results=double.results)
         artifact = compile_graph(single, target())
@@ -308,7 +308,7 @@ class MappingBoundaryTests(unittest.TestCase):
     def test_identity_graph_runs_without_instructions(self) -> None:
         """A graph returning an input needs bindings but no device instructions."""
         original = graph()
-        identity = replace(original, operations=(), results=original.operands[:1])
+        identity = replace(original, operations=(), results=original.arguments[:1])
         artifact = compile_graph(identity, target())
         self.assertEqual(artifact.executable.program.instructions, ())
         values = (
@@ -400,7 +400,7 @@ class GraphDataflowTests(unittest.TestCase):
             outputs = tuple(random.sample(names, 4))
             source = Function(
                 name="main",
-                operands=inputs,
+                arguments=inputs,
                 operations=tuple(operations),
                 results=tuple(values[name] for name in outputs),
             )
@@ -417,7 +417,7 @@ class GraphDataflowTests(unittest.TestCase):
     def test_manual_topological_order_is_obeyed(self) -> None:
         """Independent operations can run in either dependency-valid order."""
         source = graph()
-        x, y = source.operands
+        x, y = source.arguments
         first = source.operations[0]
         second = AddOp(operands=(y, x), name_hint="out")
         source = replace(

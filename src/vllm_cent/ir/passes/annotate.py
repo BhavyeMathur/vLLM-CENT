@@ -86,7 +86,7 @@ class AnnotateRolesAndAxes(FunctionPass):
         argument_names = {
             argument.name
             for function in module.functions
-            for argument in function.operands
+            for argument in function.arguments
         }
         unused = sorted(set(self.annotations) - argument_names)
         if unused:
@@ -113,7 +113,7 @@ class AnnotateRolesAndAxes(FunctionPass):
         # looked up, so it counts as missing.
         pairs: list[tuple[Value, TensorAnnotation]] = []
         missing: list[str | None] = []
-        for argument in function.operands:
+        for argument in function.arguments:
             annotation = (
                 None if argument.name is None else self.annotations.get(argument.name)
             )

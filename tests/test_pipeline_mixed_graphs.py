@@ -130,7 +130,7 @@ def _case(
     intermediate = random.choice(values[2:-1])
     results = (inputs[0], intermediate, values[-1])
     graph = Function(
-        name="main", operands=inputs, operations=tuple(operations), results=results
+        name="main", arguments=inputs, operations=tuple(operations), results=results
     )
     names = value_names(graph)
     expected_outputs = tuple(

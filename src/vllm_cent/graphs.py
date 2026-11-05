@@ -95,7 +95,7 @@ def build_attention_graph(
     )
     function = Function(
         name="attention",
-        operands=inputs,
+        arguments=inputs,
         operations=(attention,),
         results=attention.results,
     )

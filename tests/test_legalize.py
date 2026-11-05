@@ -218,7 +218,7 @@ class LowerToDeviceTest(unittest.TestCase):
             "}",
         )
         # The input is not modified: its arguments still have no domain.
-        self.assertIsNone(function.operands[0].type.domain)
+        self.assertIsNone(function.arguments[0].type.domain)
 
     def test_fewest_transfers_then_pnm(self) -> None:
         """Which of pim.ewmul and pnm.mul multiplies a GEMV result ``a``.

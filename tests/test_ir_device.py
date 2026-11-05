@@ -256,7 +256,7 @@ class PNMSoftmaxTest(unittest.TestCase):
         softmax = PNMSoftmaxOp(operands=(x,))
         self.assertNotIsInstance(softmax, Decomposable)
         function = Function(
-            name="main", operands=(x,), operations=(softmax,), results=softmax.results
+            name="main", arguments=(x,), operations=(softmax,), results=softmax.results
         )
         self.assertIs(DecomposeOps().run_on_function(function), function)
 
@@ -294,7 +294,7 @@ class TransferTest(unittest.TestCase):
         x = Value(type=TensorType(shape=(4,), dtype=DType.FP32, domain=PIM), name="x")
         op = DeviceTransferOp(operands=(x,), to=PNM, name_hint="x_pnm")
         function = Function(
-            name="f", operands=(x,), operations=(op,), results=op.results
+            name="f", arguments=(x,), operations=(op,), results=op.results
         )
         self.assertIn(
             "%x_pnm = device.transfer(%x) {to = pnm} : tensor<4xfp32, domain=pnm>",

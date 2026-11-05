@@ -157,7 +157,7 @@ def to_mlir(graph: Function) -> str:
     if any(not isinstance(op, (AddOp, MulOp)) for op in graph.operations):
         raise ValueError("Native MLIR supports only addition and multiplication")
     all_values = (
-        *graph.operands,
+        *graph.arguments,
         *(result for op in graph.operations for result in op.results),
     )
     if any(value.type.dtype is not DType.FP32 for value in all_values):
@@ -176,19 +176,19 @@ def to_mlir(graph: Function) -> str:
             function = func.FuncOp(
                 "main",
                 (
-                    [native_type(value) for value in graph.operands],
+                    [native_type(value) for value in graph.arguments],
                     [native_type(value) for value in graph.results],
                 ),
             )
             # MLIR may print arguments as %arg0, %arg1, etc. Keep the caller's
             # tensor names separately so importing the text recovers them.
             function.attributes["cent.input_names"] = ir.ArrayAttr.get(
-                [ir.StringAttr.get(names[value]) for value in graph.operands]
+                [ir.StringAttr.get(names[value]) for value in graph.arguments]
             )
             block = function.add_entry_block()
             # Keys are IR values (compared by identity), mapped to the native
             # values that stand for them.
-            natives = dict(zip(graph.operands, block.arguments, strict=True))
+            natives = dict(zip(graph.arguments, block.arguments, strict=True))
             # An insertion point tells native builders where new operations go.
             # Function order ensures each operand already exists in the table.
             with ir.InsertionPoint(block):
@@ -331,7 +331,7 @@ def _import_module(ir: ModuleType, module: Module) -> Function:
         else:
             raise ValueError(f"Unsupported MLIR operation: {kind}")
     return Function(
-        name="main", operands=arguments, operations=tuple(operations), results=results
+        name="main", arguments=arguments, operations=tuple(operations), results=results
     )
 
 

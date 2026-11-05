@@ -58,7 +58,7 @@ def _q_o_module() -> Module:
     o_proj = LinearOp(operands=(q_proj.results[0], wo), name_hint="o_proj")
     function = Function(
         name="main",
-        operands=(x, wq, wo),
+        arguments=(x, wq, wo),
         operations=(q_proj, o_proj),
         results=(o_proj.results[0],),
     )
@@ -138,7 +138,7 @@ def _single_projection(out_size: int) -> Module:
     w = Value(type=_type(out_size, HIDDEN), name="w")
     proj = LinearOp(operands=(x, w), name_hint="proj")
     function = Function(
-        name="main", operands=(x, w), operations=(proj,), results=(proj.results[0],)
+        name="main", arguments=(x, w), operations=(proj,), results=(proj.results[0],)
     )
     annotations = {
         "x": TensorAnnotation(TensorRole.ACTIVATION, ("batch", "hidden")),
@@ -299,7 +299,7 @@ class ApplyTensorParallelTest(unittest.TestCase):
         plan = ParallelPlan(tp=4)
         plan.split("out")
         module = PassManager((ApplyTensorParallel(plan),)).run(_single_projection(8))
-        (w,) = (arg for arg in module.get_function("main").operands if arg.name == "w")
+        (w,) = (arg for arg in module.get_function("main").arguments if arg.name == "w")
         self.assertEqual(w.type.shape, (2, HIDDEN))
         self.assertEqual(
             module.get_function("main").results[0].type.placement, Shard("out")

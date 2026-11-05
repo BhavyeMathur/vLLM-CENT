@@ -88,7 +88,7 @@ def function(
         Function containing exactly the supplied pieces.
     """
     return Function(
-        name="main", operands=operands, operations=operations, results=results
+        name="main", arguments=operands, operations=operations, results=results
     )
 
 
@@ -577,7 +577,7 @@ class LegalizeRejectionTests(unittest.TestCase):
         """An operation reading a value that is not defined in the function fails."""
         source = add_function()
         stray = argument("stray", 8, 4)
-        add = AddOp(operands=(stray, source.operands[0]), name_hint="bad")
+        add = AddOp(operands=(stray, source.arguments[0]), name_hint="bad")
         with self.assertRaisesRegex(ValueError, "unavailable"):
             legalize(
                 replace(source, operations=(add,), results=add.results),

@@ -655,7 +655,7 @@ def import_exported_program(program: ExportedProgram, module_name: str) -> Modul
 
     function = Function(
         name="forward",
-        operands=tuple(arguments),
+        arguments=tuple(arguments),
         operations=tuple(operations),
         results=tuple(results),
     )

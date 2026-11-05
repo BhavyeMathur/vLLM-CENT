@@ -56,7 +56,7 @@ def _with_results(graph: Function, *names: str) -> Function:
     by_name = {name: value for value, name in value_names(graph).items()}
     return Function(
         name=graph.name,
-        operands=graph.operands,
+        arguments=graph.arguments,
         operations=graph.operations,
         results=tuple(by_name[name] for name in names),
     )
@@ -165,7 +165,7 @@ class LlamaSemanticGraphTests(unittest.TestCase):
                             v.name: tuple(
                                 random.randrange(-4, 5) / 4 for _ in range(v.type.numel)
                             )
-                            for v in graph.operands
+                            for v in graph.arguments
                         }
                         if run:
                             inputs["x"] = (0.0,) * hidden + inputs["x"][hidden:]
@@ -204,11 +204,11 @@ class LlamaSemanticGraphTests(unittest.TestCase):
         graph = build_feed_forward_graph(model, epsilon=1e-5, block="decoder.ffn")
         graph.verify()
         self.assertEqual(
-            tuple(v.name for v in graph.operands),
+            tuple(v.name for v in graph.arguments),
             ("x", "norm_weight", "gate_weight", "up_weight", "down_weight"),
         )
         self.assertEqual(
-            [v.type.shape for v in graph.operands],
+            [v.type.shape for v in graph.arguments],
             [(3,), (3,), (5, 3), (5, 3), (3, 5)],
         )
         # One operation per step of x + down(SiLU(gate(n)) * up(n)), n = RMSNorm(x).

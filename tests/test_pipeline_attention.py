@@ -39,7 +39,7 @@ def _single_attention(
     """
     results = (*operation.results, *inputs) if preserve else operation.results
     return Function(
-        name="main", operands=inputs, operations=(operation,), results=results
+        name="main", arguments=inputs, operations=(operation,), results=results
     )
 
 
@@ -210,7 +210,7 @@ class AttentionTests(unittest.TestCase):
             )
         with self.assertRaises(ValueError):
             compile_target(replace(artifact.target_ir, reference_workspace=None))
-        q, k, v = graph.operands
+        q, k, v = graph.arguments
         # Missing operands, a one-dimensional mask, and a two-dimensional query
         # are rejected when the operation is built.
         for invalid in (

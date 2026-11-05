@@ -41,7 +41,7 @@ def _graph() -> Function:
     residual = AddOp(operands=(left, right), name_hint="decoder.0.sum")
     return Function(
         name="main",
-        operands=(left, right),
+        arguments=(left, right),
         operations=(residual,),
         results=residual.results,
     )
@@ -118,7 +118,7 @@ class NativeMlirTests(unittest.TestCase):
         product = MulOp(operands=(left, right), name_hint="decoder.0.product")
         graph = Function(
             name="main",
-            operands=(left, right),
+            arguments=(left, right),
             operations=(product,),
             results=product.results,
         )
@@ -152,9 +152,9 @@ class NativeMlirTests(unittest.TestCase):
         graph = from_mlir(text)
         names = value_names(graph)
         self.assertEqual(
-            tuple(names[value] for value in graph.operands), ("arg0", "arg1")
+            tuple(names[value] for value in graph.arguments), ("arg0", "arg1")
         )
-        self.assertEqual(graph.operations[0].operands, graph.operands)
+        self.assertEqual(graph.operations[0].operands, graph.arguments)
         self.assertEqual(graph.operations[0].name_hint, "value0")
         self.assertEqual(tuple(names[value] for value in graph.results), ("value0",))
 
@@ -173,7 +173,7 @@ class NativeMlirTests(unittest.TestCase):
         }"""
         graph = from_mlir(text)
         names = value_names(graph)
-        self.assertEqual(names[graph.operands[0]], "arg0_0")
+        self.assertEqual(names[graph.arguments[0]], "arg0_0")
         self.assertEqual(
             [names[operation.results[0]] for operation in graph.operations],
             ["value0_0", "value0", "arg0"],
@@ -229,9 +229,9 @@ class NativeMlirTests(unittest.TestCase):
         graph = _graph()
         graph = Function(
             name=graph.name,
-            operands=graph.operands,
+            arguments=graph.arguments,
             operations=graph.operations,
-            results=graph.operands[:1],
+            results=graph.arguments[:1],
         )
         optimized = optimize_mlir(to_mlir(graph))
         self.assertNotIn("arith.addf", optimized)
@@ -240,9 +240,9 @@ class NativeMlirTests(unittest.TestCase):
             print_function(
                 Function(
                     name=graph.name,
-                    operands=graph.operands,
+                    arguments=graph.arguments,
                     operations=(),
-                    results=graph.operands[:1],
+                    results=graph.arguments[:1],
                 )
             ),
         )
@@ -262,7 +262,7 @@ class NativeMlirTests(unittest.TestCase):
         norm = RMSNormOp(operands=(left, right), eps=1e-5, name_hint="norm")
         graph = Function(
             name="main",
-            operands=(left, right),
+            arguments=(left, right),
             operations=(norm,),
             results=norm.results,
         )
@@ -351,7 +351,7 @@ class MlirExecutionTests(unittest.TestCase):
         total = AddOp(operands=(product.results[0], left), name_hint="sum")
         graph = Function(
             name="main",
-            operands=(left, right),
+            arguments=(left, right),
             operations=(product, total),
             results=(total.results[0], left),
         )

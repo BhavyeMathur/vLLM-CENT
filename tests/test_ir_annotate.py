@@ -64,7 +64,7 @@ def _block_function(name: str = "main") -> Function:
     proj = LinearOp(operands=(norm.results[0], w), name_hint="proj")
     return Function(
         name=name,
-        operands=(x, gamma, w),
+        arguments=(x, gamma, w),
         operations=(norm, proj),
         results=(proj.results[0],),
     )
@@ -160,7 +160,7 @@ class AnnotateRolesAndAxesTest(unittest.TestCase):
         """An argument without a name cannot be looked up."""
 
         x = Value(type=_type(1, HIDDEN))
-        function = Function(name="main", operands=(x,), operations=(), results=(x,))
+        function = Function(name="main", arguments=(x,), operations=(), results=(x,))
         with self.assertRaisesRegex(ValueError, r"\[None\]"):
             _annotate(Module(name="toy", functions=(function,)), {})
 
@@ -177,14 +177,14 @@ class AnnotateRolesAndAxesTest(unittest.TestCase):
         """Unused keys are checked per module, not per function."""
 
         x = Value(type=_type(1, HIDDEN), name="other_input")
-        helper = Function(name="helper", operands=(x,), operations=(), results=(x,))
+        helper = Function(name="helper", arguments=(x,), operations=(), results=(x,))
         annotations = _block_annotations()
         annotations["other_input"] = TensorAnnotation(
             TensorRole.ACTIVATION, ("batch", "hidden")
         )
         module = Module(name="toy", functions=(_block_function(), helper))
         annotated = _annotate(module, annotations)
-        (other_input,) = annotated.get_function("helper").operands
+        (other_input,) = annotated.get_function("helper").arguments
         self.assertEqual(other_input.type.axes, ("batch", "hidden"))
 
     def test_axes_must_match_argument_rank(self) -> None:
@@ -211,7 +211,7 @@ class AnnotateRolesAndAxesTest(unittest.TestCase):
         x = Value(type=_type(1, HIDDEN), name="x")
         op = _DropsAxes(operands=(x,), name_hint="mystery")
         function = Function(
-            name="main", operands=(x,), operations=(op,), results=(op.results[0],)
+            name="main", arguments=(x,), operations=(op,), results=(op.results[0],)
         )
         annotations = {"x": _block_annotations()["x"]}
         with self.assertRaisesRegex(
@@ -227,7 +227,7 @@ class AnnotateRolesAndAxesTest(unittest.TestCase):
         annotations.clear()
         module = annotate.run(Module(name="toy", functions=(_block_function(),)))
         self.assertEqual(
-            module.get_function("main").operands[0].type.axes, ("batch", "hidden")
+            module.get_function("main").arguments[0].type.axes, ("batch", "hidden")
         )
 
 

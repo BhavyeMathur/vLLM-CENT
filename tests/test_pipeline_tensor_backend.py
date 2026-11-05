@@ -82,7 +82,7 @@ def multiply_graph(*, square: bool = False, preserve: bool = False) -> Function:
     multiply = MulOp(operands=(x, inputs[-1]), name_hint="z")
     return Function(
         name="main",
-        operands=inputs,
+        arguments=inputs,
         operations=(multiply,),
         results=(multiply.results[0], x) if preserve else multiply.results,
     )
@@ -177,7 +177,7 @@ class TensorBackendTests(unittest.TestCase):
         reshape = ReshapeOp(operands=copy.results, shape=(2, 3), name_hint="r")
         graph = Function(
             name="main",
-            operands=(x,),
+            arguments=(x,),
             operations=(copy, reshape),
             results=reshape.results,
         )
@@ -200,7 +200,7 @@ class TensorBackendTests(unittest.TestCase):
         reshape = ReshapeOp(operands=(x,), shape=(3, 2), name_hint="r")
         graph = Function(
             name="main",
-            operands=(x,),
+            arguments=(x,),
             operations=(reshape,),
             results=(reshape.results[0], x),
         )
@@ -230,7 +230,7 @@ class TensorBackendTests(unittest.TestCase):
         add = AddOp(operands=(square.results[0], y), name_hint="z")
         graph = Function(
             name="main",
-            operands=(x, y),
+            arguments=(x, y),
             operations=(copy, reshape, square, add),
             results=(add.results[0], x),
         )

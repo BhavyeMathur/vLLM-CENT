@@ -38,7 +38,7 @@ def _softmax_graph(x: Value, *, preserve: bool) -> Function:
     softmax = SoftmaxOp(operands=(x,), name_hint="out")
     return Function(
         name="main",
-        operands=(x,),
+        arguments=(x,),
         operations=(softmax,),
         results=(*softmax.results, x) if preserve else softmax.results,
     )
@@ -73,7 +73,7 @@ class ActivationTests(unittest.TestCase):
                     )
                     graph = Function(
                         name="main",
-                        operands=(x,),
+                        arguments=(x,),
                         operations=(activation,),
                         results=(
                             (*activation.results, x) if preserve else activation.results
@@ -153,7 +153,7 @@ class ActivationTests(unittest.TestCase):
         )
         graph = Function(
             name="main",
-            operands=(x,),
+            arguments=(x,),
             operations=(operation,),
             results=operation.results,
         )

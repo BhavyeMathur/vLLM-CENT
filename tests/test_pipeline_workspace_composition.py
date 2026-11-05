@@ -85,7 +85,7 @@ class WorkspaceCompositionTests(unittest.TestCase):
         )
         graph = Function(
             name="main",
-            operands=(query, key, value, scale, weight),
+            arguments=(query, key, value, scale, weight),
             operations=(first_attention, norm, linear, last_attention),
             results=(
                 first_attention.results[0],

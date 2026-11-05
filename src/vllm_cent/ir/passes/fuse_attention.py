@@ -157,10 +157,10 @@ class FuseAttention(FunctionPass):
 
         # Rebuild the function, mapping every old value to its replacement.
         arguments = tuple(
-            Value(type=arg.type, name=arg.name) for arg in function.operands
+            Value(type=arg.type, name=arg.name) for arg in function.arguments
         )
         new_values: dict[Value, Value] = dict(
-            zip(function.operands, arguments, strict=True)
+            zip(function.arguments, arguments, strict=True)
         )
         operations: list[Operation] = []
         for op in function.operations:
@@ -206,7 +206,7 @@ class FuseAttention(FunctionPass):
 
         return Function(
             name=function.name,
-            operands=arguments,
+            arguments=arguments,
             operations=tuple(operations),
             results=tuple(new_values[value] for value in function.results),
         )

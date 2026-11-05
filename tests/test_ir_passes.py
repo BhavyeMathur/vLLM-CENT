@@ -42,7 +42,7 @@ def _function(name: str = "main") -> Function:
     second = _Identity(operands=(first.results[0],))
     return Function(
         name=name,
-        operands=(x,),
+        arguments=(x,),
         operations=(first, second),
         results=(second.results[0],),
     )
@@ -73,7 +73,7 @@ def _broken_module(module: Module) -> Module:
         functions=tuple(
             Function(
                 name=function.name,
-                operands=function.operands,
+                arguments=function.arguments,
                 operations=(),
                 results=function.results,
             )
@@ -287,7 +287,7 @@ class FunctionPassTest(unittest.TestCase):
                 seen.append(function.name)
                 return Function(
                     name=function.name + "_renamed",
-                    operands=function.operands,
+                    arguments=function.arguments,
                     operations=function.operations,
                     results=function.results,
                 )
@@ -325,7 +325,7 @@ class ClonePassTest(unittest.TestCase):
 
             ids: set[int] = set()
             for function in module.functions:
-                ids.update(id(value) for value in function.operands)
+                ids.update(id(value) for value in function.arguments)
                 for op in function.operations:
                     ids.update(id(value) for value in op.results)
             return ids

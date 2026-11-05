@@ -175,13 +175,13 @@ class Function:
     """One straight-line SSA function."""
 
     name: str
-    operands: tuple[Value, ...]
+    arguments: tuple[Value, ...]
     operations: tuple[Operation, ...]
     results: tuple[Value, ...]
 
     def __post_init__(self) -> None:
-        operands = tuple(self.operands)
-        object.__setattr__(self, "operands", operands)
+        arguments = tuple(self.arguments)
+        object.__setattr__(self, "arguments", arguments)
 
         operations = tuple(self.operations)
         object.__setattr__(self, "operations", operations)
@@ -200,10 +200,10 @@ class Function:
         return tuple(op for op in self.operations if value in op.operands)
 
     def verify(self) -> None:
-        # Add arguments one at a time: set(self.operands) would silently merge
+        # Add arguments one at a time: set(self.arguments) would silently merge
         # an argument that is listed twice.
         available: set[Value] = set()
-        for argument in self.operands:
+        for argument in self.arguments:
             if argument in available:
                 raise ValueError(
                     f"function {self.name} lists argument %{argument.name} twice"
@@ -298,15 +298,15 @@ def rebuild_function(
             original op.
     """
 
-    new_operands = tuple(new_arguments)
-    if len(new_operands) != len(func.operands):
+    arguments = tuple(new_arguments)
+    if len(arguments) != len(func.arguments):
         raise ValueError(
-            f"function {func.name} has {len(func.operands)} arguments, "
-            f"got {len(new_operands)} replacements"
+            f"function {func.name} has {len(func.arguments)} arguments, "
+            f"got {len(arguments)} replacements"
         )
 
     # Maps every old value (argument or op result) to its replacement.
-    new_map: dict[Value, Value] = dict(zip(func.operands, new_operands, strict=True))
+    new_map: dict[Value, Value] = dict(zip(func.arguments, arguments, strict=True))
 
     new_ops: list[Operation] = []
     for op in func.operations:
@@ -331,7 +331,7 @@ def rebuild_function(
 
     return Function(
         name=func.name,
-        operands=new_operands,
+        arguments=arguments,
         operations=tuple(new_ops),
         # The returns are chosen by the original function, not by the ops:
         # look up the copy of each returned value instead of returning every
@@ -352,5 +352,5 @@ def clone_function(func: Function) -> Function:
 
     return rebuild_function(
         func,
-        (Value(type=operand.type, name=operand.name) for operand in func.operands),
+        (Value(type=argument.type, name=argument.name) for argument in func.arguments),
     )

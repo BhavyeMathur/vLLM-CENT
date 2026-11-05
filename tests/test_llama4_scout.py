@@ -348,7 +348,7 @@ class TensorParallelStructureTest(unittest.TestCase):
         The router has no split axis, so every rank scores all 16 experts.
         """
         function = _sharded_module(ROPE_LAYER, tp=8).get_function("forward")
-        arguments = {a.name: a.type for a in function.operands}
+        arguments = {a.name: a.type for a in function.arguments}
         self.assertEqual(arguments["self_attn.q_proj.weight"].shape, (640, 5120))
         self.assertEqual(arguments["self_attn.k_proj.weight"].shape, (128, 5120))
         self.assertEqual(arguments["feed_forward.router.weight"].placement, Replicate())

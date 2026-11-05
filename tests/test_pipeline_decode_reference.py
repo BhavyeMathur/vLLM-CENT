@@ -95,7 +95,7 @@ def _graph(rows: int, width: int, outputs: int) -> Function:
     square = MulOp(operands=(total, total), name_hint="result")
     return Function(
         name="main",
-        operands=(x, scale, weights, residual),
+        arguments=(x, scale, weights, residual),
         operations=(normalize, project, add, square),
         results=(*square.results, x, normalized),
     )
@@ -155,7 +155,7 @@ class DecodeReferenceTests(unittest.TestCase):
                                     random.randrange(-8, 9) / 4
                                     for _ in range(value.type.numel)
                                 )
-                                for value in graph.operands
+                                for value in graph.arguments
                             }
                             if run:
                                 host["x"] = (0.0,) * width + host["x"][width:]

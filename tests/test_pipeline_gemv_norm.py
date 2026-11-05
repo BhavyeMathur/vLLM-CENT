@@ -63,7 +63,7 @@ def linear_graph() -> Function:
     linear = LinearOp(operands=(x, w), name_hint="out")
     return Function(
         name="main",
-        operands=(x, w),
+        arguments=(x, w),
         operations=(linear,),
         results=(*linear.results, x, w),
     )
@@ -152,7 +152,7 @@ class GemvNormTests(unittest.TestCase):
         norm = RMSNormOp(operands=(x_value, gamma_value), eps=epsilon, name_hint="out")
         graph = Function(
             name="main",
-            operands=(x_value, gamma_value),
+            arguments=(x_value, gamma_value),
             operations=(norm,),
             results=(*norm.results, x_value),
         )
@@ -210,7 +210,7 @@ class GemvNormTests(unittest.TestCase):
         linear = LinearOp(operands=(x_value, w_value), name_hint="out")
         graph = Function(
             name="main",
-            operands=(x_value, w_value),
+            arguments=(x_value, w_value),
             operations=(linear,),
             results=linear.results,
         )
@@ -279,7 +279,7 @@ class GemvNormTests(unittest.TestCase):
         linear = LinearOp(operands=(x_value, w_value), name_hint="out")
         graph = Function(
             name="main",
-            operands=(x_value, w_value),
+            arguments=(x_value, w_value),
             operations=(linear,),
             results=linear.results,
         )
@@ -301,7 +301,7 @@ class GemvNormTests(unittest.TestCase):
         linear = LinearOp(operands=(x_value, w_value), name_hint="out")
         graph = Function(
             name="main",
-            operands=(x_value, w_value),
+            arguments=(x_value, w_value),
             operations=(linear,),
             results=linear.results,
         )

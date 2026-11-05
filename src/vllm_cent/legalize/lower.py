@@ -195,7 +195,7 @@ class LowerToDevice(FunctionPass):
                 type=replace(argument.type, domain=_default_domain(argument.type.role)),
                 name=argument.name,
             )
-            for argument in prepared.operands
+            for argument in prepared.arguments
         )
         moved: _Moved = {}
         lowered = rebuild_function(
@@ -404,7 +404,7 @@ class LowerToDevice(FunctionPass):
             return function
         return Function(
             name=function.name,
-            operands=function.operands,
+            arguments=function.arguments,
             operations=(*function.operations, *transfers),
             results=tuple(results),
         )
@@ -421,7 +421,7 @@ def _require_semantic(function: Function) -> None:
             a device op, i.e. the function was lowered before.
     """
 
-    placed = [a.name for a in function.operands if a.type.domain is not None]
+    placed = [a.name for a in function.arguments if a.type.domain is not None]
     if placed:
         raise ValueError(
             f"{LowerToDevice.NAME}: arguments {placed} of {function.name} "

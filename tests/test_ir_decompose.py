@@ -55,7 +55,7 @@ def _softmax_function(x_type: TensorType) -> Function:
     x = Value(type=x_type, name="x")
     softmax = SoftmaxOp(operands=(x,), name_hint="attn.softmax")
     return Function(
-        name="main", operands=(x,), operations=(softmax,), results=softmax.results
+        name="main", arguments=(x,), operations=(softmax,), results=softmax.results
     )
 
 
@@ -116,7 +116,7 @@ def _unary_function(op_class: type[Operation]) -> Function:
 
     x = Value(type=TensorType(shape=(4,), dtype=DType.FP32), name="x")
     op = op_class(operands=(x,))
-    return Function(name="main", operands=(x,), operations=(op,), results=op.results)
+    return Function(name="main", arguments=(x,), operations=(op,), results=op.results)
 
 
 class SoftmaxDecompositionTest(unittest.TestCase):
@@ -205,7 +205,7 @@ class DecomposeOpsTest(unittest.TestCase):
         w = Value(type=TensorType(shape=(3, 4), dtype=DType.FP32), name="w")
         linear = LinearOp(operands=(x, w))
         plain = Function(
-            name="main", operands=(x, w), operations=(linear,), results=linear.results
+            name="main", arguments=(x, w), operations=(linear,), results=linear.results
         )
         self.assertIs(DecomposeOps().run_on_function(plain), plain)
 
@@ -282,7 +282,7 @@ class SiluDecompositionTest(unittest.TestCase):
         silu = ActivationOp(operands=(x,), function=ActivationKind.SILU)
         gelu = ActivationOp(operands=silu.results, function=ActivationKind.GELU_TANH)
         function = Function(
-            name="main", operands=(x,), operations=(silu, gelu), results=gelu.results
+            name="main", arguments=(x,), operations=(silu, gelu), results=gelu.results
         )
         decomposed = DecomposeOps().run_on_function(function)
         self.assertEqual(

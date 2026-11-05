@@ -111,7 +111,7 @@ def _chain() -> tuple[Function, Value, _Identity, _Identity]:
     second = _Identity(operands=(first.results[0],))
     function = Function(
         name="main",
-        operands=(x,),
+        arguments=(x,),
         operations=(first, second),
         results=(second.results[0],),
     )
@@ -595,13 +595,13 @@ class FunctionTest(unittest.TestCase):
         _, x, first, second = _chain()
         function = Function(
             name="main",
-            operands=[x],  # type: ignore[arg-type]
+            arguments=[x],  # type: ignore[arg-type]
             # A generator can be consumed only once, so storing it unchanged
             # would make the operation list empty on the second iteration.
             operations=(op for op in (first, second)),  # type: ignore[arg-type]
             results=[second.results[0]],  # type: ignore[arg-type]
         )
-        self.assertEqual(function.operands, (x,))
+        self.assertEqual(function.arguments, (x,))
         self.assertEqual(function.operations, (first, second))
         self.assertEqual(function.results, (second.results[0],))
         # Iterating twice proves the generator was materialized.
@@ -620,7 +620,7 @@ class FunctionTest(unittest.TestCase):
         stranger = Value(type=VECTOR, name="stranger")
         op = _Identity(operands=(stranger,))
         function = Function(
-            name="main", operands=(x,), operations=(op,), results=(op.results[0],)
+            name="main", arguments=(x,), operations=(op,), results=(op.results[0],)
         )
         with self.assertRaises(ValueError):
             function.verify()
@@ -631,7 +631,7 @@ class FunctionTest(unittest.TestCase):
         x = Value(type=VECTOR, name="x")
         op = _Identity(operands=(x,))
         function = Function(
-            name="main", operands=(x, x), operations=(op,), results=(op.results[0],)
+            name="main", arguments=(x, x), operations=(op,), results=(op.results[0],)
         )
         with self.assertRaisesRegex(ValueError, "argument %x twice"):
             function.verify()
@@ -648,7 +648,7 @@ class FunctionTest(unittest.TestCase):
             with self.subTest(name_hint=name_hint):
                 op = _Identity(operands=(stranger,), name_hint=name_hint)
                 function = Function(
-                    name="main", operands=(), operations=(op,), results=()
+                    name="main", arguments=(), operations=(op,), results=()
                 )
                 with self.assertRaisesRegex(ValueError, expected):
                     function.verify()
@@ -659,7 +659,7 @@ class FunctionTest(unittest.TestCase):
         _, x, first, second = _chain()
         function = Function(
             name="main",
-            operands=(x,),
+            arguments=(x,),
             operations=(second, first),
             results=(second.results[0],),
         )
@@ -672,7 +672,7 @@ class FunctionTest(unittest.TestCase):
         _, x, first, _ = _chain()
         function = Function(
             name="main",
-            operands=(x,),
+            arguments=(x,),
             operations=(first, first),
             results=(first.results[0],),
         )
@@ -685,7 +685,7 @@ class FunctionTest(unittest.TestCase):
         _, x, first, _ = _chain()
         function = Function(
             name="main",
-            operands=(x,),
+            arguments=(x,),
             operations=(first,),
             results=(Value(type=VECTOR, name="stranger"),),
         )
@@ -709,7 +709,7 @@ class FunctionTest(unittest.TestCase):
         total = _Add(operands=(left.results[0], right.results[0]))
         function = Function(
             name="main",
-            operands=(x,),
+            arguments=(x,),
             operations=(left, right, total),
             results=(total.results[0],),
         )
@@ -760,7 +760,7 @@ class ModuleTest(unittest.TestCase):
         _, x, first, _ = _chain()
         broken = Function(
             name="broken",
-            operands=(x,),
+            arguments=(x,),
             operations=(first,),
             results=(Value(type=VECTOR, name="stranger"),),
         )
@@ -794,7 +794,7 @@ def _all_values(function: Function) -> list[Value]:
         Arguments followed by each operation's results.
     """
 
-    values = list(function.operands)
+    values = list(function.arguments)
     for op in function.operations:
         values.extend(op.results)
     return values
@@ -819,7 +819,7 @@ class CloneFunctionTest(unittest.TestCase):
             [value.type for value in _all_values(clone)],
             [value.type for value in _all_values(original)],
         )
-        self.assertEqual(clone.operands[0].name, "x")
+        self.assertEqual(clone.arguments[0].name, "x")
 
     def test_clone_shares_no_values_with_original(self) -> None:
         """Every argument, result, and return is a brand-new object."""
@@ -837,7 +837,7 @@ class CloneFunctionTest(unittest.TestCase):
         original, *_ = _chain()
         clone = clone_function(original)
         first, second = clone.operations
-        self.assertIs(first.operands[0], clone.operands[0])
+        self.assertIs(first.operands[0], clone.arguments[0])
         self.assertIs(second.operands[0], first.results[0])
         self.assertIs(clone.results[0], second.results[0])
 
@@ -846,7 +846,7 @@ class CloneFunctionTest(unittest.TestCase):
 
         original, x, first, second = _chain()
         clone_function(original)
-        self.assertEqual(original.operands, (x,))
+        self.assertEqual(original.arguments, (x,))
         self.assertEqual(original.operations, (first, second))
         self.assertEqual(original.results, (second.results[0],))
         original.verify()
@@ -858,7 +858,7 @@ class CloneFunctionTest(unittest.TestCase):
         scale = _Scale(operands=(x,), factor=3.0)
         original = Function(
             name="main",
-            operands=(x,),
+            arguments=(x,),
             operations=(scale,),
             results=(scale.results[0],),
         )
@@ -881,7 +881,7 @@ class RebuildFunctionTest(unittest.TestCase):
         rebuilt = rebuild_function(original, (new_x,))
 
         rebuilt.verify()
-        self.assertIs(rebuilt.operands[0], new_x)
+        self.assertIs(rebuilt.arguments[0], new_x)
         first, second = rebuilt.operations
         self.assertIs(first.operands[0], new_x)
         # _Identity passes its operand type through, so both results and the
@@ -897,7 +897,7 @@ class RebuildFunctionTest(unittest.TestCase):
         rebuild_function(
             original, (Value(type=TensorType(shape=(1, 8), dtype=DType.FP16)),)
         )
-        self.assertEqual(original.operands, (x,))
+        self.assertEqual(original.arguments, (x,))
         self.assertEqual(original.operations, (first, second))
         self.assertEqual(second.results[0].type, VECTOR)
 
@@ -918,7 +918,7 @@ class RebuildFunctionTest(unittest.TestCase):
         add = _Add(operands=(lhs, rhs))
         original = Function(
             name="main",
-            operands=(lhs, rhs),
+            arguments=(lhs, rhs),
             operations=(add,),
             results=(add.results[0],),
         )
@@ -952,7 +952,7 @@ def _scale_then_identity() -> Function:
     identity = _Identity(operands=(scale.results[0],))
     return Function(
         name="main",
-        operands=(x,),
+        arguments=(x,),
         operations=(scale, identity),
         results=(identity.results[0],),
     )
@@ -968,7 +968,7 @@ def _fresh_arguments(function: Function) -> list[Value]:
         New values with the same types and names.
     """
 
-    return [Value(type=arg.type, name=arg.name) for arg in function.operands]
+    return [Value(type=arg.type, name=arg.name) for arg in function.arguments]
 
 
 class RebuildFunctionRewriteTest(unittest.TestCase):

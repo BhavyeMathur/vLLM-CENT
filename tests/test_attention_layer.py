@@ -94,13 +94,13 @@ def _oracle(
     Returns:
         Flattened output retaining batch and query-head dimensions.
     """
-    batch, heads, queries, width = graph.operands[0].type.shape
-    _, kv_heads, keys, _ = graph.operands[1].type.shape
-    value_width = graph.operands[2].type.shape[-1]
+    batch, heads, queries, width = graph.arguments[0].type.shape
+    _, kv_heads, keys, _ = graph.arguments[1].type.shape
+    value_width = graph.arguments[2].type.shape[-1]
     factor = 1 / math.sqrt(width) if scale is None else scale
     output: list[float] = []
     mask = data.get("mask")
-    full_mask = len(graph.operands) == 4 and graph.operands[3].type.rank == 4
+    full_mask = len(graph.arguments) == 4 and graph.arguments[3].type.rank == 4
     for b in range(batch):
         for h in range(heads):
             kv_head = h // (heads // kv_heads)
@@ -195,9 +195,9 @@ class AttentionLayerTests(unittest.TestCase):
                 # can check that attention scratch never overwrites an input.
                 graph = Function(
                     name=graph.name,
-                    operands=graph.operands,
+                    arguments=graph.arguments,
                     operations=graph.operations,
-                    results=(*graph.results, *graph.operands[:3]),
+                    results=(*graph.results, *graph.arguments[:3]),
                 )
                 names = value_names(graph)
                 for burst, mapping in ((1, None), (2, _manual(graph)), (4, None)):
@@ -209,7 +209,7 @@ class AttentionLayerTests(unittest.TestCase):
                                     random.randrange(-6, 7) / 4
                                     for _ in range(v.type.numel)
                                 )
-                                for v in graph.operands
+                                for v in graph.arguments
                             }
                             if mask_shape is not None:
                                 # Key zero stays available, so even the first
@@ -299,7 +299,7 @@ class AttentionLayerTests(unittest.TestCase):
     def test_attention_composes_with_producers_and_residual_consumers(self) -> None:
         """Consume a computed query and preserve attention output through an addition."""
         base = build_attention_graph((1, 2, 2, 3), (1, 1, 3, 3), (1, 1, 3, 3))
-        query, key, value = base.operands
+        query, key, value = base.arguments
         delta = Value(type=query.type, name="delta")
         residual = Value(type=base.results[0].type, name="residual")
         prepare_query = AddOp(operands=(query, delta), name_hint="prepared")
@@ -313,14 +313,14 @@ class AttentionLayerTests(unittest.TestCase):
         add_residual = AddOp(operands=(attend.results[0], residual), name_hint="output")
         graph = Function(
             name="main",
-            operands=(query, key, value, delta, residual),
+            arguments=(query, key, value, delta, residual),
             operations=(prepare_query, attend, add_residual),
             results=(add_residual.results[0], attend.results[0], query),
         )
         names = value_names(graph)
         data = {
             names[v]: tuple((i % 7 - 3) / 4 for i in range(v.type.numel))
-            for v in graph.operands
+            for v in graph.arguments
         }
         adjusted = dict(data)
         adjusted["query"] = tuple(

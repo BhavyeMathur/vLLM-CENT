@@ -89,7 +89,7 @@ class DecomposeOps(FunctionPass):
             # and names, as clone_function does.
             arguments = tuple(
                 Value(type=argument.type, name=argument.name)
-                for argument in function.operands
+                for argument in function.arguments
             )
             function = rebuild_function(function, arguments, rewrite=self._rewrite)
         remaining = self._remaining(function)

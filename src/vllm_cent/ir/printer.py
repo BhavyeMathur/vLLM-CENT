@@ -88,7 +88,7 @@ def print_function(function: Function) -> str:
 
     arguments = ", ".join(
         f"{namer.define(argument, argument.name)}: {format_type(argument.type)}"
-        for argument in function.operands
+        for argument in function.arguments
     )
     body = [_INDENT + _format_operation(op, namer) for op in function.operations]
     returns = ", ".join(namer.reference(value) for value in function.results)
@@ -122,7 +122,7 @@ def value_names(function: Function) -> dict[Value, str]:
     # The namer returns printed references such as "%q_proj"; drop the "%".
     names = {
         argument: namer.define(argument, argument.name).removeprefix("%")
-        for argument in function.operands
+        for argument in function.arguments
     }
     for op in function.operations:
         for result in op.results:

@@ -833,7 +833,7 @@ def _print_one(op: Operation) -> str:
     """
 
     function = Function(
-        name="f", operands=op.operands, operations=(op,), results=op.results
+        name="f", arguments=op.operands, operations=(op,), results=op.results
     )
     return print_function(function).splitlines()[1].strip()
 
