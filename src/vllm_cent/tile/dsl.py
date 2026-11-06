@@ -34,12 +34,23 @@ from ..device.spec import DeviceSpec
 from ..ir.base import Block, Function, Operation, Value
 from ..ir.tile import (
     INDEX,
+    CentCopyBkGbOp,
+    CentCopyGbBkOp,
+    CentEwaddOp,
+    CentEwmulOp,
+    CentGbConcatOp,
     CentMacAbkOp,
+    CentMacBkBkOp,
+    CentPnmOp,
+    CentRdAfOp,
     CentRdMacOp,
+    CentRdMemOp,
+    CentSyncOp,
     CentTensorType,
     CentWrBiasOp,
     CentWrBiasZeroOp,
     CentWrGbOp,
+    CentWrMemOp,
     TileConstOp,
     TileForOp,
 )
@@ -310,6 +321,18 @@ class TileKernel:
         self._layouts[value] = layout
         return layout
 
+    def layout_of(self, tensor: TileValue) -> PhysicalLayout:
+        """The layout of the kernel tensor that holds ``tensor``.
+
+        Before ``build``, its ``base`` is the one ``bind_layout`` fixed, or 0
+        if ``build`` is to place it; the built kernel's layouts have them all.
+
+        Raises:
+            ValueError: If it is no DRAM or Shared Buffer tensor, or has no
+                layout yet.
+        """
+        return self._layout_of(self._own(tensor))
+
     def all_channels(self) -> tuple[int, ...]:
         """The channel mask that selects every channel of the device."""
         return tuple(range(self.arch.channels))
@@ -458,6 +481,220 @@ class TileKernel:
             name_hint=hint,
         )
         return self._emit(op, root=ref.tensor.root, hint=hint)
+
+    def rd_af(
+        self,
+        acc: TileValue,
+        *,
+        into: TileValue | TileRef,
+        channels: Sequence[int],
+        name: str | None = None,
+    ) -> TileValue:
+        """Activate the MAC registers and save the results (``AF``, ``RD_AF``).
+
+        Returns:
+            The new version of the tensor ``into`` names.
+        """
+
+        ref = self._ref(into)
+        hint = name or ref.tensor.hint
+        op = CentRdAfOp(
+            operands=(self._own(acc).value, ref.tensor.value, *ref.indices),
+            channels=tuple(channels),
+            at=ref.at,
+            name_hint=hint,
+        )
+        return self._emit(op, root=ref.tensor.root, hint=hint)
+
+    def wr_mem(
+        self,
+        src: TileValue,
+        *,
+        into: TileValue,
+        start: Sequence[int] | None = None,
+        name: str | None = None,
+    ) -> TileValue:
+        """Write a Shared Buffer tensor into DRAM with ordinary writes (``W MEM``).
+
+        Args:
+            src: The Shared Buffer tensor written.
+            into: The DRAM tensor written to.
+            start: Where ``src`` starts in ``into``, aligned to its last
+                dimensions; the origin by default.
+            name: The name the result prints with.
+
+        Returns:
+            The new version of ``into``.
+        """
+
+        dst = self._own(into)
+        op = CentWrMemOp(
+            operands=(self._own(src).value, dst.value),
+            start=tuple(start) if start is not None else (0,) * dst.type.rank,
+            name_hint=name or dst.hint,
+        )
+        return self._emit(op, root=dst.root, hint=name or dst.hint)
+
+    def rd_mem(
+        self,
+        src: TileValue,
+        *,
+        into: TileValue,
+        start: Sequence[int] | None = None,
+        name: str | None = None,
+    ) -> TileValue:
+        """Read DRAM into a Shared Buffer tensor with ordinary reads (``R MEM``).
+
+        Returns:
+            The new version of ``into``.
+        """
+
+        dst = self._own(into)
+        source = self._own(src)
+        op = CentRdMemOp(
+            operands=(source.value, dst.value),
+            start=tuple(start) if start is not None else (0,) * source.type.rank,
+            name_hint=name or dst.hint,
+        )
+        return self._emit(op, root=dst.root, hint=name or dst.hint)
+
+    def mac_bk_bk(
+        self,
+        a: TileValue,
+        b: TileValue,
+        acc: TileValue,
+        *,
+        channels: Sequence[int],
+        name: str | None = None,
+    ) -> TileValue:
+        """Multiply-accumulate banks ``2b`` (``a``) and ``2b + 1`` (``b``)."""
+
+        hint = name or self._own(acc).hint or "acc"
+        op = CentMacBkBkOp(
+            operands=(self._own(a).value, self._own(b).value, self._own(acc).value),
+            channels=tuple(channels),
+            name_hint=hint,
+        )
+        return self._emit(op, hint=hint)
+
+    def ewmul(
+        self,
+        a: TileValue,
+        b: TileValue,
+        *,
+        into: TileValue,
+        channels: Sequence[int],
+        name: str | None = None,
+    ) -> TileValue:
+        """Multiply banks ``4b`` (``a``) and ``4b + 1`` (``b``) into ``4b + 2``.
+
+        Returns:
+            The new version of ``into``.
+        """
+
+        out = self._own(into)
+        op = CentEwmulOp(
+            operands=(self._own(a).value, self._own(b).value, out.value),
+            channels=tuple(channels),
+            name_hint=name or out.hint,
+        )
+        return self._emit(op, root=out.root, hint=name or out.hint)
+
+    def copy_bkgb(
+        self,
+        src: TileValue,
+        *,
+        bank: int,
+        channels: Sequence[int],
+        name: str | None = None,
+    ) -> TileValue:
+        """Copy bank ``bank`` of ``src``'s row into the Global Buffers."""
+
+        source = self._own(src)
+        layout = self._layout_of(source)
+        values = prod(rf.extent for rf in layout.column_factors)
+        op = CentCopyBkGbOp(
+            operands=(source.value,),
+            channels=tuple(channels),
+            bank=bank,
+            shape=(values,),
+            name_hint=name or "gb",
+        )
+        return self._emit(op, hint=name or "gb")
+
+    def copy_gbbk(
+        self,
+        gb: TileValue,
+        *,
+        into: TileValue,
+        bank: int,
+        channels: Sequence[int],
+        name: str | None = None,
+    ) -> TileValue:
+        """Copy the Global Buffers into bank ``bank`` of ``into``'s row.
+
+        Returns:
+            The new version of ``into``.
+        """
+
+        out = self._own(into)
+        op = CentCopyGbBkOp(
+            operands=(self._own(gb).value, out.value),
+            channels=tuple(channels),
+            bank=bank,
+            name_hint=name or out.hint,
+        )
+        return self._emit(op, root=out.root, hint=name or out.hint)
+
+    def sync(self) -> None:
+        """Wait for every issued command (``SYNC``)."""
+        self._record(CentSyncOp(operands=()))
+
+    def ewadd(
+        self, a: TileValue, b: TileValue, *, name: str | None = None
+    ) -> TileValue:
+        """Add ``b`` into ``a`` in the Shared Buffer (``EWADD``).
+
+        Returns:
+            The new version of ``a``.
+        """
+
+        first = self._own(a)
+        op = CentEwaddOp(
+            operands=(first.value, self._own(b).value), name_hint=name or first.hint
+        )
+        return self._emit(op, root=first.root, hint=name or first.hint)
+
+    def gb_concat(self, *gbs: TileValue, name: str | None = None) -> TileValue:
+        """Global Buffer tiles of disjoint channels, as one operand of a MAC."""
+
+        op = CentGbConcatOp(
+            operands=tuple(self._own(gb).value for gb in gbs), name_hint=name or "gb"
+        )
+        return self._emit(op, hint=name or "gb")
+
+    def pnm(
+        self,
+        kind: str,
+        *inputs: TileValue,
+        into: TileValue,
+        cycles: float,
+        name: str | None = None,
+    ) -> TileValue:
+        """PNM work CENT models analytically: a trace comment with ``cycles``.
+
+        Returns:
+            The new version of ``into``.
+        """
+
+        out = self._own(into)
+        op = CentPnmOp(
+            operands=(*(self._own(v).value for v in inputs), out.value),
+            kind=kind,
+            cycles=cycles,
+            name_hint=name or out.hint,
+        )
+        return self._emit(op, root=out.root, hint=name or out.hint)
 
     def returns(self, *values: TileValue) -> None:
         """Set the kernel's results.

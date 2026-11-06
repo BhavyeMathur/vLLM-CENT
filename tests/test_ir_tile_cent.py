@@ -280,6 +280,7 @@ class CentOpTypeTest(unittest.TestCase):
             )
         )
         three = (0, 1, 2)
+        small_acc = _value("small_acc", MemorySpace.PIM_MAC, (3, 16))
         cases = (
             # wr_bias
             (
@@ -353,9 +354,10 @@ class CentOpTypeTest(unittest.TestCase):
                 ),
             ),
             (
-                "MAC registers of 3 channels",
+                # A MAC may update some of the registers' channels, not more.
+                "MAC registers of 4 channels",
                 lambda: CentMacAbkOp(
-                    operands=(v.w, v.gb, v.acc), channels=three, at=()
+                    operands=(v.w, v.gb, small_acc), channels=CHANNELS, at=()
                 ),
             ),
             # rd_mac

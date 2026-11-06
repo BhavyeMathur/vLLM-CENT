@@ -1,25 +1,47 @@
 """Tile IR: structured loops over tiles, below Device IR."""
 
 from .cent import (
+    CentCopyBkGbOp,
+    CentCopyGbBkOp,
+    CentEwaddOp,
+    CentEwmulOp,
+    CentGbConcatOp,
     CentMacAbkOp,
+    CentMacBkBkOp,
+    CentPnmOp,
+    CentRdAfOp,
     CentRdMacOp,
+    CentRdMemOp,
+    CentSyncOp,
     CentTensorType,
     CentTileOp,
     CentWrBiasOp,
     CentWrBiasZeroOp,
     CentWrGbOp,
+    CentWrMemOp,
 )
 from .tile import INDEX, TileConstOp, TileForOp
 
 __all__ = [
     "INDEX",
+    "CentCopyBkGbOp",
+    "CentCopyGbBkOp",
+    "CentEwaddOp",
+    "CentEwmulOp",
+    "CentGbConcatOp",
     "CentMacAbkOp",
+    "CentMacBkBkOp",
+    "CentPnmOp",
+    "CentRdAfOp",
     "CentRdMacOp",
+    "CentRdMemOp",
+    "CentSyncOp",
     "CentTensorType",
     "CentTileOp",
     "CentWrBiasOp",
     "CentWrBiasZeroOp",
     "CentWrGbOp",
+    "CentWrMemOp",
     "TileConstOp",
     "TileForOp",
 ]

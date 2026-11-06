@@ -8,6 +8,16 @@ The records follow CENT's own trace generator
     AiM WR_BIAS <GPR> <channel_mask>
     AiM MAC_ABK <OPsize> <channel_mask> <row>
     AiM RD_MAC <GPR> <channel_mask>
+    AiM AF <channel_mask>
+    AiM RD_AF <GPR> <channel_mask>
+    AiM EWMUL <OPsize> <channel_mask> <row>
+    AiM COPY_BKGB <OPsize> <channel_mask> <bank> <row>
+    AiM COPY_GBBK <OPsize> <channel_mask> <bank> <row>
+    AiM EWADD <OPsize> <GPR> <GPR>
+    AiM SYNC
+    W MEM <channel> <bank> <row>
+    R MEM <channel> <bank> <row>
+    # <comment>
     AiM EOC
 
 Two differences from CENT's generator, neither of which changes timing:
@@ -17,9 +27,11 @@ Two differences from CENT's generator, neither of which changes timing:
 - The trace starts with ``W CFR 0 1``: configuration register 0
   (``broadcast``) set to 1 selects the Global Buffer as the second MAC
   operand (AiM simulator README and ``test/all_isr.trace``; its GEMV traces
-  start the same way). CENT's generator leaves it at the simulator's
-  default. Every ``MAC_ABK`` here reads the Global Buffer, so it is written
-  once.
+  start the same way); a MAC between neighbor banks sets it to 0 and back.
+  CENT's generator writes no CFR. The AiM simulator's timing does not
+  depend on it.
+- PNM work that CENT models analytically appears as a comment with its
+  cycles; comments also name the Device IR op each kernel runs.
 
 The channel mask puts channel 0 in the most significant of 32 bits, as both
 CENT's generator and the backend's ``render_aim_channel_mask`` do.
@@ -37,14 +49,28 @@ from ..cent.aim import (
     render_aim_channel_mask,
 )
 from ..cent.instructions import (
-    CentInstruction,
+    ApplyActivation,
+    CopyBankToGlobalBuffer,
+    CopyGlobalBufferToBank,
+    ElementwiseMultiply,
     MacAllBanks,
+    ReadActivation,
     ReadMac,
     WriteBias,
     WriteGlobalBuffer,
 )
 from ..device.cent import CentArchitecture
-from .expand import ChannelIssue, backend_hardware, iter_instructions
+from .expand import (
+    ChannelIssue,
+    Comment,
+    ConfigWrite,
+    ElementwiseAdd,
+    MemAccess,
+    Sync,
+    TraceInstruction,
+    backend_hardware,
+    iter_instructions,
+)
 from .kernel import CentKernel
 
 __all__ = [
@@ -60,7 +86,7 @@ __all__ = [
 MAC_FROM_GLOBAL_BUFFER = "W CFR 0 1"
 
 
-def render_aim_record(instruction: CentInstruction) -> str:
+def render_aim_record(instruction: TraceInstruction) -> str:
     """Render one instruction as one AiM trace record.
 
     Raises:
@@ -82,6 +108,39 @@ def render_aim_record(instruction: CentInstruction) -> str:
     if isinstance(instruction, ReadMac):
         mask = render_aim_channel_mask(instruction.channels)
         return f"AiM RD_MAC {instruction.destination.slot} {mask}"
+    if isinstance(instruction, ApplyActivation):
+        return f"AiM AF {render_aim_channel_mask(instruction.channels)}"
+    if isinstance(instruction, ReadActivation):
+        mask = render_aim_channel_mask(instruction.channels)
+        return f"AiM RD_AF {instruction.destination.slot} {mask}"
+    if isinstance(instruction, ElementwiseMultiply):
+        mask = render_aim_channel_mask(instruction.channels)
+        return f"AiM EWMUL {instruction.operation_size} {mask} {instruction.row}"
+    if isinstance(instruction, (CopyBankToGlobalBuffer, CopyGlobalBufferToBank)):
+        mask = render_aim_channel_mask(instruction.channels)
+        name = (
+            "COPY_BKGB"
+            if isinstance(instruction, CopyBankToGlobalBuffer)
+            else "COPY_GBBK"
+        )
+        return (
+            f"AiM {name} {instruction.operation_size} {mask} "
+            f"{instruction.bank} {instruction.row}"
+        )
+    if isinstance(instruction, MemAccess):
+        kind = "W" if instruction.write else "R"
+        return f"{kind} MEM {instruction.channel} {instruction.bank} {instruction.row}"
+    if isinstance(instruction, Sync):
+        return "AiM SYNC"
+    if isinstance(instruction, ElementwiseAdd):
+        return (
+            f"AiM EWADD {instruction.operation_size} {instruction.first} "
+            f"{instruction.second}"
+        )
+    if isinstance(instruction, ConfigWrite):
+        return f"W CFR {instruction.register} {instruction.value}"
+    if isinstance(instruction, Comment):
+        return f"# {instruction.text}"
     raise AimSimulatorCompatibilityError(
         f"no AiM trace record for {type(instruction).__name__}"
     )

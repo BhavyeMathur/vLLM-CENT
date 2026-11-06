@@ -57,6 +57,7 @@ all channels and banks.
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from math import prod
@@ -71,6 +72,7 @@ __all__ = [
     "Bank",
     "Channel",
     "Column",
+    "ColumnBlock",
     "DramElement",
     "DramTile",
     "Factor",
@@ -144,7 +146,30 @@ class Channel:
 
 @dataclass(frozen=True, slots=True)
 class Bank:
-    """The banks within one DRAM channel (``arch.banks_per_channel``)."""
+    """The banks within one DRAM channel.
+
+    ``Bank()`` spans every bank (``arch.banks_per_channel``).
+    ``Bank(every=k, offset=g)`` spans member ``g`` of each group of ``k``
+    neighboring banks: coordinate ``b`` is bank ``k * b + g``. CENT keeps
+    elementwise operands this way: ``EWMUL`` multiplies banks ``4b`` and
+    ``4b + 1`` into ``4b + 2``, and a MAC between neighbors pairs ``2b`` with
+    ``2b + 1``.
+    """
+
+    every: int = 1
+    offset: int = 0
+
+    def __post_init__(self) -> None:
+        """Reject a group below 1 or an offset outside it."""
+        if self.every < 1 or not 0 <= self.offset < self.every:
+            raise ValueError(
+                f"Bank needs every >= 1 and 0 <= offset < every, got "
+                f"every={self.every}, offset={self.offset}"
+            )
+
+    def bank(self, coord: int) -> int:
+        """The bank in a channel that coordinate ``coord`` names."""
+        return self.every * coord + self.offset
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,7 +248,31 @@ class Mac:
             raise ValueError(f"Mac extent must be at least 1, got {self.extent}")
 
 
-Factor = Serial | Row | Channel | Bank | Column | Mac | Slot | Lane
+@dataclass(frozen=True, slots=True)
+class ColumnBlock:
+    """A named index factor that selects a block of columns within a row.
+
+    Where ``Serial``/``Row`` select the DRAM row of a tile, a column block
+    puts several tiles side by side in one row: the index adds
+    ``index * (columns of one tile)`` to the column address. CENT keeps eight
+    128-value keys per 1024-value row this way.
+    """
+
+    name: str
+    extent: int
+
+    def __post_init__(self) -> None:
+        """Reject an empty name or an extent below 1."""
+        if not self.name:
+            raise ValueError("ColumnBlock factor name must not be empty")
+        if self.extent < 1:
+            raise ValueError(
+                f"ColumnBlock({self.name!r}) extent must be at least 1, got "
+                f"{self.extent}"
+            )
+
+
+Factor = Serial | Row | Channel | Bank | Column | ColumnBlock | Mac | Slot | Lane
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,13 +339,13 @@ class ResolvedFactor:
 
     @property
     def is_index(self) -> bool:
-        """Whether this factor is selected by a loop index (``Serial`` or ``Row``)."""
-        return isinstance(self.factor, (Serial, Row))
+        """Whether an index selects this factor (``Serial``, ``Row``, ``ColumnBlock``)."""
+        return isinstance(self.factor, (Serial, Row, ColumnBlock))
 
     @property
     def name(self) -> str | None:
-        """The index name for ``Serial``/``Row``, or ``None`` for tile factors."""
-        if isinstance(self.factor, (Serial, Row)):
+        """The index name of an index factor, or ``None`` for tile factors."""
+        if isinstance(self.factor, (Serial, Row, ColumnBlock)):
             return self.factor.name
         return None
 
@@ -307,10 +356,15 @@ class ResolvedFactor:
 
 @dataclass(frozen=True, slots=True)
 class DramTile:
-    """Physical location of one DRAM tile across all selected channels and banks."""
+    """Physical location of one DRAM tile across all selected channels and banks.
+
+    ``opsize`` covers the bank with the most elements; a partial tile may
+    hold fewer in some channels (``PhysicalLayout.channel_opsizes``).
+    """
 
     row: int
     opsize: int
+    column: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -398,6 +452,25 @@ class PhysicalLayout:
         return first_slot - self.first_channel
 
     @property
+    def numbered_factors(self) -> tuple[ResolvedFactor, ...]:
+        """The index factors that number tiles: ``Serial`` and ``Row``."""
+        return tuple(rf for rf in self.factors if isinstance(rf.factor, (Serial, Row)))
+
+    @property
+    def column_factors(self) -> tuple[ResolvedFactor, ...]:
+        """The factors of the column address, high first: column blocks, Mac, Column."""
+        return tuple(
+            rf
+            for rf in self.factors
+            if isinstance(rf.factor, (ColumnBlock, Mac, Column))
+        )
+
+    @property
+    def bank_factor(self) -> ResolvedFactor:
+        """The ``Bank`` factor of a DRAM layout."""
+        return next(rf for rf in self.factors if isinstance(rf.factor, Bank))
+
+    @property
     def row_factors(self) -> tuple[ResolvedFactor, ...]:
         """The factors that form the column address in a DRAM row, high first.
 
@@ -441,8 +514,8 @@ class PhysicalLayout:
         )
 
     def tile_count(self) -> int:
-        """Total number of tiles across all index factors."""
-        return prod(rf.extent for rf in self.index_factors)
+        """Number of rows (DRAM) or slot groups (Shared Buffer) the tiles use."""
+        return prod(rf.extent for rf in self.numbered_factors)
 
     def tile_number(self, index: Mapping[str, int]) -> int:
         """Row-major linearization of ``index`` along ``index_factors``."""
@@ -453,15 +526,17 @@ class PhysicalLayout:
                 f"tile index keys {sorted(index.keys())} do not match "
                 f"layout index factors {list(expected)}"
             )
-        number = 0
         for rf in self.index_factors:
             assert rf.name is not None
-            val = index[rf.name]
-            if not 0 <= val < rf.extent:
+            if not 0 <= index[rf.name] < rf.extent:
                 raise ValueError(
-                    f"index {rf.name!r} = {val} out of bounds for extent {rf.extent}"
+                    f"index {rf.name!r} = {index[rf.name]} out of bounds for "
+                    f"extent {rf.extent}"
                 )
-            number = number * rf.extent + val
+        number = 0
+        for rf in self.numbered_factors:
+            assert rf.name is not None
+            number = number * rf.extent + index[rf.name]
         return number
 
     def footprint(self) -> int:
@@ -479,19 +554,102 @@ class PhysicalLayout:
         """
 
         tile_num = self.tile_number(index)
-        valid = self._valid_extents(index)
         if self.space is MemorySpace.PIM_DRAM:
-            row_values = prod(valid[rf] for rf in self.row_factors)
+            # The column where the tile starts: its column blocks' digits.
+            column = 0
+            for rf in self.column_factors:
+                digit = index[rf.name] if rf.name is not None else 0
+                column = column * rf.extent + digit
+            opsizes = self.channel_opsizes(index)
             return DramTile(
                 row=self.base + tile_num,
-                opsize=-(-row_values // self.burst_values),
+                opsize=max(opsizes.values(), default=0),
+                column=column,
             )
+        valid = self._valid_extents(index)
         return SbTile(
             first_slot=self.base + tile_num * self.slots_per_tile,
             slots=prod(
                 valid[rf] for rf in self.tile_factors if isinstance(rf.factor, Slot)
             ),
         )
+
+    def occupied_cells(self) -> frozenset[tuple[int, int]]:
+        """The (channel, bank) pairs a DRAM layout puts elements in, in any row."""
+
+        channels = self.channel_factors
+        bank_rf = self.bank_factor
+        bank = bank_rf.factor
+        assert isinstance(bank, Bank)
+        cells = set()
+        for digits in itertools.product(*(range(rf.extent) for rf in channels)):
+            channel = 0
+            for rf, digit in zip(channels, digits, strict=True):
+                channel = channel * rf.extent + digit
+            for b in range(bank_rf.extent):
+                cells.add((self.first_channel + channel, bank.bank(b)))
+        return frozenset(cells)
+
+    def channel_opsizes(self, index: Mapping[str, int]) -> dict[int, int]:
+        """The bursts of the tile in each channel: those of its fullest bank.
+
+        A channel with no element of the tile has 0. Every channel of a whole
+        tile has the same count; a partial tile (the last tile along an index
+        factor, or along the outermost ``Channel`` factor) may have fewer.
+        """
+
+        opsizes: dict[int, int] = {}
+        for (channel, _bank), values in self.cell_values(index).items():
+            bursts = -(-values // self.burst_values)
+            opsizes[channel] = max(opsizes.get(channel, 0), bursts)
+        return opsizes
+
+    def cell_values(self, index: Mapping[str, int]) -> dict[tuple[int, int], int]:
+        """The tile's elements in each (channel, bank) of a DRAM layout."""
+
+        offset = [0] * len(self.shape)
+        for rf in self.index_factors:
+            assert rf.name is not None
+            offset[rf.dim] += index[rf.name] * rf.stride
+        channels = self.channel_factors
+        bank_rf = self.bank_factor
+        bank = bank_rf.factor
+        assert isinstance(bank, Bank)
+        whole = all(
+            prod(rf.extent for rf in self.factors if rf.dim == dim) == size
+            for dim, size in enumerate(self.shape)
+        )
+        full = prod(rf.extent for rf in self.row_factors)
+        cells: dict[tuple[int, int], int] = {}
+        for digits in itertools.product(*(range(rf.extent) for rf in channels)):
+            channel = 0
+            for rf, digit in zip(channels, digits, strict=True):
+                channel = channel * rf.extent + digit
+            channel += self.first_channel
+            for b in range(bank_rf.extent):
+                if whole:
+                    cells[(channel, bank.bank(b))] = full
+                    continue
+                position = list(offset)
+                for rf, digit in zip(channels, digits, strict=True):
+                    position[rf.dim] += digit * rf.stride
+                position[bank_rf.dim] += b * bank_rf.stride
+                cells[(channel, bank.bank(b))] = self._row_values(position)
+        return cells
+
+    def _row_values(self, position: Sequence[int]) -> int:
+        """Elements in the row of one bank whose fixed coordinates are ``position``."""
+
+        count = 1
+        for dim, size in enumerate(self.shape):
+            factors = [rf for rf in self.factors if rf.dim == dim]
+            in_row = [rf for rf in factors if isinstance(rf.factor, (Mac, Column))]
+            remaining = size - position[dim]
+            if not in_row:
+                count *= 1 if remaining > 0 else 0
+            else:
+                count *= _count_below(in_row, remaining)
+        return count
 
     def _valid_extents(self, index: Mapping[str, int]) -> dict[ResolvedFactor, int]:
         """How many values of each tile factor hold elements in this tile.
@@ -528,9 +686,9 @@ class PhysicalLayout:
                     f"coordinate {c} along dimension {d} out of bounds for size {size}"
                 )
 
-        # Linearize index factors in appearance order to find the tile number.
+        # Linearize the tile-numbering factors in appearance order.
         tile_num = 0
-        for rf in self.index_factors:
+        for rf in self.numbered_factors:
             tile_num = tile_num * rf.extent + rf.extract(coords[rf.dim])
 
         if self.space is MemorySpace.PIM_DRAM:
@@ -539,11 +697,13 @@ class PhysicalLayout:
             for rf in self.channel_factors:
                 channel = channel * rf.extent + rf.extract(coords[rf.dim])
             channel += self.first_channel
-            # The column address, in mixed radix over Mac and Column.
+            # The column address, in mixed radix over column blocks, Mac and Column.
             col = 0
-            for rf in self.row_factors:
+            for rf in self.column_factors:
                 col = col * rf.extent + rf.extract(coords[rf.dim])
-            bk_rf = next(rf for rf in self.tile_factors if isinstance(rf.factor, Bank))
+            bk_rf = self.bank_factor
+            bank = bk_rf.factor
+            assert isinstance(bank, Bank)
             mac = next(
                 (
                     rf.extract(coords[rf.dim])
@@ -554,7 +714,7 @@ class PhysicalLayout:
             )
             return DramElement(
                 channel=channel,
-                bank=bk_rf.extract(coords[bk_rf.dim]),
+                bank=bank.bank(bk_rf.extract(coords[bk_rf.dim])),
                 row=self.base + tile_num,
                 col=col,
                 mac=mac,
@@ -569,6 +729,21 @@ class PhysicalLayout:
             slot=self.base + tile_num * self.slots_per_tile + slot_in_tile,
             lane=lane_rf.extract(coords[lane_rf.dim]),
         )
+
+
+def _count_below(factors: Sequence[ResolvedFactor], remaining: int) -> int:
+    """Coordinate tuples of ``factors`` whose offset ``sum(c * stride)`` < ``remaining``."""
+
+    if remaining <= 0:
+        return 0
+    if not factors:
+        return 1
+    outer, *inner = sorted(factors, key=lambda rf: rf.stride, reverse=True)
+    if not inner:
+        return min(outer.extent, -(-remaining // outer.stride))
+    return sum(
+        _count_below(inner, remaining - c * outer.stride) for c in range(outer.extent)
+    )
 
 
 def _is_channel_part(factor: Factor) -> bool:
@@ -704,7 +879,11 @@ def resolve(
                     f"Row({f.name!r}) is only allowed in pim.dram layouts, "
                     f"not {space.value}"
                 )
-            if isinstance(f, (Serial, Row)):
+            if isinstance(f, ColumnBlock) and space is not MemorySpace.PIM_DRAM:
+                raise ValueError(
+                    f"ColumnBlock({f.name!r}) is only allowed in pim.dram layouts"
+                )
+            if isinstance(f, (Serial, Row, ColumnBlock)):
                 if f.name in seen_names:
                     raise ValueError(f"duplicate index factor name {f.name!r}")
                 seen_names.add(f.name)
@@ -720,7 +899,12 @@ def resolve(
                     raise ValueError(
                         f"Bank() is only allowed in pim.dram layouts, not {space.value}"
                     )
-                extents.append(arch.banks_per_channel)
+                if arch.banks_per_channel % f.every:
+                    raise ValueError(
+                        f"Bank(every={f.every}) does not divide the "
+                        f"{arch.banks_per_channel} banks of a channel"
+                    )
+                extents.append(arch.banks_per_channel // f.every)
             elif isinstance(f, Column):
                 if space is not MemorySpace.PIM_DRAM:
                     raise ValueError(
@@ -782,19 +966,20 @@ def resolve(
 
         concrete_extents = [int(e) for e in extents if e is not None]
         total = prod(concrete_extents)
-        # A last, partial tile: the outermost factor is an index factor and
-        # only its last value selects fewer elements than a whole tile.
+        # A partial last part: the outermost factor is an index factor (the
+        # last tile is partial) or a Channel factor (the last channels hold
+        # fewer elements, or none), and only its last value is partial.
         inner = total // concrete_extents[0]
         ragged = (
             total > dim_size
-            and isinstance(dim_factors[0], (Serial, Row))
+            and isinstance(dim_factors[0], (Serial, Row, ColumnBlock, Channel))
             and (concrete_extents[0] - 1) * inner < dim_size
-        )
+        ) or (total > dim_size and isinstance(dim_factors[0], Channel) and dim_size > 0)
         if total != dim_size and not ragged:
             raise ValueError(
                 f"{dim_label} factor extents {concrete_extents} multiply to "
                 f"{total}, expected dimension size {dim_size} (or, with an "
-                "index factor outermost, more by less than one tile)"
+                "index or Channel factor outermost, more by less than one part)"
             )
 
         # Compute mixed-radix strides from innermost (stride = 1) to outermost.
@@ -838,21 +1023,21 @@ def resolve(
             raise ValueError(
                 "Column() must be the innermost factor of its dimension (stride 1)"
             )
-        in_row = col_rf.extent * (macs[0].extent if macs else 1)
+        blocks = prod(
+            rf.extent for rf in resolved_all if isinstance(rf.factor, ColumnBlock)
+        )
+        in_row = blocks * col_rf.extent * (macs[0].extent if macs else 1)
         if in_row > row_values:
             what = (
                 f"Mac x Column extent {macs[0].extent} x {col_rf.extent}"
                 if macs
                 else f"Column extent {col_rf.extent}"
             )
+            if blocks > 1:
+                what = f"{blocks} column blocks of {what}"
             raise ValueError(
                 f"{what} exceeds one DRAM row ({row_values} "
                 f"{tensor.dtype.value} values)"
-            )
-        if col_rf.extent % burst_values != 0:
-            raise ValueError(
-                f"Column extent {col_rf.extent} must be a multiple of burst size "
-                f"({burst_values} {tensor.dtype.value} values)"
             )
     else:
         slots = [rf for rf in resolved_all if isinstance(rf.factor, Slot)]

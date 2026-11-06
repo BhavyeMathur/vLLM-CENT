@@ -38,13 +38,24 @@ from ..types import DType, MemorySpace, TensorType
 from .tile import INDEX
 
 __all__ = [
+    "CentCopyBkGbOp",
+    "CentCopyGbBkOp",
+    "CentEwaddOp",
+    "CentEwmulOp",
+    "CentGbConcatOp",
     "CentMacAbkOp",
+    "CentMacBkBkOp",
+    "CentPnmOp",
+    "CentRdAfOp",
     "CentRdMacOp",
+    "CentRdMemOp",
+    "CentSyncOp",
     "CentTensorType",
     "CentTileOp",
     "CentWrBiasOp",
     "CentWrBiasZeroOp",
     "CentWrGbOp",
+    "CentWrMemOp",
 ]
 
 
@@ -195,11 +206,15 @@ def _check_tile_shape(op_name: str, shape: tuple[int, ...]) -> None:
         )
 
 
-def _check_mac_shape(op: CentTileOp, shape: tuple[int, ...]) -> None:
+def _check_mac_shape(
+    op: CentTileOp, shape: tuple[int, ...], *, subset: bool = False
+) -> None:
     """Check a MAC register tile's shape: ``(len(channels), banks)``.
 
     One row per selected channel, one column per bank. The bank count is
     the device's, so it is checked against the device later (Step 3).
+    With ``subset``, the op may use some of the tile's channels: the tile
+    has at least one row per selected channel.
 
     Raises:
         ValueError: If the shape is not two-dimensional, or its rows are
@@ -207,7 +222,8 @@ def _check_mac_shape(op: CentTileOp, shape: tuple[int, ...]) -> None:
     """
 
     _check_tile_shape(op.NAME, shape)
-    if len(shape) != 2 or shape[0] != len(op.channels):
+    rows_ok = shape[0] >= len(op.channels) if subset else shape[0] == len(op.channels)
+    if len(shape) != 2 or not rows_ok:
         raise ValueError(
             f"{op.NAME}: MAC registers of {len(op.channels)} channels have "
             f"shape [{len(op.channels)}, banks], got {list(shape)}"
@@ -431,7 +447,9 @@ class CentMacAbkOp(_TileRefOp):
     MAC register. The indices select the tile of ``w``.
 
     The result is the new value of the MAC registers, of ``acc``'s type, so
-    a loop can carry it from one MAC to the next.
+    a loop can carry it from one MAC to the next. The op may select some of
+    ``acc``'s channels, e.g. one MAC per operation size where the last
+    channels hold a partial tile.
     """
 
     NAME = "cent.mac_abk"
@@ -464,7 +482,7 @@ class CentMacAbkOp(_TileRefOp):
         gb = _expect(self.NAME, "global buffer", self.global_buffer, MemorySpace.PIM_GB)
         acc = _expect(self.NAME, "accumulator", self.accumulator, MemorySpace.PIM_MAC)
         _expect_same_dtype(self.NAME, weight=weight, global_buffer=gb, accumulator=acc)
-        _check_mac_shape(self, acc.shape)
+        _check_mac_shape(self, acc.shape, subset=True)
         return (acc,)
 
 
@@ -509,3 +527,334 @@ class CentRdMacOp(_TileRefOp):
         _expect_same_dtype(self.NAME, accumulator=acc, destination=destination)
         _check_mac_shape(self, acc.shape)
         return (destination,)
+
+
+def _expect_in(
+    op_name: str, what: str, value: Value, *spaces: MemorySpace
+) -> CentTensorType:
+    """Return ``value``'s type if it is a ``CentTensorType`` in one of ``spaces``."""
+
+    value_type = value.type
+    if (
+        not isinstance(value_type, CentTensorType)
+        or value_type.memory_space not in spaces
+    ):
+        names = " or ".join(space.value for space in spaces)
+        raise ValueError(
+            f"{op_name}: {what} must be in {names}, got {format_type(value_type)}"
+        )
+    return value_type
+
+
+def _check_start(
+    op_name: str, whole: TensorType, part: TensorType, start: tuple[int, ...]
+) -> None:
+    """Check that ``part`` fits in ``whole`` at ``start``, aligned to its last dims."""
+
+    if len(start) != whole.rank or part.rank > whole.rank:
+        raise ValueError(
+            f"{op_name}: start {list(start)} must give one offset per dimension of "
+            f"{list(whole.shape)}, which must hold {list(part.shape)}"
+        )
+    lead = whole.rank - part.rank
+    extents = (1,) * lead + part.shape
+    for offset, extent, size in zip(start, extents, whole.shape, strict=True):
+        if offset < 0 or offset + extent > size:
+            raise ValueError(
+                f"{op_name}: {list(part.shape)} at {list(start)} does not fit in "
+                f"{list(whole.shape)}"
+            )
+
+
+@dataclass(frozen=True, eq=False, slots=True)
+class CentWrMemOp(Operation):
+    """``cent.wr_mem(src, dst) {start}``: write a Shared Buffer tensor into DRAM.
+
+    Ordinary DRAM writes (``W MEM channel bank row``), one per burst of
+    ``dst`` that the elements land in. ``src`` fills ``dst`` from ``start``,
+    aligned to ``dst``'s last dimensions: a whole vector, or one position of
+    a KV cache. The result is the new version of ``dst``.
+    """
+
+    NAME = "cent.wr_mem"
+    NUM_OPERANDS = 2
+
+    start: tuple[int, ...] = field(kw_only=True)
+
+    def __post_init__(self) -> None:
+        """Store ``start`` as a tuple, then check the operands."""
+        object.__setattr__(self, "start", tuple(self.start))
+        super().__post_init__()
+
+    def infer_result_types(self) -> tuple[TensorType, ...]:
+        """Return ``dst``'s type."""
+        src = _expect(self.NAME, "source", self.operands[0], MemorySpace.PNM_SB)
+        dst = _expect(self.NAME, "destination", self.operands[1], MemorySpace.PIM_DRAM)
+        _expect_same_dtype(self.NAME, source=src, destination=dst)
+        _check_start(self.NAME, dst, src, self.start)
+        return (dst,)
+
+
+@dataclass(frozen=True, eq=False, slots=True)
+class CentRdMemOp(Operation):
+    """``cent.rd_mem(src, dst) {start}``: read DRAM into a Shared Buffer tensor.
+
+    Ordinary DRAM reads (``R MEM channel bank row``), one per burst of
+    ``src`` read from ``start``. The result is the new version of ``dst``.
+    """
+
+    NAME = "cent.rd_mem"
+    NUM_OPERANDS = 2
+
+    start: tuple[int, ...] = field(kw_only=True)
+
+    def __post_init__(self) -> None:
+        """Store ``start`` as a tuple, then check the operands."""
+        object.__setattr__(self, "start", tuple(self.start))
+        super().__post_init__()
+
+    def infer_result_types(self) -> tuple[TensorType, ...]:
+        """Return ``dst``'s type."""
+        src = _expect(self.NAME, "source", self.operands[0], MemorySpace.PIM_DRAM)
+        dst = _expect(self.NAME, "destination", self.operands[1], MemorySpace.PNM_SB)
+        _expect_same_dtype(self.NAME, source=src, destination=dst)
+        _check_start(self.NAME, src, dst, self.start)
+        return (dst,)
+
+
+@dataclass(frozen=True, eq=False, slots=True)
+class CentMacBkBkOp(CentTileOp):
+    """``cent.mac_bk_bk(a, b, acc)``: multiply-accumulate between neighbor banks.
+
+    ``MAC_ABK`` with configuration register 0 (broadcast) at 0: every pair
+    of banks ``2b`` and ``2b + 1`` multiplies their rows (``a`` in the even
+    bank, ``b`` in the odd one) and adds to the MAC register. CENT squares
+    a vector this way for RMSNorm, with ``a`` and ``b`` copies of it.
+    """
+
+    NAME = "cent.mac_bk_bk"
+    NUM_OPERANDS = 3
+
+    def infer_result_types(self) -> tuple[TensorType, ...]:
+        """Return ``acc``'s type."""
+        a = _expect(
+            self.NAME, "even-bank operand", self.operands[0], MemorySpace.PIM_DRAM
+        )
+        b = _expect(
+            self.NAME, "odd-bank operand", self.operands[1], MemorySpace.PIM_DRAM
+        )
+        acc = _expect(self.NAME, "accumulator", self.operands[2], MemorySpace.PIM_MAC)
+        _expect_same_dtype(self.NAME, a=a, b=b, accumulator=acc)
+        _check_mac_shape(self, acc.shape)
+        return (acc,)
+
+
+@dataclass(frozen=True, eq=False, slots=True)
+class CentEwmulOp(CentTileOp):
+    """``cent.ewmul(a, b, out)``: elementwise multiply in the banks (``EWMUL``).
+
+    In each group of four banks, banks ``4b`` and ``4b + 1`` of one row are
+    multiplied into bank ``4b + 2`` of the same row. The result is the new
+    version of ``out``.
+    """
+
+    NAME = "cent.ewmul"
+    NUM_OPERANDS = 3
+
+    def infer_result_types(self) -> tuple[TensorType, ...]:
+        """Return ``out``'s type."""
+        a = _expect(self.NAME, "first operand", self.operands[0], MemorySpace.PIM_DRAM)
+        b = _expect(self.NAME, "second operand", self.operands[1], MemorySpace.PIM_DRAM)
+        out = _expect(self.NAME, "result", self.operands[2], MemorySpace.PIM_DRAM)
+        _expect_same_dtype(self.NAME, a=a, b=b, out=out)
+        if not a.shape == b.shape == out.shape:
+            raise ValueError(
+                f"{self.NAME}: operands {list(a.shape)}, {list(b.shape)} and result "
+                f"{list(out.shape)} must have one shape"
+            )
+        return (out,)
+
+
+@dataclass(frozen=True, eq=False, slots=True)
+class CentCopyBkGbOp(CentTileOp):
+    """``cent.copy_bkgb(src) {bank, shape}``: copy one bank's row into the GB.
+
+    ``COPY_BKGB``: in every selected channel, bank ``bank`` of ``src``'s row
+    goes into the channel's Global Buffer. The result is that GB tile.
+    """
+
+    NAME = "cent.copy_bkgb"
+    NUM_OPERANDS = 1
+
+    bank: int = field(kw_only=True)
+    shape: tuple[int, ...] = field(kw_only=True)
+
+    def __post_init__(self) -> None:
+        """Store ``shape`` as a tuple, then check the operands."""
+        object.__setattr__(self, "shape", tuple(self.shape))
+        super().__post_init__()
+
+    def infer_result_types(self) -> tuple[TensorType, ...]:
+        """Return a Global Buffer tile of ``shape``."""
+        src = _expect(self.NAME, "source", self.operands[0], MemorySpace.PIM_DRAM)
+        if self.bank < 0:
+            raise ValueError(f"{self.NAME}: bank must be non-negative, got {self.bank}")
+        _check_tile_shape(self.NAME, self.shape)
+        return (
+            CentTensorType(
+                shape=self.shape, dtype=src.dtype, memory_space=MemorySpace.PIM_GB
+            ),
+        )
+
+
+@dataclass(frozen=True, eq=False, slots=True)
+class CentCopyGbBkOp(CentTileOp):
+    """``cent.copy_gbbk(gb, dst) {bank}``: copy the GB into one bank's row.
+
+    ``COPY_GBBK``: in every selected channel, the Global Buffer goes into
+    bank ``bank`` of ``dst``'s row. The result is the new version of ``dst``.
+    """
+
+    NAME = "cent.copy_gbbk"
+    NUM_OPERANDS = 2
+
+    bank: int = field(kw_only=True)
+
+    def infer_result_types(self) -> tuple[TensorType, ...]:
+        """Return ``dst``'s type."""
+        gb = _expect(self.NAME, "global buffer", self.operands[0], MemorySpace.PIM_GB)
+        dst = _expect(self.NAME, "destination", self.operands[1], MemorySpace.PIM_DRAM)
+        _expect_same_dtype(self.NAME, global_buffer=gb, destination=dst)
+        if self.bank < 0:
+            raise ValueError(f"{self.NAME}: bank must be non-negative, got {self.bank}")
+        return (dst,)
+
+
+@dataclass(frozen=True, eq=False, slots=True)
+class CentRdAfOp(_TileRefOp):
+    """``cent.rd_af(acc, y, *indices)``: activate and read (``AF``, ``RD_AF``).
+
+    Each selected channel applies the activation function to its banks' MAC
+    registers (``AF``) and writes the results as one Shared Buffer slot
+    (``RD_AF``), as ``cent.rd_mac`` does. The MAC registers keep their
+    value, so ``cent.rd_mac`` may read them after. The result is the new
+    version of ``y``.
+    """
+
+    NAME = "cent.rd_af"
+    NUM_FIXED = 2
+
+    @property
+    def accumulator(self) -> Value:
+        """The MAC registers activated."""
+        return self.operands[0]
+
+    @property
+    def destination(self) -> Value:
+        """The Shared Buffer tensor written."""
+        return self.operands[1]
+
+    def _infer_tile_types(self) -> tuple[TensorType, ...]:
+        """Return the destination's type."""
+        acc = _expect(self.NAME, "accumulator", self.accumulator, MemorySpace.PIM_MAC)
+        destination = _expect(
+            self.NAME, "destination", self.destination, MemorySpace.PNM_SB
+        )
+        _expect_same_dtype(self.NAME, accumulator=acc, destination=destination)
+        _check_mac_shape(self, acc.shape)
+        return (destination,)
+
+
+@dataclass(frozen=True, eq=False, slots=True)
+class CentSyncOp(Operation):
+    """``cent.sync()``: wait for every issued command (``SYNC``)."""
+
+    NAME = "cent.sync"
+    NUM_OPERANDS = 0
+
+    def infer_result_types(self) -> tuple[TensorType, ...]:
+        """No results."""
+        return ()
+
+
+@dataclass(frozen=True, eq=False, slots=True)
+class CentEwaddOp(Operation):
+    """``cent.ewadd(a, b)``: add ``b`` into ``a`` in the Shared Buffer (``EWADD``).
+
+    CENT issues it for the residual adds; the AiM simulator executes it as
+    a no-op. The result is the new version of ``a``.
+    """
+
+    NAME = "cent.ewadd"
+    NUM_OPERANDS = 2
+
+    def infer_result_types(self) -> tuple[TensorType, ...]:
+        """Return ``a``'s type."""
+        a = _expect(self.NAME, "first operand", self.operands[0], MemorySpace.PNM_SB)
+        b = _expect(self.NAME, "second operand", self.operands[1], MemorySpace.PNM_SB)
+        if (a.shape, a.dtype) != (b.shape, b.dtype):
+            raise ValueError(
+                f"{self.NAME}: operands {format_type(a)} and {format_type(b)} differ"
+            )
+        return (a,)
+
+
+@dataclass(frozen=True, eq=False, slots=True)
+class CentGbConcatOp(Operation):
+    """``cent.gb_concat(*gbs)``: Global Buffer tiles of disjoint channels as one.
+
+    Issues nothing: it lets one ``cent.mac_abk`` read Global Buffers that
+    different ``cent.wr_gb`` filled with different tiles, e.g. one context
+    shard per channel group. The result has the largest operand shape.
+    """
+
+    NAME = "cent.gb_concat"
+    NUM_OPERANDS = None
+
+    def infer_result_types(self) -> tuple[TensorType, ...]:
+        """Return a Global Buffer tile of the largest operand shape."""
+        if len(self.operands) < 2:
+            raise ValueError(f"{self.NAME}: needs at least two Global Buffer tiles")
+        types = [
+            _expect(self.NAME, f"operand {i}", v, MemorySpace.PIM_GB)
+            for i, v in enumerate(self.operands)
+        ]
+        _expect_same_dtype(
+            self.NAME, **{f"operand_{i}": t for i, t in enumerate(types)}
+        )
+        largest = max(types, key=lambda t: t.numel)
+        return (largest,)
+
+
+@dataclass(frozen=True, eq=False, slots=True)
+class CentPnmOp(Operation):
+    """``cent.pnm(*inputs, into) {kind, cycles}``: PNM work, modeled analytically.
+
+    CENT computes some steps on the processing-near-memory units (RISC-V
+    cores and vector units by the Shared Buffer) and charges them with an
+    analytical latency instead of simulating them. This op stands for such
+    a step: it reads ``inputs`` and writes ``into``, issues no AiM command,
+    and appears in the trace as a comment with its ``cycles``. The result
+    is the new version of ``into``.
+    """
+
+    NAME = "cent.pnm"
+    NUM_OPERANDS = None
+
+    kind: str = field(kw_only=True)
+    cycles: float = field(kw_only=True)
+
+    def infer_result_types(self) -> tuple[TensorType, ...]:
+        """Return ``into``'s type."""
+        if not self.operands:
+            raise ValueError(f"{self.NAME}: needs a destination")
+        into = _expect(self.NAME, "destination", self.operands[-1], MemorySpace.PNM_SB)
+        for i, value in enumerate(self.operands[:-1]):
+            _expect_in(
+                self.NAME, f"input {i}", value, MemorySpace.PNM_SB, MemorySpace.PIM_DRAM
+            )
+        if self.cycles < 0:
+            raise ValueError(
+                f"{self.NAME}: cycles must be non-negative, got {self.cycles}"
+            )
+        return (into,)

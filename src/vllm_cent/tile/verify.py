@@ -9,19 +9,30 @@ from ..device.cent import CentArchitecture
 from ..ir.base import Block, Function, Operation, Value
 from ..ir.printer import format_type, value_names
 from ..ir.tile import (
+    CentCopyBkGbOp,
+    CentCopyGbBkOp,
+    CentEwaddOp,
+    CentEwmulOp,
+    CentGbConcatOp,
     CentMacAbkOp,
+    CentMacBkBkOp,
+    CentPnmOp,
+    CentRdAfOp,
     CentRdMacOp,
+    CentRdMemOp,
+    CentSyncOp,
     CentTensorType,
     CentTileOp,
     CentWrBiasOp,
     CentWrBiasZeroOp,
     CentWrGbOp,
+    CentWrMemOp,
     TileConstOp,
     TileForOp,
 )
 from ..ir.types import MemorySpace
 from .kernel import CentKernel
-from .layout import Column, Lane, PhysicalLayout, Slot, resolve
+from .layout import Bank, Column, Lane, PhysicalLayout, Slot, resolve
 
 __all__ = ["verify_kernel"]
 
@@ -69,7 +80,7 @@ def _check_layouts(
             label = names.get(key, key.name or "<unnamed>")
             raise ValueError(f"layout given for non-argument value %{label}")
 
-    dram_intervals: list[tuple[int, int, str]] = []
+    dram_intervals: list[tuple[int, int, frozenset[tuple[int, int]], str]] = []
     sb_intervals: list[tuple[int, int, str]] = []
     max_rows = arch.rows_per_bank
     max_slots = arch.shared_buffer_size // arch.burst_size
@@ -122,13 +133,19 @@ def _check_layouts(
                     f"kernel argument {name} occupies DRAM rows [{start}, {end}), "
                     f"exceeding rows_per_bank ({max_rows})"
                 )
-            for other_start, other_end, other_name in dram_intervals:
-                if max(start, other_start) < min(end, other_end):
+            # Two tensors may share rows on different banks, e.g. the
+            # operands of EWMUL in banks 4b and 4b + 1 of one row.
+            cells = layout.occupied_cells()
+            for other_start, other_end, other_cells, other_name in dram_intervals:
+                if (
+                    max(start, other_start) < min(end, other_end)
+                    and cells & other_cells
+                ):
                     raise ValueError(
                         f"DRAM rows of {name} [{start}, {end}) overlap with "
-                        f"{other_name} [{other_start}, {other_end})"
+                        f"{other_name} [{other_start}, {other_end}) in the same banks"
                     )
-            dram_intervals.append((start, end, name))
+            dram_intervals.append((start, end, cells, name))
         else:
             if layout.needs_channel_alignment:
                 # Every tile's Rd = first slot - first channel must be a
@@ -229,10 +246,37 @@ def _analyze_ops(
             # A constant index c selects as if by a loop of c + 1 iterations,
             # so the loop-extent bound check also bounds constants.
             facts.extent[op.results[0]] = op.value + 1
-        elif isinstance(op, CentRdMacOp):
+        elif isinstance(op, (CentRdMacOp, CentRdAfOp)):
             facts.root[op.results[0]] = facts.root[op.destination]
-        elif isinstance(op, (CentWrGbOp, CentWrBiasOp, CentWrBiasZeroOp, CentMacAbkOp)):
+        elif isinstance(op, (CentWrMemOp, CentRdMemOp, CentCopyGbBkOp)):
+            facts.root[op.results[0]] = facts.root[op.operands[1]]
+        elif isinstance(op, CentEwmulOp):
+            facts.root[op.results[0]] = facts.root[op.operands[2]]
+        elif isinstance(op, CentEwaddOp):
+            facts.root[op.results[0]] = facts.root[op.operands[0]]
+        elif isinstance(op, CentPnmOp):
+            facts.root[op.results[0]] = facts.root[op.operands[-1]]
+        elif isinstance(op, CentMacAbkOp):
+            # The MAC registers keep the channels of the tile they update.
+            facts.channels[op.results[0]] = facts.channels[op.accumulator]
+        elif isinstance(
+            op,
+            (CentWrGbOp, CentWrBiasOp, CentWrBiasZeroOp, CentMacBkBkOp, CentCopyBkGbOp),
+        ):
             facts.channels[op.results[0]] = op.channels
+        elif isinstance(op, CentGbConcatOp):
+            union: set[int] = set()
+            for gb in op.operands:
+                channels = set(facts.channels[gb])
+                if union & channels:
+                    raise ValueError(
+                        f"{label}: Global Buffer tiles share channels "
+                        f"{sorted(union & channels)}"
+                    )
+                union |= channels
+            facts.channels[op.results[0]] = tuple(sorted(union))
+        elif isinstance(op, CentSyncOp):
+            pass
         else:
             raise ValueError(f"unsupported op in CENT kernel: {label}")
 
@@ -274,25 +318,120 @@ def _check_tile_channels(
 
 def _check_accumulator(
     label: str,
-    op: CentMacAbkOp | CentRdMacOp,
+    op: CentMacAbkOp | CentRdMacOp | CentRdAfOp,
     facts: _Facts,
     arch: CentArchitecture,
     names: dict[Value, str],
 ) -> None:
-    """Check that ``op`` uses the MAC registers of exactly its own channels."""
+    """Check that ``op`` uses MAC registers of its own channels.
+
+    A MAC may update some channels of the registers (one MAC per operation
+    size); reading them takes all of their channels.
+    """
 
     acc_ch = facts.channels[op.accumulator]
-    if op.channels != acc_ch:
+    if isinstance(op, CentMacAbkOp):
+        if not set(op.channels) <= set(acc_ch):
+            raise ValueError(
+                f"{label}: channels {list(op.channels)} are not all channels of "
+                f"accumulator %{names[op.accumulator]} {list(acc_ch)}"
+            )
+    elif op.channels != acc_ch:
         raise ValueError(
             f"{label}: channels {list(op.channels)} do not match "
             f"accumulator %{names[op.accumulator]} channels {list(acc_ch)}"
         )
-    expected = (len(op.channels), arch.banks_per_channel)
+    expected = (len(acc_ch), arch.banks_per_channel)
     if op.accumulator.type.shape != expected:
         raise ValueError(
             f"{label}: accumulator shape {list(op.accumulator.type.shape)} "
             f"does not match {list(expected)}"
         )
+
+
+def _row_layout(
+    label: str, value: Value, kernel: CentKernel, facts: _Facts, names: dict[Value, str]
+) -> PhysicalLayout:
+    """The layout of a DRAM operand that a bank op uses whole: one row."""
+
+    root = facts.root[value]
+    layout = kernel.layouts[root]
+    if layout.tile_count() != 1 or layout.index_factors:
+        raise ValueError(
+            f"{label}: %{names[root]} must be one DRAM row, without indices"
+        )
+    return layout
+
+
+def _bank_member(layout: PhysicalLayout) -> tuple[int, int]:
+    """``(every, offset)`` of a layout's ``Bank`` factor."""
+
+    bank = layout.bank_factor.factor
+    assert isinstance(bank, Bank)
+    return bank.every, bank.offset
+
+
+def _check_bank_op(
+    op: CentMacBkBkOp | CentEwmulOp | CentCopyBkGbOp | CentCopyGbBkOp,
+    kernel: CentKernel,
+    facts: _Facts,
+    arch: CentArchitecture,
+    names: dict[Value, str],
+) -> None:
+    """Check the bank placement of a MAC between neighbors, EWMUL or copy.
+
+    Their DRAM operands are whole rows; the instruction names only one row,
+    so operands of one instruction share it, in the banks the instruction
+    pairs: ``2b`` and ``2b + 1`` for the neighbor MAC, ``4b``, ``4b + 1``
+    and ``4b + 2`` for EWMUL.
+    """
+
+    label = _op_label(op)
+    if isinstance(op, CentMacBkBkOp):
+        dram, members = op.operands[:2], [(2, 0), (2, 1)]
+    elif isinstance(op, CentEwmulOp):
+        group = arch.banks_per_group
+        dram, members = op.operands, [(group, 0), (group, 1), (group, 2)]
+    elif isinstance(op, CentCopyBkGbOp):
+        dram, members = op.operands[:1], []
+    else:
+        dram, members = op.operands[1:], []
+    layouts = [_row_layout(label, v, kernel, facts, names) for v in dram]
+    if len({layout.base for layout in layouts}) != 1:
+        raise ValueError(
+            f"{label}: operands must share one DRAM row, got rows "
+            f"{[layout.base for layout in layouts]}"
+        )
+    for value, layout, member in zip(dram, layouts, members, strict=False):
+        if _bank_member(layout) != member:
+            raise ValueError(
+                f"{label}: %{names[facts.root[value]]} must be in banks "
+                f"{member[0]}b + {member[1]}, got Bank(every={_bank_member(layout)[0]}, "
+                f"offset={_bank_member(layout)[1]})"
+            )
+    for layout in layouts:
+        occupied = layout.occupied_channels(arch.channels)
+        if not set(op.channels) <= set(occupied):
+            raise ValueError(
+                f"{label}: channels {list(op.channels)} hold no part of an operand "
+                f"(channels {occupied})"
+            )
+    if isinstance(op, (CentCopyBkGbOp, CentCopyGbBkOp)):
+        every, offset = _bank_member(layouts[0])
+        if op.bank >= arch.banks_per_channel or op.bank % every != offset:
+            raise ValueError(
+                f"{label}: bank {op.bank} holds no part of the operand "
+                f"(Bank(every={every}, offset={offset}))"
+            )
+    if isinstance(op, CentCopyGbBkOp):
+        gb_ch = facts.channels[op.operands[0]]
+        if not set(op.channels) <= set(gb_ch):
+            raise ValueError(
+                f"{label}: channels {list(op.channels)} are not covered by Global "
+                f"Buffer %{names[op.operands[0]]} channels {list(gb_ch)}"
+            )
+    if isinstance(op, CentMacBkBkOp) and facts.channels[op.operands[2]] != op.channels:
+        raise ValueError(f"{label}: accumulator channels differ from the op's")
 
 
 def _check_ops(
@@ -307,8 +446,22 @@ def _check_ops(
             if isinstance(op, TileForOp):
                 walk(op.body.operations)
                 continue
-            if isinstance(op, TileConstOp):
+            if isinstance(
+                op,
+                (
+                    TileConstOp,
+                    CentWrMemOp,
+                    CentRdMemOp,
+                    CentSyncOp,
+                    CentEwaddOp,
+                    CentPnmOp,
+                ),
+            ):
+                # Their operand spaces and bounds are checked when built; the
+                # tensors they name have layouts by _check_layouts.
                 continue
+            if isinstance(op, CentGbConcatOp):
+                continue  # channels checked by _analyze
 
             assert isinstance(op, CentTileOp)
             if op.channels[-1] >= arch.channels:
@@ -317,6 +470,11 @@ def _check_ops(
                     f"with {arch.channels} channels"
                 )
 
+            if isinstance(
+                op, (CentMacBkBkOp, CentEwmulOp, CentCopyBkGbOp, CentCopyGbBkOp)
+            ):
+                _check_bank_op(op, kernel, facts, arch, names)
+                continue
             if isinstance(op, CentWrBiasZeroOp):
                 # It reads no tensor: only its register tile needs checking.
                 expected = (len(op.channels), arch.banks_per_channel)
@@ -330,7 +488,7 @@ def _check_ops(
                 indexed_value = op.source
             elif isinstance(op, CentMacAbkOp):
                 indexed_value = op.weight
-            elif isinstance(op, CentRdMacOp):
+            elif isinstance(op, (CentRdMacOp, CentRdAfOp)):
                 indexed_value = op.destination
             else:
                 raise ValueError(f"unsupported op in CENT kernel: {label}")
@@ -427,7 +585,7 @@ def _check_ops(
                     )
                 _check_accumulator(label, op, facts, arch, names)
 
-            elif isinstance(op, CentRdMacOp):
+            elif isinstance(op, (CentRdMacOp, CentRdAfOp)):
                 _check_tile_channels(label, op, layout, arch, names[root])
                 if not _is_channel_bank_sb_tile(layout):
                     raise ValueError(
@@ -542,8 +700,12 @@ def _check_liveness(
 
 
 def _is_sb_value(value: Value) -> bool:
+    """Whether ``value`` is a version of stored state: Shared Buffer or DRAM."""
     t = value.type
-    return isinstance(t, CentTensorType) and t.memory_space is MemorySpace.PNM_SB
+    return isinstance(t, CentTensorType) and t.memory_space in (
+        MemorySpace.PNM_SB,
+        MemorySpace.PIM_DRAM,
+    )
 
 
 def _check_sb_versions(function: Function, names: dict[Value, str]) -> None:
@@ -579,8 +741,16 @@ def _check_sb_versions(function: Function, names: dict[Value, str]) -> None:
         for i, op in enumerate(ops):
             label = _op_label(op)
             consuming_operands: list[Value] = []
-            if isinstance(op, CentRdMacOp):
+            if isinstance(op, (CentRdMacOp, CentRdAfOp)):
                 consuming_operands.append(op.destination)
+            elif isinstance(op, (CentWrMemOp, CentRdMemOp, CentCopyGbBkOp)):
+                consuming_operands.append(op.operands[1])
+            elif isinstance(op, CentEwmulOp):
+                consuming_operands.append(op.operands[2])
+            elif isinstance(op, CentEwaddOp):
+                consuming_operands.append(op.operands[0])
+            elif isinstance(op, CentPnmOp):
+                consuming_operands.append(op.operands[-1])
             elif isinstance(op, TileForOp):
                 consuming_operands.extend(v for v in op.operands if _is_sb_value(v))
 
