@@ -6,7 +6,7 @@ k.serial`` is one ``tile.for``; ``wr_bias``/``wr_gb``/``mac_abk``/``rd_mac``
 are the AiM instructions; ``channels=`` is the channel_mask), and so is
 the Shared Buffer convention for ``WR_BIAS``/``RD_MAC``; see there.
 
-Kernel: ``y = x @ w.T`` (``nn.Linear``) for ``M = 2`` tokens of decode,
+Kernel: ``y = x @ w.T`` (``nn.Linear``) for ``M = 4`` tokens of decode,
 ``N = K = 4096``, bf16. Each token row of x is its own GEMV against the same
 weights, so the two schedules differ in what stays in place between MACs:
 
@@ -25,6 +25,7 @@ from vllm_cent.device import CentArchitecture, MemorySpace, load_device_spec
 from vllm_cent.ir import DType
 from vllm_cent.ir import print_function
 from vllm_cent.tile import Bank, Channel, Column, Lane, Row, Serial, Slot, split
+from vllm_cent.tile.codegen import aim_trace
 from vllm_cent.tile.dsl import TileKernel
 
 device = load_device_spec("examples/cent/cent.yaml")
@@ -32,10 +33,9 @@ arch = device.architecture
 # These kernels use CENT instructions, so they need a CENT device.
 assert isinstance(arch, CentArchitecture)
 BF16 = DType.BF16
-# x and y take M * 256 Shared Buffer slots each, and the zeros slot one
-# more: M = 4 would need 2049 of the 2048 slots (64 KiB), so build() rejects
-# it. M = 2 leaves room.
-M, N, K = 2, 4096, 4096
+# x and y take M * 256 Shared Buffer slots each: M = 4 fills all 2048 slots
+# (64 KiB). Sums start with wr_bias_zero, which needs no slot of zeros.
+M, N, K = 4, 4096, 4096
 
 CHANNELS, BANKS = arch.channels, arch.banks_per_channel
 GB_VALUES = device.memory_space(MemorySpace.PIM_GB).capacity_values(BF16)
@@ -55,9 +55,6 @@ with TileKernel("q_proj_gemm_token_stationary", device) as k:
     x = k.tensor("x", (M, K), BF16, MemorySpace.PNM_SB)
     w = k.tensor("w", (N, K), BF16, MemorySpace.PIM_DRAM)
     y = k.tensor("y", (M, N), BF16, MemorySpace.PNM_SB)
-    # TODO(runtime): A Shared Buffer slot of zeros to start each sum; see
-    # gemv.py.
-    zeros = k.tensor("zeros", (BANKS,), BF16, MemorySpace.PNM_SB)
 
     # x: token rows one after another, each laid out like the GEMV input.
     k.bind_layout(
@@ -80,8 +77,6 @@ with TileKernel("q_proj_gemm_token_stationary", device) as k:
             n=(Serial("n_wave", N_WAVES), Slot(of=Channel()), Lane(of=Bank())),
         ),
     )
-    # zeros: one slot that every channel reads (WR_BIAS stride=0).
-    k.bind_layout(zeros, split(b=(Slot(1), Lane(of=Bank()))))
 
     chans = k.all_channels()
 
@@ -90,7 +85,7 @@ with TileKernel("q_proj_gemm_token_stationary", device) as k:
 
         with k.serial("m", M, carry=(y_wave,)) as tokens:
             m, (y_token,) = tokens.index, tokens.carried
-            acc0 = k.wr_bias(zeros, stride=0, channels=chans)
+            acc0 = k.wr_bias_zero(channels=chans)
 
             with k.serial("k_tile", K_TILES, carry=(acc0,)) as reduce:
                 kt, (acc,) = reduce.index, reduce.carried
@@ -111,6 +106,7 @@ with TileKernel("q_proj_gemm_token_stationary", device) as k:
 token_stationary = k.build()
 # TODO(Step 6): print(evaluate(token_stationary, device).summary())
 print(print_function(token_stationary.function))
+print(aim_trace(token_stationary, arch))  # the AiM simulator trace
 
 
 # ==============================================================================
@@ -179,6 +175,7 @@ with TileKernel("q_proj_gemm_weight_row_stationary", device) as k:
 weight_row_stationary = k.build()
 # TODO(Step 6): print(evaluate(weight_row_stationary, device).summary())
 print(print_function(weight_row_stationary.function))
+print(aim_trace(weight_row_stationary, arch))  # the AiM simulator trace
 
 # Both schedules issue the same MACs and GB writes; they differ in row
 # switches and WR_BIAS/RD_MAC round trips. The reports give both, and the

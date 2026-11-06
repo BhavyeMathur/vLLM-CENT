@@ -228,26 +228,49 @@ Factor = Serial | Row | Channel | Bank | Column | Mac | Slot | Lane
 
 @dataclass(frozen=True, slots=True)
 class LayoutSpec:
-    """Unresolved per-dimension factorizations, outermost factor first."""
+    """Unresolved per-dimension factorizations, outermost factor first.
+
+    Attributes:
+        dims: The factors of each tensor dimension, outermost first.
+        dim_names: A name per dimension, for messages.
+        channels: For a DRAM layout, the consecutive channels it occupies;
+            None for all of them. Its ``Channel`` factors then number the
+            channels from ``channels.start``, e.g. K and V projections on
+            disjoint channel groups.
+    """
 
     dims: tuple[tuple[Factor, ...], ...]
     dim_names: tuple[str, ...] = ()
+    channels: range | None = None
 
     def __post_init__(self) -> None:
-        """Store the factors as tuples; check one name per dimension."""
+        """Store the factors as tuples; check names and the channel range."""
         dims = tuple(tuple(d) for d in self.dims)
         object.__setattr__(self, "dims", dims)
         object.__setattr__(self, "dim_names", tuple(self.dim_names))
         if self.dim_names and len(self.dim_names) != len(dims):
             raise ValueError("dim_names must match dims in length")
+        if self.channels is not None and (
+            self.channels.step != 1 or len(self.channels) < 1 or self.channels.start < 0
+        ):
+            raise ValueError(
+                f"channels must be a non-empty range of consecutive channels, "
+                f"got {self.channels}"
+            )
 
 
-def split(**dims: Sequence[Factor]) -> LayoutSpec:
-    """Build a ``LayoutSpec`` from keyword arguments in tensor-dimension order."""
+def split(*, channels: range | None = None, **dims: Sequence[Factor]) -> LayoutSpec:
+    """Build a ``LayoutSpec`` from keyword arguments in tensor-dimension order.
+
+    Args:
+        channels: For a DRAM layout, the channels it occupies (default all).
+        **dims: Each dimension's factors, outermost first.
+    """
 
     return LayoutSpec(
         dims=tuple(tuple(factors) for factors in dims.values()),
         dim_names=tuple(dims.keys()),
+        channels=channels,
     )
 
 
@@ -355,6 +378,26 @@ class PhysicalLayout:
         return tuple(rf for rf in self.factors if _is_channel_part(rf.factor))
 
     @property
+    def first_channel(self) -> int:
+        """The lowest channel the layout occupies (``LayoutSpec.channels``)."""
+        return 0 if self.spec.channels is None else self.spec.channels.start
+
+    def occupied_channels(self, arch_channels: int) -> range:
+        """The channels the layout occupies on a device of ``arch_channels``."""
+        return (
+            range(arch_channels) if self.spec.channels is None else self.spec.channels
+        )
+
+    def channel_base(self, first_slot: int) -> int:
+        """``Rd``/``Rs`` of a tile of one slot per channel.
+
+        Channel ``c`` uses slot ``Rd + c``. A layout on channels from ``f``
+        stores channel ``c`` at ``first_slot + c - f``, so ``Rd`` is
+        ``first_slot - f``.
+        """
+        return first_slot - self.first_channel
+
+    @property
     def row_factors(self) -> tuple[ResolvedFactor, ...]:
         """The factors that form the column address in a DRAM row, high first.
 
@@ -429,20 +472,47 @@ class PhysicalLayout:
         return self.tile_count() * self.slots_per_tile
 
     def locate(self, index: Mapping[str, int]) -> DramTile | SbTile:
-        """Return the physical tile address selected by ``index``."""
+        """Return the physical tile address selected by ``index``.
+
+        A last, partial tile (see ``resolve``) has a smaller ``opsize`` or
+        fewer ``slots``: only the bursts that hold elements.
+        """
 
         tile_num = self.tile_number(index)
+        valid = self._valid_extents(index)
         if self.space is MemorySpace.PIM_DRAM:
-            row_values = prod(rf.extent for rf in self.row_factors)
+            row_values = prod(valid[rf] for rf in self.row_factors)
             return DramTile(
                 row=self.base + tile_num,
-                opsize=row_values // self.burst_values,
+                opsize=-(-row_values // self.burst_values),
             )
-        slots = self.slots_per_tile
         return SbTile(
-            first_slot=self.base + tile_num * slots,
-            slots=slots,
+            first_slot=self.base + tile_num * self.slots_per_tile,
+            slots=prod(
+                valid[rf] for rf in self.tile_factors if isinstance(rf.factor, Slot)
+            ),
         )
+
+    def _valid_extents(self, index: Mapping[str, int]) -> dict[ResolvedFactor, int]:
+        """How many values of each tile factor hold elements in this tile.
+
+        Every factor is full except in a dimension whose last index selects
+        a partial tile: there a factor of stride ``s`` holds
+        ``ceil(remaining / s)`` values, at most its extent.
+        """
+
+        valid = {rf: rf.extent for rf in self.factors}
+        for dim, size in enumerate(self.shape):
+            factors = [rf for rf in self.factors if rf.dim == dim]
+            outer = factors[0]
+            if outer.extent * outer.stride == size or outer.name is None:
+                continue
+            remaining = size - index[outer.name] * outer.stride
+            if remaining >= outer.stride:
+                continue
+            for rf in factors[1:]:
+                valid[rf] = min(rf.extent, -(-remaining // rf.stride))
+        return valid
 
     def locate_element(self, coords: Sequence[int]) -> DramElement | SbElement:
         """Map one logical element coordinate ``(d_0, d_1, ...)`` to hardware storage."""
@@ -468,6 +538,7 @@ class PhysicalLayout:
             channel = 0
             for rf in self.channel_factors:
                 channel = channel * rf.extent + rf.extract(coords[rf.dim])
+            channel += self.first_channel
             # The column address, in mixed radix over Mac and Column.
             col = 0
             for rf in self.row_factors:
@@ -524,9 +595,18 @@ def _channel_extents(
         The extent of each channel factor, keyed by (dimension, position).
 
     Raises:
-        ValueError: If more than one channel factor omits its extent, or the
-            extents do not multiply to ``arch.channels``.
+        ValueError: If more than one channel factor omits its extent, the
+            extents do not multiply to the layout's channel count, or the
+            channel range does not fit the device or is not a DRAM layout.
     """
+
+    total = arch.channels
+    if spec.channels is not None:
+        if spec.channels.stop > arch.channels:
+            raise ValueError(
+                f"channels {spec.channels} exceed the device's {arch.channels}"
+            )
+        total = len(spec.channels)
 
     kind = "Channel" if space is MemorySpace.PIM_DRAM else "Slot(of=Channel)"
     in_dram = space is MemorySpace.PIM_DRAM
@@ -548,16 +628,16 @@ def _channel_extents(
             f"{len(missing)} {kind} factors omit their extent; at most one may"
         )
     if missing:
-        if arch.channels % known != 0:
+        if total % known != 0:
             raise ValueError(
-                f"{kind} extents {known} do not divide the {arch.channels} channels"
+                f"{kind} extents {known} do not divide the {total} channels"
             )
-        declared[missing[0]] = arch.channels // known
+        declared[missing[0]] = total // known
     extents = {key: int(e) for key, e in declared.items() if e is not None}
-    if prod(extents.values()) != arch.channels:
+    if prod(extents.values()) != total:
         raise ValueError(
             f"{kind} extents {list(extents.values())} multiply to "
-            f"{prod(extents.values())}, expected {arch.channels} channels"
+            f"{prod(extents.values())}, expected {total} channels"
         )
     return extents
 
@@ -701,10 +781,20 @@ def resolve(
             extents[hole] = dim_size // known_product
 
         concrete_extents = [int(e) for e in extents if e is not None]
-        if prod(concrete_extents) != dim_size:
+        total = prod(concrete_extents)
+        # A last, partial tile: the outermost factor is an index factor and
+        # only its last value selects fewer elements than a whole tile.
+        inner = total // concrete_extents[0]
+        ragged = (
+            total > dim_size
+            and isinstance(dim_factors[0], (Serial, Row))
+            and (concrete_extents[0] - 1) * inner < dim_size
+        )
+        if total != dim_size and not ragged:
             raise ValueError(
                 f"{dim_label} factor extents {concrete_extents} multiply to "
-                f"{prod(concrete_extents)}, expected dimension size {dim_size}"
+                f"{total}, expected dimension size {dim_size} (or, with an "
+                "index factor outermost, more by less than one tile)"
             )
 
         # Compute mixed-radix strides from innermost (stride = 1) to outermost.
@@ -788,15 +878,18 @@ def resolve(
 
 
 def allocate(
-    layouts: Mapping[Value, PhysicalLayout], arch: CentArchitecture
+    layouts: Mapping[Value, PhysicalLayout],
+    arch: CentArchitecture,
+    fixed: frozenset[Value] = frozenset(),
 ) -> dict[Value, PhysicalLayout]:
     """Assign non-overlapping ``base`` rows (DRAM) and slots (Shared Buffer).
 
     Tensors are placed one after another in the order of ``layouts``.
 
-    Shared Buffer layouts containing ``Slot(of=Channel())`` have their ``base``
-    aligned up to a multiple of ``arch.channels`` so every ``RD_MAC`` /
-    ``WR_BIAS`` base slot ``Rd``/``Rs`` is channel-aligned.
+    Shared Buffer layouts containing ``Slot(of=Channel())`` are placed so
+    that every ``RD_MAC`` / ``WR_BIAS`` base slot ``Rd``/``Rs`` is a multiple
+    of ``arch.channels`` (``PhysicalLayout.channel_base``). Layouts whose base
+    is already set (``fixed``) keep it; the others are placed after them.
 
     Raises:
         ValueError: If total DRAM rows exceed ``arch.rows_per_bank`` or total
@@ -806,12 +899,25 @@ def allocate(
     max_rows = arch.rows_per_bank
     max_slots = arch.shared_buffer_size // arch.burst_size
 
-    next_row = 0
-    next_slot = 0
+    # Place the others after every fixed layout of the same space.
+    def end(space: MemorySpace) -> int:
+        return max(
+            (
+                layouts[v].base + layouts[v].footprint()
+                for v in fixed
+                if layouts[v].space is space
+            ),
+            default=0,
+        )
+
+    next_row = end(MemorySpace.PIM_DRAM)
+    next_slot = end(MemorySpace.PNM_SB)
     allocated: dict[Value, PhysicalLayout] = {}
 
     for value, layout in layouts.items():
-        if layout.space is MemorySpace.PIM_DRAM:
+        if value in fixed:
+            allocated[value] = layout
+        elif layout.space is MemorySpace.PIM_DRAM:
             base = next_row
             next_row += layout.footprint()
             if next_row > max_rows:
@@ -822,8 +928,9 @@ def allocate(
             allocated[value] = replace(layout, base=base)
         elif layout.space is MemorySpace.PNM_SB:
             if layout.needs_channel_alignment:
-                c = arch.channels
-                next_slot = ((next_slot + c - 1) // c) * c
+                # The first slot is f + Rd, with Rd a multiple of the channels.
+                c, f = arch.channels, layout.first_channel
+                next_slot = -(-max(next_slot - f, 0) // c) * c + f
             base = next_slot
             next_slot += layout.footprint()
             if next_slot > max_slots:

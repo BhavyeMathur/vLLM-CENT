@@ -14,7 +14,9 @@ from ..ir.tile import (
     CentTensorType,
     CentTileOp,
     CentWrBiasOp,
+    CentWrBiasZeroOp,
     CentWrGbOp,
+    TileConstOp,
     TileForOp,
 )
 from ..ir.types import MemorySpace
@@ -128,11 +130,22 @@ def _check_layouts(
                     )
             dram_intervals.append((start, end, name))
         else:
-            if layout.needs_channel_alignment and start % arch.channels != 0:
-                raise ValueError(
-                    f"kernel argument {name} layout requires base aligned to "
-                    f"{arch.channels} channels, got base {start}"
-                )
+            if layout.needs_channel_alignment:
+                # Every tile's Rd = first slot - first channel must be a
+                # multiple of the channel count.
+                rd = layout.channel_base(start)
+                if (
+                    rd < 0
+                    or rd % arch.channels != 0
+                    or (
+                        layout.tile_count() > 1
+                        and layout.slots_per_tile % arch.channels
+                    )
+                ):
+                    raise ValueError(
+                        f"kernel argument {name} layout requires base aligned to "
+                        f"{arch.channels} channels, got base {start} (Rd {rd})"
+                    )
             if end > max_slots:
                 raise ValueError(
                     f"kernel argument {name} occupies Shared Buffer slots "
@@ -212,9 +225,13 @@ def _analyze_ops(
                             f"channels {list(y_ch or ())}"
                         )
                     facts.channels[result] = c_ch
+        elif isinstance(op, TileConstOp):
+            # A constant index c selects as if by a loop of c + 1 iterations,
+            # so the loop-extent bound check also bounds constants.
+            facts.extent[op.results[0]] = op.value + 1
         elif isinstance(op, CentRdMacOp):
             facts.root[op.results[0]] = facts.root[op.destination]
-        elif isinstance(op, (CentWrGbOp, CentWrBiasOp, CentMacAbkOp)):
+        elif isinstance(op, (CentWrGbOp, CentWrBiasOp, CentWrBiasZeroOp, CentMacAbkOp)):
             facts.channels[op.results[0]] = op.channels
         else:
             raise ValueError(f"unsupported op in CENT kernel: {label}")
@@ -236,6 +253,23 @@ def _is_channel_bank_sb_tile(layout: PhysicalLayout) -> bool:
         and isinstance(lane.factor, Lane)
         and lane.factor.of is not None
     )
+
+
+def _check_tile_channels(
+    label: str,
+    op: CentTileOp,
+    layout: PhysicalLayout,
+    arch: CentArchitecture,
+    tensor: str,
+) -> None:
+    """A one-slot-per-channel tile holds slots only for its own channels."""
+
+    occupied = layout.occupied_channels(arch.channels)
+    if not set(op.channels) <= set(occupied):
+        raise ValueError(
+            f"{label}: channels {list(op.channels)} have no slots in "
+            f"%{tensor}, laid out on channels {occupied}"
+        )
 
 
 def _check_accumulator(
@@ -273,6 +307,8 @@ def _check_ops(
             if isinstance(op, TileForOp):
                 walk(op.body.operations)
                 continue
+            if isinstance(op, TileConstOp):
+                continue
 
             assert isinstance(op, CentTileOp)
             if op.channels[-1] >= arch.channels:
@@ -281,6 +317,15 @@ def _check_ops(
                     f"with {arch.channels} channels"
                 )
 
+            if isinstance(op, CentWrBiasZeroOp):
+                # It reads no tensor: only its register tile needs checking.
+                expected = (len(op.channels), arch.banks_per_channel)
+                if op.shape != expected:
+                    raise ValueError(
+                        f"{label}: MAC register shape must be {list(expected)}, "
+                        f"got {list(op.shape)}"
+                    )
+                continue
             if isinstance(op, (CentWrGbOp, CentWrBiasOp)):
                 indexed_value = op.source
             elif isinstance(op, CentMacAbkOp):
@@ -304,7 +349,7 @@ def _check_ops(
             for factor_name, idx_val in zip(op.at, op.indices, strict=True):
                 if idx_val not in facts.extent:
                     raise ValueError(
-                        f"{label}: index %{names[idx_val]} is not a loop index"
+                        f"{label}: index %{names[idx_val]} is not a loop index or a constant"
                     )
                 loop_ext = facts.extent[idx_val]
                 factor_ext = factor_by_name[factor_name].extent
@@ -343,6 +388,7 @@ def _check_ops(
                             f"single-slot tensor, got {layout.footprint()} slots"
                         )
                 else:
+                    _check_tile_channels(label, op, layout, arch, names[root])
                     if not _is_channel_bank_sb_tile(layout):
                         raise ValueError(
                             f"{label}: stride=1 source %{names[root]} tile factors "
@@ -367,6 +413,12 @@ def _check_ops(
                         f"{label}: weight Column extent ({col_rf.extent}) does not "
                         f"match Global Buffer tile size ({gb_vals})"
                     )
+                weight_channels = layout.occupied_channels(arch.channels)
+                if not set(op.channels) <= set(weight_channels):
+                    raise ValueError(
+                        f"{label}: channels {list(op.channels)} are not all "
+                        f"channels of weight %{names[root]} ({weight_channels})"
+                    )
                 gb_ch = facts.channels[op.global_buffer]
                 if not set(op.channels).issubset(set(gb_ch)):
                     raise ValueError(
@@ -376,6 +428,7 @@ def _check_ops(
                 _check_accumulator(label, op, facts, arch, names)
 
             elif isinstance(op, CentRdMacOp):
+                _check_tile_channels(label, op, layout, arch, names[root])
                 if not _is_channel_bank_sb_tile(layout):
                     raise ValueError(
                         f"{label}: destination %{names[root]} tile factors must be "

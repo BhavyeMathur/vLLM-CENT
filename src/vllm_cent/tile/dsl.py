@@ -10,8 +10,9 @@ semantics of its own; every construct is one Tile IR structure:
   ``loop.index`` and ``loop.carried`` are its block arguments,
   ``loop.yield_(...)`` sets the block's results, and ``loop.results`` (after
   the ``with`` block) are the op's results.
-- ``k.wr_bias``, ``k.wr_gb``, ``k.mac_abk`` and ``k.rd_mac`` each record one
-  ``cent.*`` op; ``channels=`` is its channel mask.
+- ``k.wr_bias``, ``k.wr_bias_zero``, ``k.wr_gb``, ``k.mac_abk`` and
+  ``k.rd_mac`` each record one ``cent.*`` op; ``channels=`` is its channel
+  mask.
 - ``t.tile(n_wave=n)`` names one tile of ``t`` by the index factors of its
   layout. The DSL derives the shapes the ops need from the layout and the
   device, so a kernel never writes them.
@@ -24,7 +25,7 @@ device. See ``examples/Tile_DSL`` for whole kernels.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import prod
 from types import TracebackType
 
@@ -37,7 +38,9 @@ from ..ir.tile import (
     CentRdMacOp,
     CentTensorType,
     CentWrBiasOp,
+    CentWrBiasZeroOp,
     CentWrGbOp,
+    TileConstOp,
     TileForOp,
 )
 from ..ir.types import DType, MemorySpace, TensorType
@@ -71,12 +74,13 @@ class TileValue:
         """The IR value's type."""
         return self.value.type
 
-    def tile(self, **index: TileValue) -> TileRef:
-        """Name the tile selected by one loop index per index factor.
+    def tile(self, **index: TileValue | int) -> TileRef:
+        """Name the tile selected by one index per index factor.
 
         Args:
             **index: For each index factor of the tensor's layout (``Serial``
-                or ``Row``), the loop index that selects it.
+                or ``Row``), the loop index that selects it, or a constant
+                (recorded as ``tile.const``) where the schedule is unrolled.
 
         Returns:
             The tile, to pass to a ``cent.*`` op.
@@ -222,6 +226,7 @@ class TileKernel:
         self.arch = arch
         self._arguments: list[Value] = []
         self._layouts: dict[Value, PhysicalLayout] = {}
+        self._fixed: set[Value] = set()
         self._top: list[Operation] = []
         self._loops: list[Loop] = []
         self._results: tuple[Value, ...] | None = None
@@ -273,11 +278,20 @@ class TileKernel:
         self._arguments.append(value)
         return TileValue(value, self, root=value, hint=name)
 
-    def bind_layout(self, tensor: TileValue, spec: LayoutSpec) -> PhysicalLayout:
+    def bind_layout(
+        self, tensor: TileValue, spec: LayoutSpec, *, base: int | None = None
+    ) -> PhysicalLayout:
         """Resolve ``spec`` for a kernel tensor on this device.
 
+        Args:
+            tensor: A tensor made by ``k.tensor()``.
+            spec: Its layout.
+            base: Its first DRAM row or Shared Buffer slot, where a mapping
+                fixes it (e.g. a weight placed with the whole model);
+                otherwise ``build`` places it after the fixed ones.
+
         Returns:
-            The resolved layout; its base is set by ``build``.
+            The resolved layout; ``build`` sets its base unless given here.
 
         Raises:
             ValueError: If the value is not a kernel tensor, already has a
@@ -290,6 +304,9 @@ class TileKernel:
         if value in self._layouts:
             raise ValueError(f"tensor {value.name!r} already has a layout")
         layout = resolve(spec, value.type, self.arch)
+        if base is not None:
+            layout = replace(layout, base=base)
+            self._fixed.add(value)
         self._layouts[value] = layout
         return layout
 
@@ -328,6 +345,46 @@ class TileKernel:
             at=ref.at,
             stride=stride,
             shape=(len(channels), self.arch.banks_per_channel),
+            name_hint=name or "acc",
+        )
+        return self._emit(op, hint=name or "acc")
+
+    def wr_bias_zero(
+        self,
+        *,
+        channels: Sequence[int],
+        dtype: DType | str | None = None,
+        name: str | None = None,
+    ) -> TileValue:
+        """Clear the MAC registers of ``channels``: a sum starts at zero.
+
+        Reads no Shared Buffer slot, so no tensor of zeros is needed.
+
+        Args:
+            channels: The channel mask.
+            dtype: The registers' type; by default the one dtype of the
+                kernel's tensors.
+            name: The name the result prints with.
+
+        Raises:
+            ValueError: If ``dtype`` is omitted and the kernel's tensors do
+                not share one dtype.
+        """
+
+        if dtype is None:
+            dtypes = {argument.type.dtype for argument in self._arguments}
+            if len(dtypes) != 1:
+                raise ValueError(
+                    "wr_bias_zero needs dtype= when the kernel's tensors do not "
+                    f"share one dtype, got {sorted(dtypes)}"
+                )
+            dtype = dtypes.pop()
+        channels = tuple(channels)
+        op = CentWrBiasZeroOp(
+            operands=(),
+            channels=channels,
+            shape=(len(channels), self.arch.banks_per_channel),
+            dtype=DType.normalize(dtype),
             name_hint=name or "acc",
         )
         return self._emit(op, hint=name or "acc")
@@ -436,7 +493,9 @@ class TileKernel:
             ordered = {
                 a: self._layouts[a] for a in self._arguments if a in self._layouts
             }
-            kernel = CentKernel(function, allocate(ordered, self.arch))
+            kernel = CentKernel(
+                function, allocate(ordered, self.arch, frozenset(self._fixed))
+            )
             verify_kernel(kernel, self.arch)
             self._kernel = kernel
         return self._kernel
@@ -467,7 +526,9 @@ class TileKernel:
             )
         return layout
 
-    def _tile_ref(self, tensor: TileValue, index: dict[str, TileValue]) -> TileRef:
+    def _tile_ref(
+        self, tensor: TileValue, index: dict[str, TileValue | int]
+    ) -> TileRef:
         """Build the ``TileRef`` for ``tensor.tile(**index)``."""
 
         layout = self._layout_of(self._own(tensor))
@@ -477,8 +538,18 @@ class TileKernel:
                 f"a tile of {tensor.hint!r} needs one index for each of "
                 f"{list(layout.index_names)}, got {list(names)}"
             )
-        indices = tuple(self._own(v).value for v in index.values())
+        indices = tuple(
+            self._const(v) if isinstance(v, int) else self._own(v).value
+            for v in index.values()
+        )
         return TileRef(tensor, names, indices)
+
+    def _const(self, value: int) -> Value:
+        """Record ``tile.const`` in the innermost open block; return its index."""
+
+        op = TileConstOp(operands=(), value=value, name_hint=f"c{value}")
+        self._record(op)
+        return op.results[0]
 
     def _ref(self, source: TileValue | TileRef) -> TileRef:
         """A whole tensor is the tile with no indices."""

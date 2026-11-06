@@ -1,4 +1,4 @@
-"""Target-independent Tile IR ops: structured loops."""
+"""Target-independent Tile IR ops: structured loops and constant indices."""
 
 from dataclasses import dataclass
 
@@ -107,3 +107,32 @@ class TileForOp(Operation):
                 )
 
         return tuple(value.type for value in self.body.results)
+
+
+@dataclass(frozen=True, eq=False, slots=True)
+class TileConstOp(Operation):
+    """``tile.const() {value}``: a constant index.
+
+    Names a fixed tile where the schedule is unrolled, e.g. the j-th output
+    of a group whose MACs are issued back to back. Like a loop index, it is
+    an ``INDEX``; its value must lie within the factor it selects, which the
+    kernel verifier checks.
+    """
+
+    NAME = "tile.const"
+    NUM_OPERANDS = 0
+
+    value: int
+
+    def infer_result_types(self) -> tuple[TensorType, ...]:
+        """Return one ``INDEX``.
+
+        Raises:
+            ValueError: If ``value`` is negative.
+        """
+
+        if self.value < 0:
+            raise ValueError(
+                f"{self.NAME}: value must be non-negative, got {self.value}"
+            )
+        return (INDEX,)

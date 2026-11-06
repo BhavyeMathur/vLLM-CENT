@@ -4,7 +4,8 @@ A value's ``CentTensorType`` says where its data is (DRAM banks, a Global
 Buffer, the MAC registers or the Shared Buffer); each ``cent.*`` op says
 where it needs its operands, as ``_DomainOp`` does for Device IR domains.
 The ops are named after the AiM instructions they become: ``cent.wr_bias``,
-``cent.wr_gb``, ``cent.mac_abk`` and ``cent.rd_mac``.
+``cent.wr_gb``, ``cent.mac_abk`` and ``cent.rd_mac``; ``cent.wr_bias_zero``
+is a ``WR_BIAS`` of zeros, which reads no Shared Buffer slot.
 
 A tile of a larger tensor is named by the whole tensor plus index operands:
 ``at[i]`` names the serial dimension of the tensor's layout that
@@ -33,7 +34,7 @@ from typing import ClassVar
 
 from ..base import Operation, Value
 from ..printer import format_type
-from ..types import MemorySpace, TensorType
+from ..types import DType, MemorySpace, TensorType
 from .tile import INDEX
 
 __all__ = [
@@ -42,6 +43,7 @@ __all__ = [
     "CentTensorType",
     "CentTileOp",
     "CentWrBiasOp",
+    "CentWrBiasZeroOp",
     "CentWrGbOp",
 ]
 
@@ -331,6 +333,48 @@ class CentWrBiasOp(_TileRefOp):
         return (
             CentTensorType(
                 shape=self.shape, dtype=source.dtype, memory_space=MemorySpace.PIM_MAC
+            ),
+        )
+
+
+@dataclass(frozen=True, eq=False, slots=True)
+class CentWrBiasZeroOp(CentTileOp):
+    """``cent.wr_bias_zero()``: clear the MAC registers (``WR_BIAS`` of zeros).
+
+    Starts a sum at zero without a Shared Buffer slot of zeros: like a zero
+    register, it reads no slot, so no tensor has to hold zeros. The AiM
+    trace still names a GPR, which the simulator requires but does not use;
+    the code generator writes 0, as CENT's own traces do.
+
+    The result is the MAC register tile, shape ``(len(channels), banks)``,
+    in ``dtype``.
+    """
+
+    NAME = "cent.wr_bias_zero"
+    NUM_OPERANDS = 0
+
+    shape: tuple[int, ...] = field(kw_only=True)
+    dtype: DType = field(kw_only=True)
+
+    def __post_init__(self) -> None:
+        """Store ``shape`` as a tuple, then run the other checks."""
+
+        object.__setattr__(self, "shape", tuple(self.shape))
+        super().__post_init__()
+
+    def infer_result_types(self) -> tuple[TensorType, ...]:
+        """Return MAC registers of ``shape`` in ``dtype``.
+
+        Raises:
+            ValueError: If ``shape`` is not ``(len(channels), banks)``.
+        """
+
+        _check_mac_shape(self, self.shape)
+        return (
+            CentTensorType(
+                shape=self.shape,
+                dtype=DType.normalize(self.dtype),
+                memory_space=MemorySpace.PIM_MAC,
             ),
         )
 

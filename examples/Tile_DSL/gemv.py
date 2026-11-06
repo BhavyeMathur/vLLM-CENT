@@ -2,7 +2,10 @@
 
 Run from the repository root: ``python examples/Tile_DSL/gemv.py``. Each
 kernel is built with ``vllm_cent.tile.dsl``, verified for the device, and
-printed; each DSL construct maps to one IR structure:
+printed, then printed again as an AiM simulator trace
+(``vllm_cent.tile.codegen``); schedule 2's trace is CENT's own GEMV trace
+(``../ALOI/cent_simulation``) but for the GPR field. Each DSL construct maps
+to one IR structure:
 
 - ``with k.serial(name, extent, carry=...) as loop`` builds one ``tile.for``.
   ``loop.index`` and ``loop.carried`` are its block arguments,
@@ -52,11 +55,14 @@ hardware rule:
   ``Rs + c`` (aligned, as for ``RD_MAC``); with ``stride=0`` every channel
   reads slot ``Rs``.
 
-Expansion issues one ``RD_MAC`` per channel, and one ``WR_BIAS`` per
-channel for ``stride=1``, each with its channel's slot; ``WR_BIAS`` with
-``stride=0`` is a single instruction with the full ``channel_mask``.
-CENT's own traces issue one full-mask ``RD_MAC`` instead, so their
-timings are not directly comparable.
+A sum that starts at zero uses ``wr_bias_zero``: a ``WR_BIAS`` of zeros that
+reads no Shared Buffer slot, like a zero register.
+
+How these transfers reach many channels is the run spec's
+``codegen.channel_issue``: ``broadcast`` issues one full-mask instruction
+naming the base slot, as CENT's own traces do; ``serialize`` issues one
+instruction per channel, each naming its own slot (see
+``vllm_cent.tile.expand``).
 
 Kernel: ``y = w @ x`` (``nn.Linear``: ``w`` is ``[N, K]``), ``N = K = 4096``,
 bf16. Every size below is derived from the device spec; nothing is assumed
@@ -67,6 +73,7 @@ from vllm_cent.device import CentArchitecture, MemorySpace, load_device_spec
 from vllm_cent.ir import DType
 from vllm_cent.ir import print_function
 from vllm_cent.tile import Bank, Channel, Column, Lane, Row, Serial, Slot, split
+from vllm_cent.tile.codegen import aim_trace
 from vllm_cent.tile.dsl import TileKernel
 
 device = load_device_spec("examples/cent/cent.yaml")
@@ -100,11 +107,6 @@ with TileKernel("q_proj_gemv_output_stationary", device) as k:
     x = k.tensor("x", (K,), BF16, MemorySpace.PNM_SB)
     w = k.tensor("w", (N, K), BF16, MemorySpace.PIM_DRAM)
     y = k.tensor("y", (N,), BF16, MemorySpace.PNM_SB)
-    # WR_BIAS only copies a burst into the MAC registers, so starting a sum
-    # at zero needs a Shared Buffer slot that holds zeros.
-    # TODO(runtime): Nothing defines how that slot is filled yet (see
-    # cent/instructions/data_movement.py), so the kernel takes it as input.
-    zeros = k.tensor("zeros", (BANKS,), BF16, MemorySpace.PNM_SB)
 
     # x: one reduction tile after another; a tile fills Shared Buffer slots
     # of one burst (lanes) each. Slot() and Lane() sizes follow the device.
@@ -125,14 +127,13 @@ with TileKernel("q_proj_gemv_output_stationary", device) as k:
     k.bind_layout(
         y, split(n=(Serial("n_wave", N_WAVES), Slot(of=Channel()), Lane(of=Bank())))
     )
-    # zeros: one slot that every channel reads (WR_BIAS stride=0).
-    k.bind_layout(zeros, split(b=(Slot(1), Lane(of=Bank()))))
 
     chans = k.all_channels()  # channel_mask selecting every channel
 
     with k.serial("n_wave", N_WAVES, carry=(y,)) as waves:
         n, (y_now,) = waves.index, waves.carried
-        acc0 = k.wr_bias(zeros, stride=0, channels=chans)
+        # A WR_BIAS of zeros: it reads no Shared Buffer slot.
+        acc0 = k.wr_bias_zero(channels=chans)
 
         with k.serial("k_tile", K_TILES, carry=(acc0,)) as reduce:
             kt, (acc,) = reduce.index, reduce.carried
@@ -150,6 +151,7 @@ with TileKernel("q_proj_gemv_output_stationary", device) as k:
 output_stationary = k.build()  # a CentKernel: the function and its layouts
 # TODO(Step 6): print(evaluate(output_stationary, device).summary())
 print(print_function(output_stationary.function))
+print(aim_trace(output_stationary, arch))  # the AiM simulator trace
 
 
 # ==============================================================================
@@ -167,7 +169,7 @@ with TileKernel("q_proj_gemv_gb_stationary", device) as k:
     # The same tensors and layout as schedule 1: only the loops differ.
     x = k.tensor("x", (K,), BF16, MemorySpace.PNM_SB)
     w = k.tensor("w", (N, K), BF16, MemorySpace.PIM_DRAM)
-    # TODO(runtime): y must be zero on entry, like the zeros slot above.
+    # TODO(runtime): y must be zero on entry: the first WR_BIAS reads it.
     y = k.tensor("y", (N,), BF16, MemorySpace.PNM_SB)
     k.bind_layout(x, split(k=(Serial("k_tile", K_TILES), Slot(), Lane())))
     k.bind_layout(
@@ -204,6 +206,7 @@ with TileKernel("q_proj_gemv_gb_stationary", device) as k:
 gb_stationary = k.build()
 # TODO(Step 6): print(evaluate(gb_stationary, device).summary())
 print(print_function(gb_stationary.function))
+print(aim_trace(gb_stationary, arch))  # the AiM simulator trace
 
 # Which schedule is faster is the model's answer, not an assumption: the
 # reports give GB writes, WR_BIAS/RD_MAC round trips, row switches and the

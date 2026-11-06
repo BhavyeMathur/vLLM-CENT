@@ -6,9 +6,10 @@ from .cent import (
     CentTensorType,
     CentTileOp,
     CentWrBiasOp,
+    CentWrBiasZeroOp,
     CentWrGbOp,
 )
-from .tile import INDEX, TileForOp
+from .tile import INDEX, TileConstOp, TileForOp
 
 __all__ = [
     "INDEX",
@@ -17,6 +18,8 @@ __all__ = [
     "CentTensorType",
     "CentTileOp",
     "CentWrBiasOp",
+    "CentWrBiasZeroOp",
     "CentWrGbOp",
+    "TileConstOp",
     "TileForOp",
 ]
