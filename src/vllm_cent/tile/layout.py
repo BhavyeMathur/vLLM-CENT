@@ -417,6 +417,38 @@ class PhysicalLayout:
         object.__setattr__(self, "factors", tuple(self.factors))
         object.__setattr__(self, "shape", tuple(self.shape))
 
+    def describe(self) -> str:
+        """One line: the space, base and each dimension's resolved factors.
+
+        For example ``pim.dram row 3: n=(Serial col 2, Channel 32, Bank 16),
+        k=(Row k_row 8, Column 1024)``.
+        """
+
+        names = self.spec.dim_names or tuple(f"d{i}" for i in range(len(self.shape)))
+        dims = []
+        for dim, name in enumerate(names):
+            parts = []
+            for rf in (rf for rf in self.factors if rf.dim == dim):
+                factor = rf.factor
+                label = type(factor).__name__
+                if isinstance(factor, Bank) and factor.every > 1:
+                    label = f"Bank(every {factor.every}, offset {factor.offset})"
+                elif isinstance(factor, Slot) and factor.of is not None:
+                    label = "Slot(of Channel)"
+                elif isinstance(factor, Lane) and factor.of is not None:
+                    label = "Lane(of Bank)"
+                if rf.name is not None:
+                    label = f"{label} {rf.name}"
+                parts.append(f"{label} {rf.extent}")
+            dims.append(f"{name}=({', '.join(parts)})")
+        where = "row" if self.space is MemorySpace.PIM_DRAM else "slot"
+        channels = (
+            ""
+            if self.spec.channels is None
+            else f" on channels {self.spec.channels.start}-{self.spec.channels.stop - 1}"
+        )
+        return f"{self.space.value} {where} {self.base}{channels}: {', '.join(dims)}"
+
     @property
     def index_factors(self) -> tuple[ResolvedFactor, ...]:
         """The ``Serial`` and ``Row`` factors in layout order."""

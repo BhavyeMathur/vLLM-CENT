@@ -24,7 +24,12 @@ attention norm uses its own row 0.
 
 Run from the repository root::
 
-    python -m examples.llama_70b.kernel_mapping.llama3_1_70b [trace.txt]
+    python -m examples.llama_70b.kernel_mapping.llama3_1_70b [OUT_DIR]
+
+With ``OUT_DIR`` (``examples/llama_70b/llama3_1_70b_ir``), it writes every
+stage of the run: ``00``-``03`` as ``aloi-compile`` does, ``04_tile.aloi``
+(the kernels' Tile IR, with their layouts) and ``05_aim.trace``; without,
+it prints the trace.
 """
 
 from __future__ import annotations
@@ -37,7 +42,7 @@ from pathlib import Path
 
 from vllm_cent.device import CentArchitecture, DeviceSpec, load_device_spec
 from vllm_cent.driver import RunSpec, compile_module, load_model, load_run_spec
-from vllm_cent.ir import Function, Operation, Value
+from vllm_cent.ir import Function, Operation, Value, print_function
 from vllm_cent.ir.device import PIMGemvOp
 from vllm_cent.tile import CentKernel
 from vllm_cent.tile.codegen import MAC_FROM_GLOBAL_BUFFER, iter_aim_records
@@ -105,6 +110,7 @@ class LayerMapping:
     """
 
     ops: tuple[Operation, ...]
+    name: str = "layer"
     kernels: dict[Operation, CentKernel] = field(default_factory=dict)
     covered_by: dict[Operation, Operation] = field(default_factory=dict)
     comments: dict[Operation, str] = field(default_factory=dict)
@@ -445,21 +451,70 @@ def device_ir(run: RunSpec, device: DeviceSpec) -> Function:
     return module.functions[0]
 
 
-def main(argv: list[str]) -> None:
-    """Write the layer's trace to ``argv[0]``, or print it."""
+def tile_text(mapping: LayerMapping) -> str:
+    """The layer's kernels as Tile IR, in op order, each with its layouts.
+
+    ``//`` lines name the Device IR ops a kernel runs and give each kernel
+    tensor's physical layout; the functions are printed as the IR printer
+    prints them.
+    """
+
+    sections = [f"module @{mapping.name}_tile"]
+    for op in mapping.ops:
+        kernel = mapping.kernels.get(op)
+        if kernel is None:
+            continue
+        runs = [op, *(o for o, by in mapping.covered_by.items() if by is op)]
+        header = [f"// {o.NAME} ({o.name_hint})" for o in runs]
+        header += [
+            f"// layout %{arg.name}: {kernel.layouts[arg].describe()}"
+            for arg in kernel.function.arguments
+        ]
+        sections.append("\n".join([*header, print_function(kernel.function)]))
+    return "\n\n".join(sections) + "\n"
+
+
+def write_stages(out_dir: Path) -> list[Path]:
+    """Write every stage of the evaluated run to ``out_dir``.
+
+    Returns:
+        The files written.
+    """
 
     run = load_run_spec(RUN)
     device = load_device_spec(DEVICE)
     arch = device.architecture
     assert isinstance(arch, CentArchitecture)
-    mapping = map_layer(device_ir(run, device), arch, run.workload.context_len)
-    lines = layer_trace(mapping, arch, run.codegen.channel_issue)
+    module, texts = compile_module(load_model(MODEL), run, device)
+    mapping = map_layer(module.functions[0], arch, run.workload.context_len)
+    mapping.name = module.name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    files = {f"{stage}.aloi": text for stage, text in texts.items()}
+    files["04_tile.aloi"] = tile_text(mapping)
+    trace = layer_trace(mapping, arch, run.codegen.channel_issue)
+    files["05_aim.trace"] = "".join(line + "\n" for line in trace)
+    paths = []
+    for name, text in files.items():
+        path = out_dir / name
+        path.write_text(text)
+        paths.append(path)
+    return paths
+
+
+def main(argv: list[str]) -> None:
+    """Write every stage to ``argv[0]``, or print the layer's trace."""
+
     if argv:
-        with Path(argv[0]).open("w") as out:
-            out.writelines(line + "\n" for line in lines)
-    else:
-        for line in lines:
-            print(line)
+        for path in write_stages(Path(argv[0])):
+            print(path)
+        return
+    run = load_run_spec(RUN)
+    device = load_device_spec(DEVICE)
+    arch = device.architecture
+    assert isinstance(arch, CentArchitecture)
+    mapping = map_layer(device_ir(run, device), arch, run.workload.context_len)
+    for line in layer_trace(mapping, arch, run.codegen.channel_issue):
+        print(line)
 
 
 if __name__ == "__main__":
