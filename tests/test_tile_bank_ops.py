@@ -236,7 +236,7 @@ class BankOpTest(unittest.TestCase):
             used = tuple(range(24))
             acc = k.wr_bias_zero(channels=used)
             gb = k.wr_gb(p, channels=used)
-            acc = k.mac_abk(cache, gb, acc, channels=used)
+            acc = k.mac_abk(gb, cache, acc, channels=used)
             out = k.tensor("out", (512,), DType.BF16, MemorySpace.PNM_SB)
             k.bind_layout(out, split(n=(Slot(of=Channel()), Lane(of=Bank()))))
             k.returns(k.rd_mac(acc, into=out, channels=used))

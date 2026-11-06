@@ -181,8 +181,8 @@ def qk(
             valid = tuple(range(ceil(filled / banks_per_channel)))
             acc = k.wr_bias_zero(channels=valid)
             acc = k.mac_abk(
-                cache.tile(wave=g // blocks, segment=g % blocks),
                 gb,
+                cache.tile(wave=g // blocks, segment=g % blocks),
                 acc,
                 channels=valid,
             )
@@ -260,7 +260,7 @@ def sv(
         ]
         gb = k.gb_concat(*gbs) if len(gbs) > 1 else gbs[0]
         for channels in sorted(sizes.values()):
-            acc = k.mac_abk(cache.tile(), gb, acc, channels=tuple(channels))
+            acc = k.mac_abk(gb, cache.tile(), acc, channels=tuple(channels))
         part = k.rd_mac(acc, into=part.tile(h=h), channels=used)
         loop.yield_(part)
     (part,) = loop.results

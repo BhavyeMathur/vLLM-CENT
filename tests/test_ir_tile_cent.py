@@ -250,7 +250,7 @@ class CentOpTypeTest(unittest.TestCase):
 
         v = self.v
         op = CentMacAbkOp(
-            operands=(v.w, v.gb, v.acc, v.n, v.kt),
+            operands=(v.gb, v.w, v.acc, v.n, v.kt),
             channels=CHANNELS,
             at=("n_wave", "k_row"),
         )
@@ -327,37 +327,37 @@ class CentOpTypeTest(unittest.TestCase):
             # mac_abk
             (
                 "expects 3 operands before its indices, got 2",
-                lambda: CentMacAbkOp(operands=(v.w, v.gb), channels=CHANNELS, at=()),
+                lambda: CentMacAbkOp(operands=(v.gb, v.w), channels=CHANNELS, at=()),
             ),
             (
                 "weight must be in pim.dram, got pnm.sb",
                 lambda: CentMacAbkOp(
-                    operands=(v.y, v.gb, v.acc), channels=CHANNELS, at=()
+                    operands=(v.gb, v.y, v.acc), channels=CHANNELS, at=()
                 ),
             ),
             (
                 "global buffer must be in pim.gb",
                 lambda: CentMacAbkOp(
-                    operands=(bf16_dram, v.x, v.acc), channels=CHANNELS, at=()
+                    operands=(v.x, bf16_dram, v.acc), channels=CHANNELS, at=()
                 ),
             ),
             (
                 "accumulator must be in pim.mac",
                 lambda: CentMacAbkOp(
-                    operands=(v.w, v.gb, v.y), channels=CHANNELS, at=()
+                    operands=(v.gb, v.w, v.y), channels=CHANNELS, at=()
                 ),
             ),
             (
                 "share one dtype, got weight bf16, global_buffer fp16",
                 lambda: CentMacAbkOp(
-                    operands=(v.w, fp16_gb, v.acc), channels=CHANNELS, at=()
+                    operands=(fp16_gb, v.w, v.acc), channels=CHANNELS, at=()
                 ),
             ),
             (
                 # A MAC may update some of the registers' channels, not more.
                 "MAC registers of 4 channels",
                 lambda: CentMacAbkOp(
-                    operands=(v.w, v.gb, small_acc), channels=CHANNELS, at=()
+                    operands=(v.gb, v.w, small_acc), channels=CHANNELS, at=()
                 ),
             ),
             # rd_mac
@@ -406,7 +406,7 @@ def _output_stationary() -> Function:
         name_hint="gb",
     )
     mac = CentMacAbkOp(
-        operands=(v.w, gb.results[0], acc, v.n, v.kt),
+        operands=(gb.results[0], v.w, acc, v.n, v.kt),
         channels=CHANNELS,
         at=("n_wave", "k_row"),
         name_hint="mac",
@@ -459,7 +459,7 @@ class CentKernelTest(unittest.TestCase):
             shape=MAC,
         )
         mac = CentMacAbkOp(
-            operands=(v.w, gb.results[0], restore.results[0], v.n, v.kt),
+            operands=(gb.results[0], v.w, restore.results[0], v.n, v.kt),
             channels=CHANNELS,
             at=("n_wave", "k_row"),
         )
@@ -533,7 +533,7 @@ OUTPUT_STATIONARY = "\n".join(
             "memory_space=pim.gb>"
         ),
         (
-            "      %mac = cent.mac_abk(%w, %gb, %acc, %n, %kt) {channels = [0, "
+            "      %mac = cent.mac_abk(%gb, %w, %acc, %n, %kt) {channels = [0, "
             '1, 2, 3], at = ["n_wave", "k_row"]} : tensor<4x16xbf16, domain=pim, '
             "memory_space=pim.mac>"
         ),

@@ -57,7 +57,7 @@ def _gb_stationary() -> CentKernel:
         with k.serial("n_wave", 2, carry=(partial,)) as waves:
             n, (now,) = waves.index, waves.carried
             acc = k.wr_bias(now.tile(n_wave=n), stride=1, channels=chans)
-            acc = k.mac_abk(g.w.tile(n_wave=n, k_row=kt), gb, acc, channels=chans)
+            acc = k.mac_abk(gb, g.w.tile(n_wave=n, k_row=kt), acc, channels=chans)
             waves.yield_(k.rd_mac(acc, into=now.tile(n_wave=n), channels=chans))
         reduce.yield_(*waves.results)
     k.returns(*reduce.results)
@@ -111,7 +111,7 @@ class ExpandTest(unittest.TestCase):
                 kt, (a,) = reduce.index, reduce.carried
                 gb = k.wr_gb(g.x.tile(k_tile=kt), channels=chans)
                 reduce.yield_(
-                    k.mac_abk(g.w.tile(n_wave=n, k_row=kt), gb, a, channels=chans)
+                    k.mac_abk(gb, g.w.tile(n_wave=n, k_row=kt), a, channels=chans)
                 )
             waves.yield_(
                 k.rd_mac(reduce.results[0], into=y_now.tile(n_wave=n), channels=chans)

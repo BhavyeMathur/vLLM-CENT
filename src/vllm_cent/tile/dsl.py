@@ -434,21 +434,25 @@ class TileKernel:
 
     def mac_abk(
         self,
-        weight: TileValue | TileRef,
         gb: TileValue,
+        weight: TileValue | TileRef,
         acc: TileValue,
         *,
         channels: Sequence[int],
         name: str | None = None,
     ) -> TileValue:
-        """Multiply a DRAM tile with the Global Buffer into the MAC registers."""
+        """``acc += x @ w.T`` for one tile: the Global Buffer (``x``) times ``w``.
+
+        The arguments follow ``x @ w.T``: the input in the Global Buffer,
+        then the weight tile, then the MAC registers added to.
+        """
 
         ref = self._ref(weight)
         hint = name or self._own(acc).hint or "acc"
         op = CentMacAbkOp(
             operands=(
-                ref.tensor.value,
                 self._own(gb).value,
+                ref.tensor.value,
                 self._own(acc).value,
                 *ref.indices,
             ),

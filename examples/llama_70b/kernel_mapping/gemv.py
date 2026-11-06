@@ -115,7 +115,7 @@ def reuse_gb_gemv(
     group: int = CENT_REUSE_SIZE,
     activation: str | None = None,
 ) -> GemvTensors:
-    """Record ``y = w @ x`` on every channel, in CENT's reuse-GB order.
+    """Record ``y = x @ w.T`` on every channel, in CENT's reuse-GB order.
 
     Args:
         k: The kernel to record into.
@@ -157,7 +157,7 @@ def reuse_gb_gemv(
                 for c in members
             ]
             accs = [
-                k.mac_abk(t.w.tile(**_col(cols, c), k_row=r), gb, acc, channels=chans)
+                k.mac_abk(gb, t.w.tile(**_col(cols, c), k_row=r), acc, channels=chans)
                 for c, acc in zip(members, accs, strict=True)
             ]
             if act is not None:
@@ -235,16 +235,16 @@ def kv_proj(
             for i, c in enumerate(members):
                 macs.append(
                     k.mac_abk(
-                        kt.w.tile(**_col(cols, c), k_row=r),
                         k_gb,
+                        kt.w.tile(**_col(cols, c), k_row=r),
                         accs[2 * i],
                         channels=k_mask,
                     )
                 )
                 macs.append(
                     k.mac_abk(
-                        vt.w.tile(**_col(cols, c), k_row=r),
                         v_gb,
+                        vt.w.tile(**_col(cols, c), k_row=r),
                         accs[2 * i + 1],
                         channels=v_mask,
                     )

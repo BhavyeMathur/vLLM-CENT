@@ -64,7 +64,7 @@ naming the base slot, as CENT's own traces do; ``serialize`` issues one
 instruction per channel, each naming its own slot (see
 ``vllm_cent.tile.expand``).
 
-Kernel: ``y = w @ x`` (``nn.Linear``: ``w`` is ``[N, K]``), ``N = K = 4096``,
+Kernel: ``y = x @ w.T`` (``nn.Linear``: ``w`` is ``[N, K]``), ``N = K = 4096``,
 bf16. Every size below is derived from the device spec; nothing is assumed
 about the paper-scale numbers.
 """
@@ -139,7 +139,7 @@ with TileKernel("q_proj_gemv_output_stationary", device) as k:
             kt, (acc,) = reduce.index, reduce.carried
             gb = k.wr_gb(x.tile(k_tile=kt), channels=chans)
             reduce.yield_(
-                k.mac_abk(w.tile(n_wave=n, k_row=kt), gb, acc, channels=chans)
+                k.mac_abk(gb, w.tile(n_wave=n, k_row=kt), acc, channels=chans)
             )
 
         (acc_done,) = reduce.results
@@ -194,10 +194,8 @@ with TileKernel("q_proj_gemv_gb_stationary", device) as k:
         with k.serial("n_wave", N_WAVES, carry=(partial,)) as waves:
             n, (partial_now,) = waves.index, waves.carried
             acc = k.wr_bias(partial_now.tile(n_wave=n), stride=1, channels=chans)
-            acc = k.mac_abk(w.tile(n_wave=n, k_row=kt), gb, acc, channels=chans)
-            waves.yield_(
-                k.rd_mac(acc, into=partial_now.tile(n_wave=n), channels=chans)
-            )
+            acc = k.mac_abk(gb, w.tile(n_wave=n, k_row=kt), acc, channels=chans)
+            waves.yield_(k.rd_mac(acc, into=partial_now.tile(n_wave=n), channels=chans))
 
         reduce.yield_(*waves.results)
 

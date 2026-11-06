@@ -440,11 +440,13 @@ class CentWrGbOp(_TileRefOp):
 
 @dataclass(frozen=True, eq=False, slots=True)
 class CentMacAbkOp(_TileRefOp):
-    """``cent.mac_abk(w, gb, acc, *indices)``: multiply-accumulate (``MAC_ABK``).
+    """``cent.mac_abk(gb, w, acc, *indices)``: multiply-accumulate (``MAC_ABK``).
 
-    Every bank of the selected channels multiplies the open row of its tile
-    of ``w`` with its channel's Global Buffer and adds the products to its
-    MAC register. The indices select the tile of ``w``.
+    ``acc += x @ w.T`` for one tile: every bank of the selected channels
+    multiplies its channel's Global Buffer (``x``'s tile) with the open row
+    of its tile of ``w`` and adds the products to its MAC register. The
+    operands follow ``x @ w.T``: the input, then the weight; the indices
+    select the tile of ``w``.
 
     The result is the new value of the MAC registers, of ``acc``'s type, so
     a loop can carry it from one MAC to the next. The op may select some of
@@ -456,13 +458,13 @@ class CentMacAbkOp(_TileRefOp):
     NUM_FIXED = 3
 
     @property
-    def weight(self) -> Value:
-        """The DRAM tensor whose tile is multiplied."""
+    def global_buffer(self) -> Value:
+        """The Global Buffer tile multiplied with each row: the input."""
         return self.operands[0]
 
     @property
-    def global_buffer(self) -> Value:
-        """The Global Buffer tile multiplied with each row."""
+    def weight(self) -> Value:
+        """The DRAM tensor whose tile is multiplied."""
         return self.operands[1]
 
     @property

@@ -115,7 +115,7 @@ def _output_stationary_kernel() -> CentKernel:
         name_hint="gb",
     )
     mac = CentMacAbkOp(
-        operands=(w, gb.results[0], acc, n, kt),
+        operands=(gb.results[0], w, acc, n, kt),
         channels=CHANNELS,
         at=("n_wave", "k_row"),
         name_hint="mac",
@@ -166,7 +166,7 @@ def _gb_stationary_kernel() -> CentKernel:
         name_hint="acc0",
     )
     mac = CentMacAbkOp(
-        operands=(w, gb.results[0], restore.results[0], n, kt),
+        operands=(gb.results[0], w, restore.results[0], n, kt),
         channels=CHANNELS,
         at=("n_wave", "k_row"),
         name_hint="mac",
@@ -359,7 +359,7 @@ class VerifyKernelTest(unittest.TestCase):
         )
         gb = CentWrGbOp(operands=(x, n), channels=CHANNELS, at=("k_tile",), shape=(GB,))
         bad_mac = CentMacAbkOp(
-            operands=(w, gb.results[0], acc0.results[0], n),
+            operands=(gb.results[0], w, acc0.results[0], n),
             channels=CHANNELS,
             at=("n_wave",),
         )
@@ -417,7 +417,7 @@ class VerifyKernelTest(unittest.TestCase):
             operands=(x, kt), channels=(0, 1), at=("k_tile",), shape=(GB,)
         )
         mac_full = CentMacAbkOp(
-            operands=(w, gb_partial.results[0], acc0_c.results[0], n, kt),
+            operands=(gb_partial.results[0], w, acc0_c.results[0], n, kt),
             channels=CHANNELS,
             at=("n_wave", "k_row"),
         )
@@ -514,7 +514,7 @@ class VerifyKernelTest(unittest.TestCase):
             operands=(zeros,), channels=CHANNELS, at=(), stride=0, shape=MAC
         )
         mac = CentMacAbkOp(
-            operands=(w, gb.results[0], acc0.results[0], kt, kt),
+            operands=(gb.results[0], w, acc0.results[0], kt, kt),
             channels=CHANNELS,
             at=("n_wave", "k_row"),
             name_hint="mac",
@@ -598,7 +598,7 @@ class VerifyKernelTest(unittest.TestCase):
             operands=(zeros,), channels=CHANNELS, at=(), stride=0, shape=MAC
         )
         mac_b = CentMacAbkOp(
-            operands=(w, gb1.results[0], acc_b.results[0], kt, kt),
+            operands=(gb1.results[0], w, acc_b.results[0], kt, kt),
             channels=CHANNELS,
             at=("n_wave", "k_row"),
         )

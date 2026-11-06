@@ -91,7 +91,7 @@ with TileKernel("q_proj_gemm_token_stationary", device) as k:
                 kt, (acc,) = reduce.index, reduce.carried
                 gb = k.wr_gb(x.tile(m=m, k_tile=kt), channels=chans)
                 reduce.yield_(
-                    k.mac_abk(w.tile(n_wave=n, k_row=kt), gb, acc, channels=chans)
+                    k.mac_abk(gb, w.tile(n_wave=n, k_row=kt), acc, channels=chans)
                 )
 
             (acc_done,) = reduce.results
@@ -159,11 +159,9 @@ with TileKernel("q_proj_gemm_weight_row_stationary", device) as k:
                     partial_now.tile(m=m, n_wave=n), stride=1, channels=chans
                 )
                 gb = k.wr_gb(x.tile(m=m, k_tile=kt), channels=chans)
-                acc = k.mac_abk(w_row, gb, acc, channels=chans)
+                acc = k.mac_abk(gb, w_row, acc, channels=chans)
                 tokens.yield_(
-                    k.rd_mac(
-                        acc, into=partial_now.tile(m=m, n_wave=n), channels=chans
-                    )
+                    k.rd_mac(acc, into=partial_now.tile(m=m, n_wave=n), channels=chans)
                 )
 
             reduce.yield_(*tokens.results)

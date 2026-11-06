@@ -53,7 +53,7 @@ class _Gemv:
                 kt, (acc,) = reduce.index, reduce.carried
                 gb = k.wr_gb(self.x.tile(k_tile=kt), channels=chans)
                 reduce.yield_(
-                    k.mac_abk(self.w.tile(n_wave=n, k_row=kt), gb, acc, channels=chans)
+                    k.mac_abk(gb, self.w.tile(n_wave=n, k_row=kt), acc, channels=chans)
                 )
             waves.yield_(
                 k.rd_mac(reduce.results[0], into=y_now.tile(n_wave=n), channels=chans)
@@ -245,7 +245,7 @@ GOLDEN = "\n".join(
             "memory_space=pim.gb>"
         ),
         (
-            "      %acc_3 = cent.mac_abk(%w, %gb, %acc_2, %n_wave, "
+            "      %acc_3 = cent.mac_abk(%gb, %w, %acc_2, %n_wave, "
             '%k_tile) {channels = [0, 1, 2, 3], at = ["n_wave", '
             '"k_row"]} : tensor<4x16xbf16, domain=pim, '
             "memory_space=pim.mac>"
