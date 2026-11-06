@@ -2,7 +2,8 @@
 
 ``vllm_cent.ir.tile`` defines the Tile IR types and ops, which know no
 device. This package holds what does: ``PhysicalLayout`` (resolved against a
-``CentArchitecture``), ``CentKernel`` and ``verify_kernel``.
+``CentArchitecture``), ``CentKernel``, ``verify_kernel``, and the Tile DSL
+builder in ``vllm_cent.tile.dsl``.
 """
 
 from .kernel import CentKernel
