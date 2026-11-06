@@ -1,0 +1,29 @@
+# Llama 3.1 70B, one decode step on 8 tensor-parallel ranks, as CENT's own
+# simulator evaluates it: KV-head tensor parallelism with TP = 8 (PP = 4 on
+# 32 devices), GDDR6 with 32 channels x 16 banks, bf16, batch 1, a 4096-token
+# window at its decode midpoint (2304 positions).
+#
+# Source: ../ALOI/cent_simulation, campaign
+#   scripts/run_cent_memory_cases.py --kv-head-tp --models Llama2-70B \
+#       --context-windows 4096 --cases GDDR6
+# whose TP=8 cell runs function_sim.py with --kv-head-tp --FC-devices 8
+# --seqlen 2304 --max-seq-len 4096 --GEMV reuse-GB --reuse-size 32. Its
+# "Llama2-70B" has Llama 3.1 70B's layer shapes (8 KV heads, FFN 28672).
+# Caveat: the campaign's result CSVs are not committed; that it was run is
+# inferred from the analysis scripts that read them. The paper's own results
+# (simulation_results.csv) use FC-only TP, not this per-rank split.
+#
+#   python -m examples.llama_70b.kernel_mapping.llama3_1_70b
+parallel:
+  tp: 8
+  split: [q_head, kv_head, intermediate]
+workload:
+  phase: decode
+  batch: 1
+  context_len: 2304      # KV cache positions, including the new token
+scope:
+  layers: 1
+codegen:
+  # broadcast: one full-mask WR_GB / WR_BIAS / RD_MAC, as CENT's traces do;
+  # serialize: one per channel, each naming its own Shared Buffer slot.
+  channel_issue: broadcast
