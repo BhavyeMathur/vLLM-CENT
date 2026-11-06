@@ -113,6 +113,7 @@ def reuse_gb_gemv(
     names: tuple[str, str, str] = ("x", "w", "y"),
     w_row: int | None = None,
     group: int = CENT_REUSE_SIZE,
+    activation: str | None = None,
 ) -> GemvTensors:
     """Record ``y = w @ x`` on every channel, in CENT's reuse-GB order.
 
@@ -123,19 +124,32 @@ def reuse_gb_gemv(
         names: Names of x, w and y, as the Device IR op names its operands.
         w_row: The weight's first DRAM row, if the model's mapping fixes it.
         group: Outputs per group; capped by the MAC registers per bank.
+        activation: The name of a second output, the activation (sigmoid)
+            of ``y``: after the last K row's MACs, each output's ``AF`` and
+            ``RD_AF`` come before its ``RD_MAC``, in groups of half the size
+            (``Vector_Matrix_Mul_weight_af_pim_only_trace``).
 
     Returns:
-        The tensors; ``y`` is the kernel's result.
+        The tensors; the kernel returns ``y`` (and the activation).
     """
 
     arch = k.arch
     chans = k.all_channels()
     t = _declare(k, names, n, kdim, range(arch.channels), w_row)
     cols, rows = _shape(arch, n, kdim, range(arch.channels))
-    groups = _groups(cols, min(group, arch.accumulators_per_bank))
+    size = group // 2 if activation is not None else group
+    groups = _groups(cols, min(size, arch.accumulators_per_bank))
+    act = None
+    if activation is not None:
+        act = k.tensor(activation, (n,), DType.BF16, MemorySpace.PNM_SB)
+        col = (Serial("col", cols),) if cols > 1 else ()
+        k.bind_layout(act, split(n=(*col, Slot(of=Channel()), Lane(of=Bank()))))
 
-    with k.serial("k_row", rows, carry=(t.y,)) as loop:
-        r, (y,) = loop.index, loop.carried
+    def k_row(
+        r: TileValue | int, y: TileValue, act: TileValue | None
+    ) -> tuple[TileValue, TileValue | None]:
+        """One K row: its Global Buffer write, then every group of outputs."""
+
         gb = k.wr_gb(t.x.tile(k_row=r), channels=chans)
         for members in groups:
             accs = [
@@ -146,10 +160,28 @@ def reuse_gb_gemv(
                 k.mac_abk(t.w.tile(**_col(cols, c), k_row=r), gb, acc, channels=chans)
                 for c, acc in zip(members, accs, strict=True)
             ]
+            if act is not None:
+                for c, acc in zip(members, accs, strict=True):
+                    act = k.rd_af(acc, into=act.tile(**_col(cols, c)), channels=chans)
             for c, acc in zip(members, accs, strict=True):
                 y = k.rd_mac(acc, into=y.tile(**_col(cols, c)), channels=chans)
-        loop.yield_(y)
-    k.returns(*loop.results)
+        return y, act
+
+    # With an activation, the last K row differs: it is recorded after the
+    # loop over the others, with a constant index.
+    looped = rows - 1 if act is not None else rows
+    y = t.y
+    if looped:
+        with k.serial("k_row", looped, carry=(y,)) as loop:
+            r, (y_now,) = loop.index, loop.carried
+            loop.yield_(k_row(r, y_now, None)[0])
+        (y,) = loop.results
+    if act is not None:
+        y, act = k_row(rows - 1, y, act)
+        assert act is not None
+        k.returns(y, act)
+    else:
+        k.returns(y)
     return t
 
 

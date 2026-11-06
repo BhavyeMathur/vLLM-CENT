@@ -1,17 +1,26 @@
 """Map one Llama 3.1 70B decoder layer onto CENT, as CENT's simulator does.
 
 The run spec ``runs/llama3_1_70b_kvtp8_decode.yaml`` names the evaluated
-configuration (KV-head TP = 8, GDDR6, 2304 positions). This module takes
-the Device IR of one rank for that run and gives each op the Tile DSL kernel
-of CENT's mapping (``../ALOI/cent_simulation``), checks that the kernel's
-tensors have the shapes of the op's operands, and writes the layer's AiM
-trace.
+configuration (KV-head TP = 8, PP = 4 on 32 devices, GDDR6, 2304 of a
+4096-position window). This module takes the Device IR of one rank for that
+run, gives each op the Tile DSL kernel of CENT's mapping
+(``../ALOI/cent_simulation``, ``Llama.trace_only``), checks that each
+kernel's tensors have the shapes of the op's operands, and writes the
+layer's AiM trace:
 
-Mapped so far: the GEMVs (``pim.gemv``) but for the gate projection, whose
-trace fuses the activation (``AF``/``RD_AF``) and comes with
-``pim.activation``. Every other op is written to the trace as a comment
-naming it; they are mapped next (PIM side) or modeled analytically, as CENT
-does (PNM and CXL).
+- PIM work: the kernels' records, CENT's but for the GPR fields (CENT
+  writes 0) and configuration-register writes (CENT writes none).
+- PNM work CENT charges analytically (the RMSNorm reduction, RoPE,
+  softmax, the SV partial-sum reduction) and the CXL all-reduces: comments
+  with CENT's cycles or milliseconds (``analytical``).
+- Ops that move no data in CENT's mapping (transfers between PIM and PNM,
+  head splits and merges): comments.
+
+One known difference: CENT stores the FFN norm's squared input in bank
+pairs of row ``sa_copy`` (61), the row its EWMUL operands then overwrite,
+and leaves row ``sa`` (60) unused (``Llama.py:1005-1007``). The verifier
+does not let two tensors overlap, so this mapping uses row 60, as the
+attention norm uses its own row 0.
 
 Run from the repository root::
 
@@ -21,22 +30,26 @@ Run from the repository root::
 from __future__ import annotations
 
 import sys
-from collections.abc import Iterator
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass, field
+from math import prod
 from pathlib import Path
 
 from vllm_cent.device import CentArchitecture, DeviceSpec, load_device_spec
 from vllm_cent.driver import RunSpec, compile_module, load_model, load_run_spec
-from vllm_cent.ir import Function, Operation
+from vllm_cent.ir import Function, Operation, Value
 from vllm_cent.ir.device import PIMGemvOp
 from vllm_cent.tile import CentKernel
 from vllm_cent.tile.codegen import MAC_FROM_GLOBAL_BUFFER, iter_aim_records
 from vllm_cent.tile.dsl import TileKernel
 from vllm_cent.tile.expand import ChannelIssue
 
+from . import analytical
+from .attention import cache_write, k_cache_layout, qk, sv, v_cache_layout
 from .gemv import kv_proj, reuse_gb_gemv
+from .vector import residual_add, rms_norm, silu_mul
 
-__all__ = ["WEIGHT_ROWS", "LayerMapping", "layer_trace", "map_layer"]
+__all__ = ["DRAM_ROWS", "WEIGHT_ROWS", "LayerMapping", "layer_trace", "map_layer"]
 
 EXAMPLE_DIR = Path(__file__).resolve().parents[1]
 MODEL = EXAMPLE_DIR / "llama3_1_70b.json"
@@ -44,11 +57,15 @@ RUN = EXAMPLE_DIR / "runs" / "llama3_1_70b_kvtp8_decode.yaml"
 # CENT's MAC register count, so the GEMV order is CENT's (see cent_paper.yaml).
 DEVICE = EXAMPLE_DIR.parents[0] / "cent" / "cent_paper.yaml"
 
+# The evaluated configuration's window and system (run_cent_memory_cases.py):
+# a 4096-position window, 32 devices with 144 PCIe lanes, PP = 4.
+WINDOW = 4096
+DEVICES = 32
+PCIE_LANES = 144
+PIPELINE_STAGES = 4
+
 # First DRAM row of each weight, as CENT's Llama.memory_mapping places them
-# for KV-head TP = 8 with a 4096 window (Llama.py:1494-1748). The rows in
-# between hold activations and the KV cache: x 0, x_copy 1, SANorm 2, xq 35,
-# xk 36, cache_k 37, scores 38, cache_v 42, output 43, sa 60, sa_copy 61,
-# FFNNorm 62, x1 175, x3 176, x1_sigmoid 177, ffn_vector 178.
+# for KV-head TP = 8 with a 4096 window (Llama.py:1494-1748).
 WEIGHT_ROWS = {
     "self_attn.q_proj.weight": 3,
     "self_attn.k_proj.weight": 19,
@@ -58,119 +75,340 @@ WEIGHT_ROWS = {
     "mlp.up_proj.weight": 119,
     "mlp.down_proj.weight": 179,
 }
+# The rows of activations and the KV cache in the same map. "sa" holds the
+# FFN norm's bank pairs here; see the module docstring.
+DRAM_ROWS = {
+    "x": 0,
+    "x_copy": 1,
+    "sa_norm": 2,
+    "cache_k": 37,
+    "cache_v": 42,
+    "sa": 60,
+    "sa_copy": 61,
+    "ffn_norm": 62,
+    "x1_sigmoid": 177,
+}
 
-# Device IR ops whose kernel is not written yet: the trace names them.
-_PENDING = "not mapped yet"
+_NO_RECORDS = "no records: CENT's kernels read and write the data in place"
 
 
-@dataclass(frozen=True)
+@dataclass
 class LayerMapping:
-    """One layer's ops, in order, each with its kernel or None if not mapped.
+    """One layer's ops, in order, with the kernel or comment each gets.
 
     Attributes:
         ops: The Device IR function's ops.
-        kernels: For each op, the kernel that runs it; None where the op is
-            not mapped, or is run by another op's kernel (``covered_by``).
-        covered_by: Ops run by an earlier op's kernel, e.g. ``v_proj`` by
-            the fused K/V kernel of ``k_proj``.
+        kernels: The kernel that runs an op.
+        covered_by: Ops run by another op's kernel, e.g. ``v_proj`` by the
+            fused K/V kernel of ``k_proj``.
+        comments: The trace comment of an op, alone or before its kernel.
     """
 
     ops: tuple[Operation, ...]
-    kernels: dict[Operation, CentKernel]
-    covered_by: dict[Operation, Operation]
+    kernels: dict[Operation, CentKernel] = field(default_factory=dict)
+    covered_by: dict[Operation, Operation] = field(default_factory=dict)
+    comments: dict[Operation, str] = field(default_factory=dict)
 
 
-def _squeeze(shape: tuple[int, ...]) -> tuple[int, ...]:
-    """Drop leading size-1 dimensions: ``[1, 1, 8192]`` is the vector 8192."""
+def _squeeze(shape: Sequence[int]) -> tuple[int, ...]:
+    """Drop size-1 dimensions: ``[1, 2304, 1, 128]`` is ``(2304, 128)``."""
 
-    dims = list(shape)
-    while len(dims) > 1 and dims[0] == 1:
-        dims.pop(0)
-    return tuple(dims)
+    return tuple(d for d in shape if d != 1)
 
 
-def _check_gemv(op: PIMGemvOp, kernel: CentKernel, names: tuple[str, str, str]) -> None:
-    """Check that the kernel's x, w and y have the op's operand shapes.
+def _check(
+    op: Operation, kernel: CentKernel, pairs: Sequence[tuple[str, Value]]
+) -> None:
+    """Check that each named kernel tensor has its Device IR value's shape.
 
     Raises:
         ValueError: If a shape or dtype differs.
     """
 
     by_name = {a.name: a for a in kernel.function.arguments}
-    expected = {
-        names[0]: (_squeeze(op.operands[0].type.shape), op.operands[0].type.dtype),
-        names[1]: (op.operands[1].type.shape, op.operands[1].type.dtype),
-        names[2]: (_squeeze(op.results[0].type.shape), op.results[0].type.dtype),
-    }
-    for name, (shape, dtype) in expected.items():
+    for name, value in pairs:
         arg = by_name[name]
-        if (arg.type.shape, arg.type.dtype) != (shape, dtype):
+        ours = (_squeeze(arg.type.shape), arg.type.dtype)
+        theirs = (_squeeze(value.type.shape), value.type.dtype)
+        if ours != theirs:
             raise ValueError(
-                f"{op.name_hint}: kernel tensor {name!r} is {arg.type.shape} "
-                f"{arg.type.dtype}, but the Device IR operand is {shape} {dtype}"
+                f"{op.name_hint}: kernel tensor {name!r} is {ours[0]} {ours[1]}, "
+                f"but the Device IR value is {theirs[0]} {theirs[1]}"
             )
 
 
-def _gemv_dims(op: PIMGemvOp) -> tuple[int, int]:
-    """``(N, K)`` of a GEMV: its weight is ``(N, K)``."""
+def _check_gemv(op: Operation, kernel: CentKernel, names: tuple[str, str, str]) -> None:
+    """Check a GEMV kernel's x, w and y against the op."""
 
-    n, kdim = op.operands[1].type.shape
-    return n, kdim
+    values = (op.operands[0], op.operands[1], op.results[0])
+    _check(op, kernel, list(zip(names, values, strict=True)))
 
 
-def _weight(op: PIMGemvOp) -> str:
+def _weight(op: Operation) -> str:
     name = op.operands[1].name
     assert name is not None
     return name
 
 
-def map_layer(function: Function, arch: CentArchitecture) -> LayerMapping:
-    """Give each op of one rank's layer its CENT kernel, where one exists.
+def _build(
+    name: str, arch: CentArchitecture, record: Callable[[TileKernel], object]
+) -> CentKernel:
+    with TileKernel(name, arch) as k:
+        record(k)
+    return k.build()
+
+
+def map_layer(function: Function, arch: CentArchitecture, context: int) -> LayerMapping:
+    """Give each op of one rank's layer its CENT kernel or trace comment.
+
+    Args:
+        function: One rank's Device IR of the layer.
+        arch: The device.
+        context: KV cache positions, including the new one.
 
     Raises:
         ValueError: If a kernel's tensors do not match its op's shapes.
     """
 
-    ops = function.operations
-    kernels: dict[Operation, CentKernel] = {}
-    covered: dict[Operation, Operation] = {}
-    gemvs = {op.name_hint: op for op in ops if isinstance(op, PIMGemvOp)}
+    mapping = LayerMapping(function.operations)
+    ops = {op.name_hint: op for op in function.operations if op.name_hint}
+    users: dict[Value, list[Operation]] = {}
+    for user in function.operations:
+        for value in user.operands:
+            users.setdefault(value, []).append(user)
 
-    for op in ops:
-        if not isinstance(op, PIMGemvOp) or op in covered:
+    for op in function.operations:
+        if op in mapping.covered_by:
             continue
-        name = op.name_hint or "gemv"
-        if name == "mlp.gate_proj":
-            continue  # fused with its activation: mapped with pim.activation
-        n, kdim = _gemv_dims(op)
-        if name == "self_attn.k_proj":
-            v_op = gemvs["self_attn.v_proj"]
-            k_names = ("x", _weight(op), "k")
-            v_names = ("x", _weight(v_op), "v")
-            with TileKernel("kv_proj", arch) as k:
-                kv_proj(
-                    k,
-                    n=n,
-                    kdim=kdim,
-                    k_names=k_names,
-                    v_names=v_names,
-                    k_row=WEIGHT_ROWS[_weight(op)],
-                    v_row=WEIGHT_ROWS[_weight(v_op)],
-                )
-            kernel = k.build()
-            _check_gemv(op, kernel, k_names)
-            _check_gemv(v_op, kernel, v_names)
-            covered[v_op] = op
+        if op.NAME == "pim.gemv":
+            _map_gemv(op, ops, users, arch, mapping)
+        elif op.NAME == "pnm.rms_norm":
+            mapping.kernels[op] = _map_rms_norm(op, arch)
+        elif op.NAME == "pim.cache_write":
+            mapping.kernels[op] = _map_cache_write(op, arch, context)
+        elif op.NAME in ("pim.qk", "pim.sv"):
+            mapping.kernels[op] = _map_attention(op, arch, context)
+        elif op.NAME == "pim.ewmul" and op.name_hint == "mlp.silu":
+            mul = ops["mlp.mul"]
+            mapping.kernels[op] = _map_silu_mul(op, mul, arch)
+            mapping.covered_by[mul] = op
+        elif op.NAME == "pnm.add":
+            mapping.kernels[op] = _map_residual_add(op, arch)
+            mapping.comments[op] = (
+                "residual add: EWADD, as CENT issues it; CENT charges no time for it"
+            )
         else:
-            names = ("x", _weight(op), "y")
-            with TileKernel(name.replace(".", "_"), arch) as k:
-                reuse_gb_gemv(
-                    k, n=n, kdim=kdim, names=names, w_row=WEIGHT_ROWS[names[1]]
-                )
-            kernel = k.build()
-            _check_gemv(op, kernel, names)
-        kernels[op] = kernel
-    return LayerMapping(ops, kernels, covered)
+            mapping.comments[op] = _comment(op, arch, context)
+    return mapping
+
+
+def _map_residual_add(op: Operation, arch: CentArchitecture) -> CentKernel:
+    """CENT's residual add: one EWADD of the two vectors."""
+
+    n = _squeeze(op.results[0].type.shape)[-1]
+    names = ("residual", "update")
+
+    def record(k: TileKernel) -> None:
+        residual_add(k, n=n, names=names)
+
+    kernel = _build(op.name_hint or "add", arch, record)
+    _check(op, kernel, list(zip(names, op.operands, strict=True)))
+    return kernel
+
+
+def _map_gemv(
+    op: Operation,
+    ops: dict[str, Operation],
+    users: dict[Value, list[Operation]],
+    arch: CentArchitecture,
+    mapping: LayerMapping,
+) -> None:
+    """Map one GEMV: K with V, the gate with its activation, the others alone."""
+
+    assert isinstance(op, PIMGemvOp)
+    name = op.name_hint or "gemv"
+    n, kdim = op.operands[1].type.shape
+    if name == "self_attn.k_proj":
+        v_op = ops["self_attn.v_proj"]
+        k_names = ("x", _weight(op), "k")
+        v_names = ("x", _weight(v_op), "v")
+        kernel = _build(
+            "kv_proj",
+            arch,
+            lambda k: kv_proj(
+                k,
+                n=n,
+                kdim=kdim,
+                k_names=k_names,
+                v_names=v_names,
+                k_row=WEIGHT_ROWS[k_names[1]],
+                v_row=WEIGHT_ROWS[v_names[1]],
+            ),
+        )
+        _check_gemv(op, kernel, k_names)
+        _check_gemv(v_op, kernel, v_names)
+        mapping.covered_by[v_op] = op
+    elif name == "mlp.gate_proj":
+        act = next(u for u in users[op.results[0]] if u.NAME == "pim.activation")
+        names = ("x", _weight(op), "y")
+        kernel = _build(
+            "gate_proj",
+            arch,
+            lambda k: reuse_gb_gemv(
+                k,
+                n=n,
+                kdim=kdim,
+                names=names,
+                w_row=WEIGHT_ROWS[names[1]],
+                activation="sigmoid",
+            ),
+        )
+        _check_gemv(op, kernel, names)
+        _check(act, kernel, [("sigmoid", act.results[0])])
+        mapping.covered_by[act] = op
+    else:
+        names = ("x", _weight(op), "y")
+        kernel = _build(
+            name.replace(".", "_"),
+            arch,
+            lambda k: reuse_gb_gemv(
+                k, n=n, kdim=kdim, names=names, w_row=WEIGHT_ROWS[names[1]]
+            ),
+        )
+        _check_gemv(op, kernel, names)
+    mapping.kernels[op] = kernel
+
+
+def _map_rms_norm(op: Operation, arch: CentArchitecture) -> CentKernel:
+    """CENT's RMSNorm; the attention norm and the FFN norm use their own rows."""
+
+    hint = op.name_hint or "rms_norm"
+    first = hint == "input_layernorm"
+    rows = (
+        (DRAM_ROWS["x"], DRAM_ROWS["x_copy"], DRAM_ROWS["sa_norm"])
+        if first
+        else (DRAM_ROWS["sa"], DRAM_ROWS["sa_copy"], DRAM_ROWS["ffn_norm"])
+    )
+    names = ("x", f"{hint}.weight", "y")
+    hidden = op.results[0].type.shape[-1]
+    kernel = _build(
+        hint,
+        arch,
+        lambda k: rms_norm(
+            k, hidden=hidden, names=names, rows=rows, scale_first=not first
+        ),
+    )
+    values = (op.operands[0], op.operands[1], op.results[0])
+    _check(op, kernel, list(zip(names, values, strict=True)))
+    return kernel
+
+
+def _map_cache_write(op: Operation, arch: CentArchitecture, context: int) -> CentKernel:
+    """Write the new position (the last of the context) into a KV cache."""
+
+    cache_name = op.operands[0].name or "cache"
+    head_dim = _squeeze(op.operands[1].type.shape)[-1]
+    is_k = cache_name.startswith("k")
+    layout = k_cache_layout if is_k else v_cache_layout
+    row = DRAM_ROWS["cache_k"] if is_k else DRAM_ROWS["cache_v"]
+
+    def record(k: TileKernel) -> None:
+        cache = layout(k, cache_name, context, head_dim, WINDOW, row)
+        cache_write(
+            k, cache=cache, new_name="new", head_dim=head_dim, position=context - 1
+        )
+
+    kernel = _build(op.name_hint or "cache_write", arch, record)
+    _check(
+        op,
+        kernel,
+        [
+            (cache_name, op.operands[0]),
+            ("new", op.operands[1]),
+            (cache_name, op.results[0]),
+        ],
+    )
+    return kernel
+
+
+def _map_attention(op: Operation, arch: CentArchitecture, context: int) -> CentKernel:
+    """QK or SV of one KV head's query heads."""
+
+    heads, head_dim = _squeeze(op.operands[0].type.shape)
+    if op.NAME == "pim.qk":
+        names = ("q", "k_cache", "scores")
+        kernel = _build(
+            "qk",
+            arch,
+            lambda k: qk(
+                k,
+                names=names,
+                heads=heads,
+                head_dim=head_dim,
+                context=context,
+                max_context=WINDOW,
+                k_row=DRAM_ROWS["cache_k"],
+            ),
+        )
+    else:
+        head_dim = _squeeze(op.results[0].type.shape)[-1]
+        names = ("p", "v_cache", "out")
+        kernel = _build(
+            "sv",
+            arch,
+            lambda k: sv(
+                k,
+                names=names,
+                heads=heads,
+                head_dim=head_dim,
+                context=context,
+                max_context=WINDOW,
+                v_row=DRAM_ROWS["cache_v"],
+            ),
+        )
+    _check(op, kernel, list(zip(names, (*op.operands, op.results[0]), strict=True)))
+    return kernel
+
+
+def _map_silu_mul(
+    silu: Operation, mul: Operation, arch: CentArchitecture
+) -> CentKernel:
+    """CENT's ``silu(gate) * up``: the two ``pim.ewmul`` ops in one kernel."""
+
+    n = _squeeze(silu.results[0].type.shape)[-1]
+    names = ("gate", "sigmoid", "up", "y")
+    kernel = _build(
+        "silu_mul",
+        arch,
+        lambda k: silu_mul(k, n=n, names=names, row=DRAM_ROWS["x1_sigmoid"]),
+    )
+    values = (silu.operands[0], silu.operands[1], mul.operands[1], mul.results[0])
+    _check(silu, kernel, list(zip(names, values, strict=True)))
+    return kernel
+
+
+def _comment(op: Operation, arch: CentArchitecture, context: int) -> str:
+    """The trace comment of an op CENT models analytically or not at all."""
+
+    hint = op.name_hint or ""
+    if op.NAME == "pnm.rope":
+        cycles = analytical.rope_cycles(prod(_squeeze(op.results[0].type.shape)))
+        return f"PNM RoPE: {cycles:g} cycles (analytical, as CENT)"
+    if hint.startswith("self_attn.softmax"):
+        if op.NAME == "pnm.reduce_max":
+            heads = _squeeze(op.operands[0].type.shape)[0]
+            cycles = analytical.softmax_cycles(context, heads, arch.channels)
+            return (
+                f"PNM softmax (max, exp, sum, div): {cycles:g} cycles "
+                "(analytical, as CENT)"
+            )
+        return "part of the softmax above"
+    if op.NAME == "cxl.all_reduce":
+        hidden = _squeeze(op.results[0].type.shape)[-1]
+        tp = DEVICES // PIPELINE_STAGES
+        ms = analytical.cxl_all_reduce_ms(hidden, PCIE_LANES // DEVICES, tp)
+        return f"CXL all-reduce over {tp} devices: {ms:.7f} ms (analytical, as CENT)"
+    return _NO_RECORDS
 
 
 def layer_trace(
@@ -178,18 +416,25 @@ def layer_trace(
     arch: CentArchitecture,
     issue: ChannelIssue = ChannelIssue.BROADCAST,
 ) -> Iterator[str]:
-    """Yield the layer's AiM trace, op by op; unmapped ops as comments."""
+    """Yield the layer's AiM trace, op by op, ending with EOC."""
 
     yield MAC_FROM_GLOBAL_BUFFER
     for op in mapping.ops:
         label = f"{op.NAME} ({op.name_hint})" if op.name_hint else op.NAME
-        if op in mapping.kernels:
-            yield f"# {label}"
-            yield from iter_aim_records(mapping.kernels[op], arch, issue=issue)
-        elif op in mapping.covered_by:
+        if op in mapping.covered_by:
             yield f"# {label}: in the kernel of {mapping.covered_by[op].name_hint}"
-        else:
-            yield f"# {label}: {_PENDING}"
+            continue
+        comment = mapping.comments.get(op)
+        yield f"# {label}: {comment}" if comment else f"# {label}"
+        if op in mapping.kernels:
+            yield from iter_aim_records(mapping.kernels[op], arch, issue=issue)
+    if PIPELINE_STAGES > 1:
+        hidden = _squeeze(mapping.ops[-1].results[0].type.shape)[-1]
+        ms = analytical.pipeline_handoff_ms(hidden, PCIE_LANES // DEVICES)
+        yield (
+            f"# CXL hand-off to the next pipeline stage: {ms:.7f} ms "
+            "(analytical, as CENT)"
+        )
     yield "AiM EOC"
 
 
@@ -207,7 +452,7 @@ def main(argv: list[str]) -> None:
     device = load_device_spec(DEVICE)
     arch = device.architecture
     assert isinstance(arch, CentArchitecture)
-    mapping = map_layer(device_ir(run, device), arch)
+    mapping = map_layer(device_ir(run, device), arch, run.workload.context_len)
     lines = layer_trace(mapping, arch, run.codegen.channel_issue)
     if argv:
         with Path(argv[0]).open("w") as out:
