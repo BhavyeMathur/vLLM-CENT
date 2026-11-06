@@ -9,10 +9,8 @@ from vllm_cent.cent import (
     BroadcastCxl,
     CentChannelSet,
     CentHardwareSpec,
-    CentInstruction,
     CentMemoryAddress,
     CentOpcode,
-    CentProgram,
     CentSharedBufferAddress,
     CopyBankToGlobalBuffer,
     CopyGlobalBufferToBank,
@@ -31,8 +29,7 @@ from vllm_cent.cent import (
     WriteBias,
     WriteGlobalBuffer,
     WriteSingleBank,
-    render_instruction,
-    render_text_program,
+    render_aim_channel_mask,
 )
 from vllm_cent.cent.instructions.validation import (
     _validate_accumulation_register,
@@ -43,10 +40,6 @@ from vllm_cent.cent.instructions.validation import (
     validate_channels,
     validate_instruction,
     validate_shared_buffer_address,
-)
-from vllm_cent.cent.render import (
-    _shared_buffer_operands,
-    render_channel_mask,
 )
 from vllm_cent.cent.utils import require_nonnegative, require_positive
 
@@ -119,10 +112,9 @@ class PrimitiveValueTests(unittest.TestCase):
         self.assertEqual(channels, CentChannelSet(channels=(0, 3)))
         self.assertEqual(channels, CentChannelSet(channels=(3, 0)))
         self.assertEqual(hash(channels), hash(CentChannelSet(channels=(3, 0))))
-        # The inspection renderer uses bit n for channel n. Channels 0 and 3
-        # set binary 1001 (the AiM timing renderer uses a different bit order),
-        # which is rendered as hexadecimal 0x9.
-        self.assertEqual(render_channel_mask(channels), "0x9")
+        # The AiM simulator puts channel 0 in bit 31: channels 0 and 3 set
+        # bits 31 and 28, hexadecimal 0x90000000.
+        self.assertEqual(render_aim_channel_mask(channels), "0x90000000")
         for invalid in ((), (0, 0), (-1,)):
             with self.assertRaises(ValueError):
                 CentChannelSet(channels=invalid)
@@ -131,8 +123,8 @@ class PrimitiveValueTests(unittest.TestCase):
 class PaperInstructionTests(unittest.TestCase):
     """Test the instructions listed in paper Tables 2 and 3."""
 
-    def test_renders_the_complete_paper_isa(self) -> None:
-        """Render every instruction in the paper's operand order."""
+    def test_constructs_the_complete_paper_isa(self) -> None:
+        """Build and validate every instruction; its opcode names the paper's."""
 
         channels = CentChannelSet(channels=(0, 1))
         address = CentMemoryAddress(channel=1, bank=2, row=3, column=4)
@@ -299,7 +291,6 @@ class PaperInstructionTests(unittest.TestCase):
         for instruction, expected in cases:
             with self.subTest(instruction=type(instruction).__name__):
                 validate_instruction(instruction, hardware())
-                self.assertEqual(render_instruction(instruction), expected)
                 self.assertEqual(instruction.opcode.value, expected.split()[0])
 
     def test_instruction_exposes_its_class_opcode(self) -> None:
@@ -384,7 +375,7 @@ class HardwareValidationTests(unittest.TestCase):
                     factory()
 
     def test_instruction_subclasses_use_parent_rules(self) -> None:
-        """Validate and render an instruction subclass like its parent."""
+        """Validate an instruction subclass like its parent."""
 
         instruction = _WriteSingleBankVariant(
             address=CentMemoryAddress(channel=0, bank=1, row=2, column=4),
@@ -393,10 +384,7 @@ class HardwareValidationTests(unittest.TestCase):
         )
 
         validate_instruction(instruction, hardware())
-        self.assertEqual(
-            render_instruction(instruction),
-            "WR_SBK 0 2 1 2 4 3",
-        )
+        self.assertIs(instruction.opcode, WriteSingleBank.OPCODE)
 
     def test_validates_each_address_space_and_operation_span(self) -> None:
         """Accept the last valid address in each address space."""
@@ -487,58 +475,6 @@ class HardwareValidationTests(unittest.TestCase):
             with self.subTest(instruction=instruction):
                 with self.assertRaises(ValueError):
                     validate_instruction(instruction, hardware())
-
-
-class ProgramAndRenderingTests(unittest.TestCase):
-    """Test CENT programs and assembly rendering."""
-
-    def test_program_preserves_instruction_order_and_allows_no_work(self) -> None:
-        """Allow empty instruction sequences for identity and reshape programs."""
-
-        instruction = ReceiveCxl()
-        program = CentProgram(hardware=hardware(), instructions=(instruction,))
-        self.assertEqual(program.hardware, hardware())
-        self.assertEqual(program.instructions, (instruction,))
-        self.assertEqual(
-            CentProgram(hardware=hardware(), instructions=()).instructions, ()
-        )
-
-    def test_program_renderer_serializes_every_program_instruction(self) -> None:
-        """Render every program instruction in order."""
-
-        instruction = WriteBias(
-            channels=CentChannelSet(channels=(0,)),
-            source=CentSharedBufferAddress(slot=3),
-        )
-        program = CentProgram(
-            hardware=hardware(),
-            instructions=(instruction, ReceiveCxl()),
-        )
-
-        # Channel 0 renders as CHmask 0x1 and Rs is Shared Buffer slot 3. The
-        # renderer preserves instruction order and terminates each with '\n'.
-        self.assertEqual(
-            render_text_program(program),
-            "WR_BIAS 0x1 3\nRECV_CXL\n",
-        )
-
-    def test_private_shared_buffer_renderer_uses_rd_then_rs(self) -> None:
-        """Render PNM operands as OPsize, Rd, then Rs."""
-
-        instruction = Accumulate(
-            operation_size=2,
-            destination=CentSharedBufferAddress(slot=6),
-            source=CentSharedBufferAddress(slot=5),
-        )
-        # Table 2 orders these operands as OPsize, destination Rd, then source
-        # Rs, hence two operations followed by slots 6 and 5.
-        self.assertEqual(_shared_buffer_operands(instruction), "2 6 5")
-
-    def test_renderer_rejects_an_instruction_without_an_opcode(self) -> None:
-        """Report an unsupported base instruction with the documented error."""
-
-        with self.assertRaisesRegex(TypeError, "CentInstruction"):
-            render_instruction(CentInstruction())
 
 
 if __name__ == "__main__":

@@ -6,11 +6,11 @@ from dataclasses import replace
 from vllm_cent.cent import (
     CentChannelSet,
     CentHardwareSpec,
-    CentProgram,
     CentSharedBufferAddress,
     CopyBankToGlobalBuffer,
     CopyGlobalBufferToBank,
     WriteGlobalBuffer,
+    validate_instruction,
 )
 
 
@@ -47,25 +47,14 @@ class GlobalBufferCapacityTests(unittest.TestCase):
             operation_size=1,
             source=CentSharedBufferAddress(slot=0),
         )
-        self.assertEqual(
-            CentProgram(
-                hardware=self.hardware, instructions=(instruction,)
-            ).instructions,
-            (instruction,),
-        )
+        validate_instruction(instruction, self.hardware)
         with self.assertRaisesRegex(ValueError, "Global Buffer"):
-            CentProgram(
-                hardware=self.hardware,
-                instructions=(replace(instruction, operation_size=2),),
-            )
+            validate_instruction(replace(instruction, operation_size=2), self.hardware)
         # A larger Global Buffer can address columns beyond a DRAM row when no
         # DRAM operand participates in this Shared Buffer-to-Global Buffer copy.
         wide = replace(self.hardware, global_buffer_columns=12)
         wide_instruction = replace(instruction, column=10)
-        self.assertEqual(
-            CentProgram(hardware=wide, instructions=(wide_instruction,)).instructions,
-            (wide_instruction,),
-        )
+        validate_instruction(wide_instruction, wide)
 
     def test_bank_copies_must_fit_both_address_spaces(self) -> None:
         """Reject a transfer that fits DRAM but exceeds the Global Buffer."""
@@ -76,14 +65,8 @@ class GlobalBufferCapacityTests(unittest.TestCase):
                 channels=self.channels, bank=0, row=0, column=2, operation_size=1
             )
             with self.subTest(instruction_type=instruction_type):
-                self.assertEqual(
-                    CentProgram(
-                        hardware=self.hardware, instructions=(instruction,)
-                    ).instructions,
-                    (instruction,),
-                )
+                validate_instruction(instruction, self.hardware)
                 with self.assertRaisesRegex(ValueError, "Global Buffer"):
-                    CentProgram(
-                        hardware=self.hardware,
-                        instructions=(replace(instruction, operation_size=2),),
+                    validate_instruction(
+                        replace(instruction, operation_size=2), self.hardware
                     )

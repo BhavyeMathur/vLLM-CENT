@@ -6,6 +6,7 @@ transfers stay inside storage. Passing these checks does not prove numerical
 semantics or input initialization.
 """
 
+from ..hardware import CentHardwareSpec
 from .address import (
     CentChannelSet,
     CentMemoryAddress,
@@ -36,7 +37,6 @@ from .data_movement import (
     WriteGlobalBuffer,
     WriteSingleBank,
 )
-from ..hardware import CentHardwareSpec
 
 __all__ = [
     "validate_address",
@@ -184,13 +184,6 @@ def validate_instruction(
         TypeError: If the instruction type is unsupported.
         ValueError: If an operand is incompatible with the target.
     """
-
-    # Import here because reference services reuse the instruction address types.
-    from ..reference import ReferenceInstruction, validate_reference
-
-    if isinstance(instruction, ReferenceInstruction):
-        validate_reference(instruction, hardware)
-        return
 
     # A single-bank transfer advances through DRAM bursts and Shared Buffer
     # slots. A write reads Rs; a read writes Rd.

@@ -1,7 +1,7 @@
-"""Public hardware, instruction, program-building, and text-rendering APIs.
+"""CENT's hardware description, typed instructions and AiM channel masks.
 
 These types describe device storage and commands without choosing a model
-family. Layout selection and operation lowering live outside this package.
+family; ``vllm_cent.tile`` expands kernels into them.
 """
 
 from .aim import (
@@ -10,11 +10,7 @@ from .aim import (
     AIM_SIMULATOR_CHANNELS,
     AimSimulatorCompatibilityError,
     render_aim_channel_mask,
-    render_aim_instruction,
-    render_aim_trace,
-    validate_aim_hardware,
 )
-from .builder import CentProgramBuilder
 from .hardware import BANKS_PER_GROUP, CentBlockPlacementSpec, CentHardwareSpec
 from .instructions import (
     Accumulate,
@@ -44,9 +40,8 @@ from .instructions import (
     WriteBias,
     WriteGlobalBuffer,
     WriteSingleBank,
+    validate_instruction,
 )
-from .program import CentProgram
-from .render import render_instruction, render_text_program
 from .utils import ceil_div
 
 __all__ = [
@@ -66,8 +61,6 @@ __all__ = [
     "CentInstruction",
     "CentMemoryAddress",
     "CentOpcode",
-    "CentProgram",
-    "CentProgramBuilder",
     "CentSharedBufferAddress",
     "CopyBankToGlobalBuffer",
     "CopyGlobalBufferToBank",
@@ -88,33 +81,5 @@ __all__ = [
     "WriteSingleBank",
     "ceil_div",
     "render_aim_channel_mask",
-    "render_aim_instruction",
-    "render_aim_trace",
-    "render_instruction",
-    "render_text_program",
-    "validate_aim_hardware",
-]
-
-from .reference import (
-    InitializeAccumulator,
-    ReadAccumulator,
-    ReferenceCopy,
-    ReferenceStoreSlice,
-    ReferenceFill,
-    ReferenceReduceSum,
-    ReferenceRmsScale,
-    ReferenceBroadcast,
-    ReferenceInstruction,
-)
-
-__all__ += [
-    "InitializeAccumulator",
-    "ReadAccumulator",
-    "ReferenceBroadcast",
-    "ReferenceCopy",
-    "ReferenceFill",
-    "ReferenceInstruction",
-    "ReferenceReduceSum",
-    "ReferenceRmsScale",
-    "ReferenceStoreSlice",
+    "validate_instruction",
 ]

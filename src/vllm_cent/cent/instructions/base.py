@@ -3,7 +3,7 @@
 from enum import Enum
 from typing import ClassVar
 
-__all__ = ["CentInstruction", "CentOpcode", "ReferenceOpcode"]
+__all__ = ["CentInstruction", "CentOpcode"]
 
 
 class CentOpcode(str, Enum):
@@ -57,40 +57,6 @@ class CentOpcode(str, Enum):
     WRITE_GLOBAL_BUFFER = "WR_GB"
 
 
-class ReferenceOpcode(str, Enum):
-    """Name functional services that have no physical instruction encoding.
-
-    Members:
-        INITIALIZE_ACCUMULATOR: Set the selected latch in every selected bank.
-        READ_ACCUMULATOR: Pack selected latch values into Shared Buffer.
-        COPY: Pack a scalar slice with explicit zero padding.
-        STORE_SLICE: Replace a slice while preserving neighboring lanes.
-        FILL: Initialize a logical vector to a constant.
-        REDUCE_SUM: Sum a logical prefix into one scalar.
-        RMS_SCALE: Compute reciprocal square root of a mean plus epsilon.
-        BROADCAST: Repeat a scalar across a logical vector.
-        ACTIVATION: Apply an explicit scalar activation formula.
-        SOFTMAX: Normalize consecutive rows with negative-infinity masking.
-        TRANSPOSE: Pack the transpose of a selected matrix slice.
-        ATTENTION_SCORES: Scale one query score vector and apply its masks.
-        ROTARY_EMBEDDING: Rotate head vectors by table angles at given positions.
-    """
-
-    INITIALIZE_ACCUMULATOR = "REF_INITIALIZE_ACCUMULATOR"
-    READ_ACCUMULATOR = "REF_READ_ACCUMULATOR"
-    COPY = "REF_COPY"
-    STORE_SLICE = "REF_STORE_SLICE"
-    FILL = "REF_FILL"
-    REDUCE_SUM = "REF_REDUCE_SUM"
-    RMS_SCALE = "REF_RMS_SCALE"
-    BROADCAST = "REF_BROADCAST"
-    ACTIVATION = "REF_ACTIVATION"
-    SOFTMAX = "REF_SOFTMAX"
-    TRANSPOSE = "REF_TRANSPOSE"
-    ATTENTION_SCORES = "REF_ATTENTION_SCORES"
-    ROTARY_EMBEDDING = "REF_ROTARY_EMBEDDING"
-
-
 class CentInstruction:
     """Base class for every typed CENT instruction.
 
@@ -98,10 +64,10 @@ class CentInstruction:
     constant defined by its class.
     """
 
-    OPCODE: ClassVar[CentOpcode | ReferenceOpcode]
+    OPCODE: ClassVar[CentOpcode]
 
     @property
-    def opcode(self) -> CentOpcode | ReferenceOpcode:
+    def opcode(self) -> CentOpcode:
         """Return this instruction class's fixed opcode.
 
         Returns:
