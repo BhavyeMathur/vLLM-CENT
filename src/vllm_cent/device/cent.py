@@ -55,6 +55,11 @@ class CentArchitecture(Architecture):
         shared_buffer_size: Size of the device's Shared Buffer, in bytes.
         accumulators_per_bank: MAC result registers per bank. AiM has one;
             the CENT paper's ``Regid`` addresses 32.
+        mac_array_width: Outputs one bank's MAC unit computes in one MAC
+            instruction. AiM has one: a bank's MAC unit reduces each burst
+            into its single MAC register (Hot Chips 2022 GDDR6-AiM, slide
+            6). Wider MAC arrays can be laid out (``tile.layout.Mac``), but
+            no CENT op uses them yet.
     """
 
     channels: int
@@ -66,6 +71,7 @@ class CentArchitecture(Architecture):
     global_buffer_size: int
     shared_buffer_size: int
     accumulators_per_bank: int
+    mac_array_width: int = 1
 
     def __post_init__(self) -> None:
         """Validate the hardware geometry.
@@ -92,6 +98,8 @@ class CentArchitecture(Architecture):
         # Regid and Shared Buffer addresses need at least one valid destination.
         if self.accumulators_per_bank < 1:
             raise ValueError("accumulators_per_bank must be at least 1")
+        if self.mac_array_width < 1:
+            raise ValueError("mac_array_width must be at least 1")
         if self.global_buffer_size < 1:
             raise ValueError("global_buffer_size must be at least 1")
         if self.global_buffer_size % self.burst_size != 0:

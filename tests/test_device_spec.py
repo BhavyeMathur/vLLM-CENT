@@ -412,6 +412,7 @@ class SnapshotTest(unittest.TestCase):
                     "global_buffer_size": 2048,
                     "shared_buffer_size": 65536,
                     "accumulators_per_bank": 32,
+                    "mac_array_width": 1,
                 },
                 "capabilities": {
                     "ops": {

@@ -23,6 +23,9 @@ architecture:
   # README: "16b MAC registers of 16 banks"). The CENT paper's ISA addresses
   # 32 per bank by Regid, but AiM and its simulator have no Regid.
   accumulators_per_bank: 1
+  # Outputs one bank's MAC unit computes per MAC instruction: AiM reduces
+  # each burst into its one MAC register (Hot Chips 2022 GDDR6-AiM, slide 6).
+  mac_array_width: 1
 
 capabilities:
   # Supported Device IR ops (pim.gemv, ...) and their element types. Views

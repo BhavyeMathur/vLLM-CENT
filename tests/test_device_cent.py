@@ -135,6 +135,7 @@ class CentArchitectureTest(unittest.TestCase):
                 "multiple of banks_per_group",
             ),
             "no accumulators": ({"accumulators_per_bank": 0}, "at least 1"),
+            "no MAC array": ({"mac_array_width": 0}, "mac_array_width must be"),
         }
         for name, (fields, message) in cases.items():
             with self.subTest(case=name), self.assertRaisesRegex(ValueError, message):
