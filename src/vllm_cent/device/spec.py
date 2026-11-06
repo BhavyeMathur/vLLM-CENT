@@ -30,7 +30,7 @@ from ..ir.device import (
     PNMActivationOp,
     ViewOp,
 )
-from ..ir.types import DType, ExecutionDomain
+from ..ir.types import DType, ExecutionDomain, MemorySpace
 
 __all__ = [
     "Architecture",
@@ -42,29 +42,6 @@ __all__ = [
     "TraceFormat",
 ]
 
-
-class MemorySpace(StrEnum):
-    """Where a tensor is stored.
-
-    Members:
-        PIM_DRAM: Tensor being stored in DRAM rows, Read and Write using normal
-            RD/WR commands
-        PIM_GB: Tensor temporarily residing in Global Buffer (GB), Write only
-            using WR_GB commands. No way to read it other than being consumed
-            by the PU
-        PNM_GPR: Tensor being stored in PNM General Purpose Register
-    """
-
-    PIM_DRAM = "pim.dram"
-    PIM_GB = "pim.gb"
-    PIM_ACC = "pim.acc"
-    PNM_GPR = "pnm.gpr"
-    PNM_SB = "pnm.sb"
-
-    @property
-    def domain(self) -> ExecutionDomain:
-        """The execution domain this storage belongs to: the part before the dot."""
-        return ExecutionDomain(self.value.partition(".")[0])
 
 
 @dataclass(frozen=True, slots=True)

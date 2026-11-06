@@ -273,10 +273,10 @@ class DeviceSpecTest(unittest.TestCase):
         )
 
     def test_missing_memory_space(self) -> None:
-        """CENT has no PNM register space configured, so the lookup fails."""
+        """CENT has no MAC register space configured, so the lookup fails."""
 
-        with self.assertRaisesRegex(KeyError, "has no memory space 'pnm.gpr'"):
-            self.spec.memory_space(MemorySpace.PNM_GPR)
+        with self.assertRaisesRegex(KeyError, "has no memory space 'pim.mac'"):
+            self.spec.memory_space(MemorySpace.PIM_MAC)
 
     def test_empty_names(self) -> None:
         """Neither the profile nor the target may be unnamed."""

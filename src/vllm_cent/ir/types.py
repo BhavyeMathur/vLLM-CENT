@@ -116,6 +116,38 @@ class ExecutionDomain(StrEnum):
     PNM = auto()
 
 
+class MemorySpace(StrEnum):
+    """Which kind of CENT storage holds a tensor.
+
+    A finer division of ``ExecutionDomain``: Device IR only says PIM or PNM,
+    while CENT Tile IR ops need to know which storage they read and write.
+    The value's prefix is its domain. (``pipeline.ir.MemorySpace`` is the
+    CENT backend's own, unrelated enum.)
+
+    Members:
+        PIM_DRAM: Tensor being stored in DRAM rows, Read and Write using normal
+            RD/WR commands
+        PIM_GB: Tensor temporarily residing in Global Buffer (GB), Write only
+            using WR_GB commands. No way to read it other than being consumed
+            by the PU
+        PIM_MAC: The MAC result registers, one 16-bit register per bank.
+            Written by WR_BIAS and MAC_ABK, read by RD_MAC.
+        PNM_SB: The Shared Buffer, in 256-bit slots of one burst each. The
+            AiM ISA addresses a slot as a GPR (``GPR_addr``), so the GPRs are
+            this buffer, not a storage of their own.
+    """
+
+    PIM_DRAM = "pim.dram"
+    PIM_GB = "pim.gb"
+    PIM_MAC = "pim.mac"
+    PNM_SB = "pnm.sb"
+
+    @property
+    def domain(self) -> ExecutionDomain:
+        """The execution domain this storage belongs to: the part before the dot."""
+        return ExecutionDomain(self.value.partition(".")[0])
+
+
 # Joins the names of semantic axes that share one flat dimension.
 _PACKED_AXIS_SEPARATOR = "*"
 
@@ -295,3 +327,7 @@ class TensorType:
         if isinstance(self.placement, Shard):
             return self.dim_of(self.placement.axis)
         return None
+
+    def extra_annotations(self) -> tuple[str, ...]:
+        """Annotations a subclass adds to the printed type; none here."""
+        return ()

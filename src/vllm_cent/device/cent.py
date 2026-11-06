@@ -114,7 +114,7 @@ class CentArchitecture(Architecture):
         """
 
         # TODO(accumulator width): accumulators_per_bank counts the MAC result
-        # registers of a bank, but not how many bytes each holds, so pim.acc
+        # registers of a bank, but not how many bytes each holds, so pim.mac
         # has no size yet. Find the register width in the CENT paper or the
         # AiM documentation before adding it.
         return (

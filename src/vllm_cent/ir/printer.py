@@ -44,7 +44,8 @@ def format_type(tensor_type: TensorType) -> str:
     """Format a tensor type as ``tensor<1x1x8192xfp16>``.
 
     Annotations are appended only when they differ from their defaults, in a
-    fixed order: role, axes, global shape. An unannotated M0 dump therefore
+    fixed order: role, axes, global shape, placement, domain, then those of
+    the type's subclass (``extra_annotations()``). An unannotated M0 dump therefore
     stays short, while later stages show the full semantic information, e.g.
     ``tensor<1024x8192xfp16, role=weight, axes=[kv_head*head_dim, hidden]>``.
 
@@ -75,6 +76,8 @@ def format_type(tensor_type: TensorType) -> str:
         annotations.append("placement=partial")
     if tensor_type.domain is not None:
         annotations.append(f"domain={tensor_type.domain.value}")
+    # A subclass's own annotations come last, e.g. a CENT memory space.
+    annotations.extend(tensor_type.extra_annotations())
 
     return f"tensor<{', '.join([shape_and_dtype, *annotations])}>"
 
