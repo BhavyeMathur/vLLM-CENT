@@ -8,6 +8,7 @@ The model is an HF config.json plus the code registered next to it.
 from .loader import LoadedModel, load_model
 from .registry import ModelRegistration, get_registration, register_model
 from .run_spec import (
+    CodegenSpec,
     ParallelSpec,
     Phase,
     RunSpec,
@@ -16,11 +17,12 @@ from .run_spec import (
     load_run_spec,
     parse_run_spec,
 )
-from .stages import DEVICE_STAGE, STAGES, compile_stages
+from .stages import DEVICE_STAGE, STAGES, compile_module, compile_stages
 
 __all__ = [
     "DEVICE_STAGE",
     "STAGES",
+    "CodegenSpec",
     "LoadedModel",
     "ModelRegistration",
     "ParallelSpec",
@@ -28,6 +30,7 @@ __all__ = [
     "RunSpec",
     "Scope",
     "Workload",
+    "compile_module",
     "compile_stages",
     "get_registration",
     "load_model",

@@ -16,6 +16,8 @@ compile. Together they define the SPMD program the compiler produces::
     scope:
       layers: 1
       layer: 0          # which decoder layer: layer types may differ
+    codegen:
+      channel_issue: broadcast   # or serialize: see tile.expand.ChannelIssue
 """
 
 from __future__ import annotations
@@ -30,9 +32,11 @@ from typing import Any
 import yaml  # type: ignore[import-untyped]
 
 from ..parallel.plan import ParallelPlan
+from ..tile.expand import ChannelIssue
 from ..utils import config
 
 __all__ = [
+    "CodegenSpec",
     "ParallelSpec",
     "Phase",
     "RunSpec",
@@ -126,6 +130,19 @@ class Scope:
 
 
 @dataclass(frozen=True, slots=True)
+class CodegenSpec:
+    """How the AiM trace is generated.
+
+    Attributes:
+        channel_issue: How ``WR_GB``, ``WR_BIAS`` and ``RD_MAC`` reach many
+            channels: one full-mask instruction (``broadcast``, as CENT's own
+            traces), or one instruction per channel (``serialize``).
+    """
+
+    channel_issue: ChannelIssue = ChannelIssue.BROADCAST
+
+
+@dataclass(frozen=True, slots=True)
 class RunSpec:
     """Everything about how a model runs.
 
@@ -133,11 +150,13 @@ class RunSpec:
         parallel: Tensor parallelism.
         workload: Shapes of the compiled step.
         scope: How much of the model is compiled.
+        codegen: How the AiM trace is generated.
     """
 
     parallel: ParallelSpec = ParallelSpec()
     workload: Workload = Workload()
     scope: Scope = Scope()
+    codegen: CodegenSpec = CodegenSpec()
 
 
 def parse_run_spec(data: Mapping[str, Any]) -> RunSpec:
@@ -153,7 +172,7 @@ def parse_run_spec(data: Mapping[str, Any]) -> RunSpec:
         ValueError: For unknown sections or keys, or invalid values.
     """
 
-    unknown = sorted(set(data) - {"parallel", "workload", "scope"})
+    unknown = sorted(set(data) - {"parallel", "workload", "scope", "codegen"})
     if unknown:
         raise ValueError(f"unknown run spec sections: {unknown}")
 
@@ -203,7 +222,22 @@ def parse_run_spec(data: Mapping[str, Any]) -> RunSpec:
         layers=config.positive_int(_RUN_SPEC, "scope.layers", scope.get("layers", 1)),
         layer=config.nonnegative_int(_RUN_SPEC, "scope.layer", scope.get("layer", 0)),
     )
-    return RunSpec(parallel=parallel_spec, workload=workload_spec, scope=scope_spec)
+
+    codegen = config.section(_RUN_SPEC, data, "codegen", {"channel_issue"})
+    issue = codegen.get("channel_issue", ChannelIssue.BROADCAST.value)
+    try:
+        issue = ChannelIssue(issue)
+    except ValueError as error:
+        raise ValueError(
+            "run spec codegen.channel_issue must be one of "
+            f"{[i.value for i in ChannelIssue]}, got {issue!r}"
+        ) from error
+    return RunSpec(
+        parallel=parallel_spec,
+        workload=workload_spec,
+        scope=scope_spec,
+        codegen=CodegenSpec(channel_issue=issue),
+    )
 
 
 def load_run_spec(path: Path) -> RunSpec:

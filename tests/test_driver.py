@@ -28,6 +28,7 @@ from vllm_cent.driver import (
 )
 from vllm_cent.driver import registry as registry_module
 from vllm_cent.driver.cli import main
+from vllm_cent.tile.expand import ChannelIssue
 
 # registry.py of a tiny model family: one projection whose output dimension
 # ("out", width from the config) is split by tp. MODEL_TYPE is replaced per
@@ -198,6 +199,17 @@ class RunSpecTest(unittest.TestCase):
 
         self.assertEqual(parse_run_spec({}).scope.layer, 0)
         self.assertEqual(parse_run_spec({"scope": {"layer": 3}}).scope.layer, 3)
+
+    def test_codegen_channel_issue(self) -> None:
+        """codegen.channel_issue picks broadcast (default) or serialize."""
+
+        self.assertIs(parse_run_spec({}).codegen.channel_issue, ChannelIssue.BROADCAST)
+        spec = parse_run_spec({"codegen": {"channel_issue": "serialize"}})
+        self.assertIs(spec.codegen.channel_issue, ChannelIssue.SERIALIZE)
+        with self.assertRaisesRegex(ValueError, "codegen.channel_issue must be one of"):
+            parse_run_spec({"codegen": {"channel_issue": "both"}})
+        with self.assertRaisesRegex(ValueError, "unknown"):
+            parse_run_spec({"codegen": {"issue": "serialize"}})
 
     def test_rejections(self) -> None:
         """Typos and invalid values are reported, not ignored."""

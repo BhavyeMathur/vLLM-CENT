@@ -10,7 +10,7 @@ from ..legalize import LowerToDevice
 from .loader import LoadedModel
 from .run_spec import Phase, RunSpec
 
-__all__ = ["DEVICE_STAGE", "STAGES", "compile_stages"]
+__all__ = ["DEVICE_STAGE", "STAGES", "compile_module", "compile_stages"]
 
 # Stage names, in pipeline order. They name the dump files: 00_imported.aloi.
 STAGES = ("00_imported", "01_semantic", "02_sharded")
@@ -31,6 +31,17 @@ def compile_stages(
 ) -> dict[str, str]:
     """Compile one step of ``model`` as ``run`` describes; print every stage.
 
+    The text of ``compile_module``; see there.
+    """
+
+    return compile_module(model, run, device)[1]
+
+
+def compile_module(
+    model: LoadedModel, run: RunSpec, device: DeviceSpec | None = None
+) -> tuple[Module, dict[str, str]]:
+    """Compile one step of ``model`` as ``run`` describes; keep every stage.
+
     Stages:
 
     - ``00_imported``: torch.export graph translated to IR (shapes, dtypes).
@@ -46,8 +57,8 @@ def compile_stages(
         device: Target to lower to; None stops at ``02_sharded``.
 
     Returns:
-        Stage name to IR text, in STAGES order, then DEVICE_STAGE if
-        ``device`` is given.
+        The module after the last stage, and the stage name to IR text, in
+        STAGES order, then DEVICE_STAGE if ``device`` is given.
 
     Raises:
         NotImplementedError: For prefill, or more than one layer.
@@ -81,5 +92,5 @@ def compile_stages(
     ]
     if device is not None:
         passes.append(LowerToDevice(device))
-    PassManager(tuple(passes), dump=record).run(module)
-    return texts
+    module = PassManager(tuple(passes), dump=record).run(module)
+    return module, texts
