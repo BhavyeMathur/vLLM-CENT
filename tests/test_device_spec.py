@@ -6,6 +6,7 @@ import copy
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -298,7 +299,8 @@ class LoadDeviceSpecTest(unittest.TestCase):
         """Every section of examples/cent/cent.yaml, as typed objects.
 
         The PNM softmax is commented out in the file, so it is not listed;
-        views are never listed.
+        views are never listed. The file follows AiM's one MAC register per
+        bank, not the paper's 32.
         """
 
         pim_ops = (PIMGemvOp, PIMEwmulOp, PIMActivationOp, PIMQKOp, PIMSVOp)
@@ -326,7 +328,7 @@ class LoadDeviceSpecTest(unittest.TestCase):
             DeviceSpec(
                 name="cent_paper",
                 target=TargetDescriptor("cent_aim", TraceFormat.AIM_TEXT_TRACE),
-                architecture=PAPER,
+                architecture=replace(PAPER, accumulators_per_bank=1),
                 capabilities=DeviceCapability(
                     ops={
                         op: frozenset({BF16}) for op in (*pim_ops, *pnm_ops, *other_ops)
@@ -341,8 +343,8 @@ class LoadDeviceSpecTest(unittest.TestCase):
     def test_example_gives_the_backend_paper_spec(self) -> None:
         """Bytes to bf16 counts, with sigmoid's configured AFid.
 
-        This is the same CentHardwareSpec the compiler tests construct by
-        hand, so the YAML can replace it.
+        This is the CentHardwareSpec the compiler tests construct by hand,
+        except for AiM's single MAC register per bank.
         """
 
         spec = load_device_spec(EXAMPLE)
@@ -357,7 +359,7 @@ class LoadDeviceSpecTest(unittest.TestCase):
                 dram_rows=16384,
                 dram_columns=1024,
                 burst_length=16,
-                accumulator_slots_per_bank=32,
+                accumulator_slots_per_bank=1,
                 sigmoid_activation_function_id=0,
                 shared_buffer_slots=2048,
                 global_buffer_columns=1024,

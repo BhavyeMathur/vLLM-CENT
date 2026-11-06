@@ -53,7 +53,8 @@ class CentArchitecture(Architecture):
             and also the size of one Shared Buffer slot.
         global_buffer_size: Size of each channel's Global Buffer, in bytes.
         shared_buffer_size: Size of the device's Shared Buffer, in bytes.
-        accumulators_per_bank: MAC result registers per bank (``Regid``).
+        accumulators_per_bank: MAC result registers per bank. AiM has one;
+            the CENT paper's ``Regid`` addresses 32.
     """
 
     channels: int

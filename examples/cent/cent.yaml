@@ -18,7 +18,11 @@ architecture:
   burst_size: 32              # bytes: paper's 256-bit transfer, 16 bf16 values
   global_buffer_size: 2048    # bytes per channel: one row's worth
   shared_buffer_size: 65536   # bytes: paper's 64 KiB, 2048 slots of 32 bytes
-  accumulators_per_bank: 32
+  # One 16-bit MAC register per bank: one channel's 16 registers fill one
+  # 256-bit burst (Hot Chips 2022 GDDR6-AiM, slide 6: MAC_REG; AiM simulator
+  # README: "16b MAC registers of 16 banks"). The CENT paper's ISA addresses
+  # 32 per bank by Regid, but AiM and its simulator have no Regid.
+  accumulators_per_bank: 1
 
 capabilities:
   # Supported Device IR ops (pim.gemv, ...) and their element types. Views
